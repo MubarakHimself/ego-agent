@@ -16,15 +16,15 @@ MVP is always **isolated** mode (one process tree per Space). There is no `mode`
 |---|---|---|
 | `K` | 5 | Hard max live Chromium process trees |
 | `W` | 1 | Warm idle slots after **explicit client DELETE** only |
-| `idle_ttl_seconds` | 300 | Soft-evict without heartbeat (~5 min); always stops Chromium; **skipped** while lease is `awaiting_human` |
-| `lease_hard_ttl_seconds` | 1800 | Hard lease ceiling (enforced on heartbeat / idle sweep / re-lease); always stops Chromium |
+| `idle_ttl_seconds` | 300 | Soft-evict without heartbeat (~5 min); always stops Chromium; **skipped** while lease is `awaiting_human` **or** `keep_alive` |
+| `lease_hard_ttl_seconds` | 1800 | Hard lease ceiling (enforced on heartbeat / idle sweep / re-lease); always stops Chromium (incl. keep_alive) |
 | `spaces_root` | `./data/spaces` | Space = `{spaces_root}/{space_id}/` = Chromium `--user-data-dir` |
 | `vault_root` | `./data/vault` | Credential vault (**must** be outside `spaces_root`; fail-closed at config/pool init) |
 | `artifacts_root` | `./data/artifacts` | Lease downloads/uploads (**must** be outside `spaces_root` + `vault_root`) |
 | `cdp_base_port` | 9222 | Operator-internal Chromium bind; **not** on public status/lease unless `SLIPSTREAM_EXPOSE_RAW_CDP=1`. Do **not** derive CDP from public JSON or `slot_id` (no `9222+slot_id` recipe) |
 | `host` / `port` | `127.0.0.1` / `8755` | API bind |
 
-Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_ARTIFACTS_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm + unused grant seconds, default 60), `SLIPSTREAM_EXPOSE_RAW_CDP=1` (include cdp_* URLs **and** `cdp_port`/`cdp_base_port`/`chromium_pid` on lease/status JSON; raw CDP nav/eval honor-system — do not derive CDP from default public JSON), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted unless Space/lease lockdown applies), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers).
+Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_ARTIFACTS_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm + unused grant seconds, default 60), `SLIPSTREAM_EXPOSE_RAW_CDP=1` (include cdp_* URLs **and** `cdp_port`/`cdp_base_port`/`chromium_pid` on lease/status JSON; raw CDP nav/eval honor-system — do not derive CDP from default public JSON), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted unless Space/lease lockdown applies), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers), `SLIPSTREAM_KEEPALIVE=1` (default `keep_alive` on new leases when body omits the field; default off).
 
 ## Endpoints
 
@@ -34,7 +34,8 @@ Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT
 {
   "agent_id": "agent-1",
   "space_id": "task-42",
-  "ttl_seconds": 1800
+  "ttl_seconds": 1800,
+  "keep_alive": false
 }
 ```
 
@@ -48,7 +49,8 @@ Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT
   "space_id": "task-42",
   "status": "leased",
   "created_at": 0,
-  "expires_at": 0
+  "expires_at": 0,
+  "keep_alive": false
 }
 ```
 
@@ -63,6 +65,22 @@ Optional `ttl_seconds` may be shorter than `lease_hard_ttl_seconds`; requests ab
 → `503` when pool at hard K (`{"error":"pool_full"}`) or Chromium launch fails (`{"error":"launch_failed"}`, including `OSError` / other launch exceptions).
 
 **Warm reuse:** if a `FREE_WARM` slot already holds the requested `space_id` **and** its process is still alive, the existing process is reused (no stop/relaunch). A dead warm process is stopped and cold-started. A warm slot bound to a different Space is stopped and relaunched.
+
+### keepAlive (survive driver disconnect)
+
+Thin Browserbase-style **`keep_alive`** on lease create (pattern-steal only; no Browserbase paid APIs).
+
+| Signal | `keep_alive: false` (default) | `keep_alive: true` |
+| --- | --- | --- |
+| Soft-idle (no heartbeat ≥ `idle_ttl_seconds`) | Release + stop Chromium | **Survive** — lease + Chromium stay |
+| Hard TTL (`expires_at`) | Release + stop | Release + stop |
+| Explicit `DELETE` / release / `task_done` | Release (warm rules) | Release (warm rules) |
+
+**Why soft-idle ≈ “driver gone”:** the pool does not proxy agent CDP websockets (agents attach directly to Chromium). Missed heartbeats are the pool’s stand-in for agent process death / CDP client drop. `keep_alive` skips soft-idle only; it does **not** extend hard TTL.
+
+Optional body `keep_alive: true|false` (bool only → else `400 invalid_keep_alive`). Omit → env `SLIPSTREAM_KEEPALIVE` (default false). Lease / list / ops session JSON always include `keep_alive`. CLI: `slipstream lease … --keep-alive`. Idempotent re-lease with explicit `keep_alive` updates the flag; omit preserves it.
+
+Reconnect: same `(agent_id, space_id)` while leased returns the same `lease_id` (CDP tip still via `SLIPSTREAM_EXPOSE_RAW_CDP=1` when needed).
 
 ### `POST /v1/leases/{lease_id}/heartbeat`
 
@@ -511,7 +529,7 @@ GET /v1/ops/sessions
 GET /v1/ops/sessions?q=env=staging
 → 200 { "sessions": [
     { "space_id", "lease_id", "agent_id?", "status", "leased_at", "duration_s",
-      "user_metadata", "signed_in", "signed_in_host?", "watch_url?" }
+      "user_metadata", "signed_in", "signed_in_host?", "keep_alive", "watch_url?" }
   ], "q" }
 
 GET /v1/ops/

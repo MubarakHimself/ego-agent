@@ -114,6 +114,7 @@ _QS_AGENT_ID = "agent_id"
 _QS_WATCH_AUTH = "token"  # skylos: ignore[SKY-L014,SKY-L032] query param name, not a secret
 _FIELD_ALLOWED_DOMAINS = "allowed_domains"
 _FIELD_USER_METADATA = "user_metadata"
+_FIELD_KEEP_ALIVE = "keep_alive"
 
 
 
@@ -323,6 +324,18 @@ def _parse_ttl_seconds(raw: Any) -> int | None:
     if ttl <= 0:
         raise ValueError("ttl_seconds must be positive")
     return ttl
+
+
+def _parse_keep_alive(raw: Any) -> bool | None:
+    """Return explicit keep_alive, or None to use env default.
+
+    Rejects non-bool (incl. 1/0) so clients do not silently coerce.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    raise ValueError("keep_alive must be a boolean")
 
 
 def make_handler(pool: BrowserPool):
@@ -628,12 +641,22 @@ def make_handler(pool: BrowserPool):
                 user_metadata = body.get(_FIELD_USER_METADATA)
                 allowed_domains = body.get(_FIELD_ALLOWED_DOMAINS)
                 try:
+                    keep_alive = _parse_keep_alive(body.get(_FIELD_KEEP_ALIVE))
+                except ValueError as e:
+                    _json_response(
+                        self,
+                        400,
+                        {"error": "invalid_keep_alive", "detail": str(e)},
+                    )
+                    return
+                try:
                     result = pool.lease(
                         agent_id,
                         space_id,
                         ttl_seconds=ttl,
                         user_metadata=user_metadata,
                         allowed_domains=allowed_domains,
+                        keep_alive=keep_alive,
                     )
                     _json_response(self, 200, result)
                 except MetadataValidationError as e:

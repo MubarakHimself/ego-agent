@@ -8,8 +8,8 @@ description: >
   browser). HTTP + this CLI/skill surface only — there is no MCP server.
   For video watch intents, compose a separate /watch skill (not Slipstream).
 metadata:
-  version: "0.6.0"
-  date: "2026-09-22"
+  version: "0.6.1"
+  date: "2026-09-23"
 ---
 
 # slipstream
@@ -93,10 +93,18 @@ Use **one Space** per user goal. Print `lease_id`; reuse it in later rounds.
 Heartbeat every ~15–30s (including during LLM think). Always release when done
 (or on hard failure after you stop retrying).
 
+**keepAlive (optional):** `slipstream lease … --keep-alive` or body
+`keep_alive: true` (env default `SLIPSTREAM_KEEPALIVE=1`). Soft-idle / missed
+heartbeats (pool stand-in for agent death / CDP disconnect) do **not** tear
+down the lease+Chromium; **hard TTL** and explicit `release` / `task_done`
+still do. Without the flag, current soft-idle release applies. Status / lease
+JSON shows `keep_alive`. No Monid / Electron / MCP.
+
 ```bash
 # 1) Lease
 slipstream lease --agent-id "$AGENT_ID" --space-id "task-42"
-# → JSON: lease_id, slot_id, expires_at, … (no cdp_* / chromium_pid by default;
+# Optional: --keep-alive  (survive soft-idle / driver disconnect; hard TTL still)
+# → JSON: lease_id, slot_id, expires_at, keep_alive, … (no cdp_* / chromium_pid by default;
 #    do not derive CDP from public JSON or slot_id)
 
 # 2) Drive via pool HTTP (ladder-enforced) — do NOT spawn Chrome

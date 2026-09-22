@@ -7,6 +7,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def keep_alive_default() -> bool:
+    """Env default for lease keep_alive (SLIPSTREAM_KEEPALIVE; default false)."""
+    return os.environ.get("SLIPSTREAM_KEEPALIVE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 @dataclass
 class PoolConfig:
     """Hard-capped browser pool settings.

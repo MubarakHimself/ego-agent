@@ -201,6 +201,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Comma-separated top-frame host allowlist for this lease (empty=unrestricted)",
     )
+    p_lease.add_argument(
+        "--keep-alive",
+        action=_STORE_TRUE,
+        default=None,
+        help="Survive driver disconnect / soft-idle (Browserbase keepAlive); "
+        "hard TTL + explicit release still apply (env SLIPSTREAM_KEEPALIVE)",
+    )
     p_lease.set_defaults(_handler="lease")
 
     # --- heartbeat ---
@@ -632,6 +639,7 @@ def main(argv: list[str] | None = None) -> int:
                 url=args.url,
                 user_metadata=meta or None,
                 allowed_domains=domains,
+                keep_alive=getattr(args, "keep_alive", None),
             )
         if args._handler == "navigate":
             return cmd_navigate(

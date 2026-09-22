@@ -111,7 +111,7 @@ from slipstream.watch import (
     parse_watch_input,
     render_watch_html,
 )
-from slipstream.config import PoolConfig
+from slipstream.config import PoolConfig, keep_alive_default
 from slipstream.domains import (
     DomainAllowlistError,
     check_navigate_url,
@@ -365,6 +365,7 @@ class BrowserPool:
         cdp_ws_url: str | None,
         user_metadata: dict[str, Any] | None = None,
         allowed_domains: list[str] | None = None,
+        keep_alive: bool = False,
     ) -> dict[str, Any]:
         """Wire Lease + slot lease fields; caller sets process/CDP fields as needed."""
         now = time.time()
@@ -394,6 +395,7 @@ class BrowserPool:
             allowed_domains=self._effective_domains_for(space_id, domains_override),
             signed_in=bool(badge.get("signed_in")),
             signed_in_host=badge.get(_KEY_SIGNED_IN_HOST),
+            keep_alive=bool(keep_alive),
         )
         self._leases[lease_id] = lease
         slot.status = SlotStatus.LEASED
@@ -487,6 +489,7 @@ class BrowserPool:
         *,
         user_metadata: dict[str, Any] | None = None,
         allowed_domains: list[str] | None = None,
+        keep_alive: bool = False,
     ) -> dict[str, Any]:
         """Under lock: attach lease after a successful launch outside the lock."""
         self._handles[slot.slot_id] = handle
@@ -499,6 +502,7 @@ class BrowserPool:
             cdp_ws_url=handle.cdp_ws_url,
             user_metadata=user_metadata,
             allowed_domains=allowed_domains,
+            keep_alive=keep_alive,
         )
         self._prepare_lease_downloads(result["lease_id"], handle.cdp_http_url)
         slot.chromium_pid = handle.pid
@@ -519,6 +523,7 @@ class BrowserPool:
         ttl_seconds: int | None = None,
         user_metadata: dict[str, Any] | None = None,
         allowed_domains: list[str] | None = None,
+        keep_alive: bool | None = None,
     ) -> dict[str, Any]:
         # Validate early (rejects ".", "..", "/", NULs, empty, unsafe)
         space_id = self.config.normalize_space_id(space_id)
@@ -528,6 +533,10 @@ class BrowserPool:
         domains_override = (
             parse_allowed_domains(allowed_domains) if allowed_domains is not None else None
         )
+        # None = env default for *new* leases; explicit bool wins.
+        # On idempotent re-lease, omit leaves existing keep_alive unchanged.
+        ka_explicit = keep_alive is not None
+        ka = bool(keep_alive) if ka_explicit else keep_alive_default()
 
         # Handles that must be stopped outside the lock (released/replaced trees).
         pending_stops: list[LaunchHandle] = []
@@ -576,6 +585,10 @@ class BrowserPool:
                             space_id, existing.allowed_domains_override
                         )
                         self._sync_lease_signed_in(existing)
+                        # Idempotent re-lease: only flip keep_alive when body/arg
+                        # set it explicitly (omit preserves prior flag).
+                        if ka_explicit:
+                            existing.keep_alive = ka
                         early_result = existing.to_dict()
                         break
 
@@ -613,6 +626,7 @@ class BrowserPool:
                                 cdp_ws_url=matching_warm.cdp_ws_url,
                                 user_metadata=meta_override,
                                 allowed_domains=domains_override,
+                                keep_alive=ka,
                             )
                             self._prepare_lease_downloads(
                                 early_result["lease_id"], matching_warm.cdp_http_url
@@ -698,6 +712,7 @@ class BrowserPool:
                     handle,
                     user_metadata=meta_override,
                     allowed_domains=domains_override,
+                    keep_alive=ka,
                 )
 
         self.launcher.stop(orphan)
@@ -1528,7 +1543,9 @@ class BrowserPool:
         """Soft-evict idle leases and hard-TTL-expired leases.
 
         Soft-idle eviction is skipped while ``lease.status == 'awaiting_human'``
-        (need_human pause keeps Chromium); hard TTL still tears down.
+        (need_human pause keeps Chromium) **or** ``lease.keep_alive``
+        (Browserbase-style keepAlive — survive driver disconnect / missed
+        heartbeats). Hard TTL still tears down in both cases.
         Re-checks staleness / expiry under the lock immediately before teardown
         so a concurrent heartbeat cannot be raced into an eviction.
         Evictions never keep warm (always stop Chromium).
@@ -1566,9 +1583,10 @@ class BrowserPool:
                         pass
                     continue
 
-                # Soft-idle: skip while awaiting human (lease/Chromium kept).
-                # Hard TTL above still applies.
-                if lease.status == _STATE_AWAITING_HUMAN:
+                # Soft-idle: skip while awaiting human OR keep_alive
+                # (Browserbase-style: driver gone / missed heartbeats ≠ teardown).
+                # Hard TTL above still applies; explicit DELETE still tears down.
+                if lease.status == _STATE_AWAITING_HUMAN or lease.keep_alive:
                     continue
 
                 # Idle soft-evict: re-check heartbeat freshness under lock
@@ -2690,6 +2708,7 @@ class BrowserPool:
                         signed_in=bool(lease.signed_in),
                         signed_in_host=lease.signed_in_host,
                         watch_url=watch.get(_KEY_WATCH_URL),
+                        keep_alive=bool(lease.keep_alive),
                         now=now,
                     )
                 )

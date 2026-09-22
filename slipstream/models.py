@@ -80,6 +80,8 @@ class Lease:
     # Space signed-in badge (metadata only; cookies stay in user-data-dir).
     signed_in: bool = False
     signed_in_host: str | None = None
+    # Browserbase-style keepAlive: survive driver disconnect / soft-idle.
+    keep_alive: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         from slipstream.actions import expose_raw_cdp
@@ -95,6 +97,7 @@ class Lease:
             "user_metadata": dict(self.user_metadata),
             "allowed_domains": list(self.allowed_domains),
             "signed_in": bool(self.signed_in),
+            "keep_alive": bool(self.keep_alive),
         }
         if expose_raw_cdp():
             out["cdp_http_url"] = self.cdp_http_url
