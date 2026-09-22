@@ -13,7 +13,10 @@ authors = [{ name = "MubarakHimself" }]
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = [
+    "pytest>=8.0",
+    "vulture>=2.11",
+]
 
 [project.scripts]
 slipstream = "slipstream.__main__:main"
@@ -28,3 +31,8 @@ markers = [
     "bench: optional pool speed benchmark (MOCK or LIVE)",
 ]
 testpaths = ["tests"]
+
+[tool.vulture]
+min_confidence = 80
+paths = ["slipstream"]
+exclude = [".venv*", "**/__pycache__/**", ".venv-skylos", "tests"]

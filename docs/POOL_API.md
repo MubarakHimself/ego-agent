@@ -2,9 +2,9 @@
 
 Transport: **localhost HTTP/JSON** via Python stdlib `ThreadingHTTPServer`.
 
-**No MCP yet** — this HTTP API is the external surface for agents/tools; an MCP wrapper may come later atop the same lease endpoints.
+**No MCP** — this HTTP API is the external surface for agents/tools. The agent-facing **`slipstream` CLI** (`lease` / `heartbeat` / `release` / `status` / `doctor`) is another client of these same endpoints (see `skills/slipstream/SKILL.md`; alias intent `slipstream-browser`). There is no MCP server in this project.
 
-Default base URL: `http://127.0.0.1:8755`
+Default base URL: `http://127.0.0.1:8755` (override for CLI clients with `SLIPSTREAM_URL` or `--url`).
 
 Agents **must not** spawn Chromium themselves — only this service launches browsers (hard K-cap).
 
@@ -95,6 +95,22 @@ slot is `STARTING`, other agents can still heartbeat existing leases, read
 still applies: a second lease for the same `space_id` gets `409` while the
 first is `LEASED` or `STARTING`. Callers see no new request fields — semantics
 are transparent aside from lower latency under concurrent load.
+
+## CLI client
+
+Console script / module entry (`slipstream` or `python -m slipstream`):
+
+| Command | HTTP |
+|---|---|
+| `slipstream serve` | starts this API server |
+| `slipstream lease --agent-id … --space-id …` | `POST /v1/leases` |
+| `slipstream heartbeat --lease-id …` | `POST /v1/leases/{id}/heartbeat` |
+| `slipstream release --lease-id …` | `DELETE /v1/leases/{id}` |
+| `slipstream status` | `GET /v1/pool/status` |
+| `slipstream doctor [--json]` | local preflight + `GET /healthz` (Chrome/CDP/spaces/skill) |
+
+Uses stdlib `urllib`. Env: `SLIPSTREAM_URL` for base URL. Non-zero exit + stderr on HTTP errors.
+`doctor` also probes an ephemeral Chrome CDP endpoint and checks Spaces root + skill path (no lease required).
 
 ## Driver notes
 

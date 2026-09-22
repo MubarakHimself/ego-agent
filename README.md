@@ -14,7 +14,7 @@ Architecture locked — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and F
 
 **MVP:** Browser Pool Manager — lease / heartbeat / release, hard **K=5**, warm **W=1**, Space = Chromium `user-data-dir`, Linux-first, local CDP.
 
-**External surface (now):** localhost **HTTP JSON API** only (`docs/POOL_API.md`). **No MCP server yet** — agents and tools talk to the pool over HTTP; MCP may wrap the same lease API later.
+**External surface:** localhost **HTTP JSON API** (`docs/POOL_API.md`) is primary. Agents should use the **`slipstream` CLI** + skill doc ([`skills/slipstream/SKILL.md`](skills/slipstream/SKILL.md); alias intent `slipstream-browser`) — skill+CLI over HTTP/CDP. Includes **`slipstream doctor`** preflight. **No MCP server** — do not look for one; MCP was explicitly deferred/cancelled.
 
 ## Constraints
 
@@ -22,27 +22,34 @@ Architecture locked — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and F
 - Laya optional later (decision head only — not a browser)
 - No proprietary ego binary / ego-lite source theft
 - Agents never spawn Chrome themselves — only the pool does
+- No MCP server in this repo
 
 ## Layout
 
 ```text
 slipstream/          # Pool service package
-  config.py        # K=5, W=1, idle_ttl=300, spaces_root, cdp_base_port
-  models.py        # SlotState, Lease
-  launcher.py      # ChromiumLauncher (CDP + user-data-dir); mock via SLIPSTREAM_MOCK=1
-  cdp_http.py      # Thin DevTools HTTP helpers (smoke/bench; not full driver)
-  rss.py           # sample_tree_rss(pid) — /proc tree RSS hook
-  pool.py          # BrowserPool lease/heartbeat/release/evict
-  api.py           # HTTP JSON API (stdlib)
-  __main__.py      # python -m slipstream
+  config.py          # K=5, W=1, idle_ttl=300, spaces_root, cdp_base_port
+  models.py          # SlotState, Lease
+  launcher.py        # ChromiumLauncher (CDP + user-data-dir); mock via SLIPSTREAM_MOCK=1
+  cdp_http.py        # Thin DevTools HTTP helpers (smoke/bench; not full driver)
+  rss.py             # sample_tree_rss(pid) — /proc tree RSS hook
+  pool.py            # BrowserPool lease/heartbeat/release/evict
+  api.py             # HTTP JSON API (stdlib)
+  cli.py             # Agent HTTP client helpers (urllib)
+  __main__.py        # slipstream / python -m slipstream (serve|lease|heartbeat|release|status|doctor)
+  doctor.py          # Preflight: Chrome, CDP, healthz, spaces, skill
+skills/
+  slipstream/SKILL.md  # Agent skill (alias: slipstream-browser); lifecycle + doctor
 scripts/
-  bench_pool.py    # LIVE + MOCK pool speed benchmark
-tests/             # pytest (mocked by default; @pytest.mark.live / bench)
-benches/           # Sample benchmark outputs (committed samples)
+  bench_pool.py      # LIVE + MOCK pool speed benchmark
+  skylos_local.sh    # Skylos quality gate (also: run_skylos.sh)
+  run_vulture.sh     # Vulture dead-code gate
+tests/               # pytest (mocked by default; @pytest.mark.live / bench)
+benches/             # Sample benchmark outputs (committed samples)
 docs/
-  ARCHITECTURE.md  # Captain lock
-  POOL_API.md      # HTTP endpoints
-data/spaces/       # Runtime Space profiles (gitignored)
+  ARCHITECTURE.md    # Captain lock
+  POOL_API.md        # HTTP endpoints (+ CLI as another client)
+data/spaces/         # Runtime Space profiles (gitignored)
 ```
 
 **Space path convention:** `{spaces_root}/{space_id}/` → Chromium `--user-data-dir`.
@@ -52,18 +59,44 @@ data/spaces/       # Runtime Space profiles (gitignored)
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt   # pytest only; service is stdlib
+pip install -e ".[dev]"   # installs console script `slipstream`; pytest for tests
 
-# Mock mode (no Chrome required)
-SLIPSTREAM_MOCK=1 python -m slipstream --port 8755
+# Start pool — mock mode (no Chrome required)
+SLIPSTREAM_MOCK=1 slipstream serve --port 8755
+# equivalent: SLIPSTREAM_MOCK=1 python -m slipstream serve --port 8755
 
 # Real Chrome (system google-chrome / chromium; or SLIPSTREAM_CHROME=/usr/bin/google-chrome)
-python -m slipstream --port 8755
+slipstream serve --port 8755
 ```
 
 Base URL: `http://127.0.0.1:8755` — see [`docs/POOL_API.md`](docs/POOL_API.md).
+Agent skill: [`skills/slipstream/SKILL.md`](skills/slipstream/SKILL.md).
 
-Example:
+### Agent CLI (against a running pool)
+
+```bash
+export SLIPSTREAM_URL=http://127.0.0.1:8755   # optional; this is the default
+
+slipstream lease --agent-id a1 --space-id task-1
+# → prints lease JSON (lease_id, cdp_http_url, cdp_ws_url, …)
+
+slipstream heartbeat --lease-id <lease_id>
+slipstream release --lease-id <lease_id>
+slipstream status
+```
+
+### Doctor (preflight)
+
+```bash
+# Real path — mock OFF (out-of-box). Checks Chrome, CDP probe, pool healthz,
+# Spaces root, skills/slipstream/SKILL.md (alias: slipstream-browser).
+slipstream doctor
+slipstream doctor --json
+```
+
+Exit 0 if no failures (warnings/skips allowed, e.g. pool not yet started).
+
+curl still works (HTTP is primary):
 
 ```bash
 curl -s -X POST http://127.0.0.1:8755/v1/leases \
@@ -79,13 +112,14 @@ Spaces are exclusive while leased (second agent gets HTTP 409). Warm slots (from
 
 Drive a leased browser via CDP (`cdp_http_url` / DevTools WebSocket) or Playwright `connectOverCDP`. Smoke/bench use thin HTTP helpers in `slipstream.cdp_http` (PUT `/json/new`).
 
-## Tests
+## Tests & quality gates
 
 ```bash
 source .venv/bin/activate
+pip install -e ".[dev]"   # pytest + vulture
 
 # Unit tests (mocked launcher — no browsers needed)
-SLIPSTREAM_MOCK=1 pytest -q -m "not live and not bench"
+SLIPSTREAM_MOCK=1 pytest -q -m "not live and not bench and not live_stress"
 
 # Optional live smoke only (requires Chrome on PATH or SLIPSTREAM_CHROME)
 # lease → CDP ready → navigate example.com → title check → heartbeat → release → warm reuse
@@ -96,6 +130,12 @@ SLIPSTREAM_MOCK=1 pytest -q -m bench          # MOCK timings
 pytest -q -m bench                          # LIVE timings (uses scripts/bench_pool.py)
 # Or run the harness directly:
 #   python scripts/bench_pool.py --mode LIVE|MOCK|BOTH
+
+# Skylos (dead-code / SAST / quality) — see docs/SKYLOS.md
+./scripts/skylos_local.sh advisory   # or: ./scripts/run_skylos.sh gate
+
+# Vulture dead-code
+./scripts/run_vulture.sh
 ```
 
 ## Benchmark harness
@@ -121,4 +161,4 @@ JSON goes to stdout (and `--out` if set). Sample committed under [`benches/SAMPL
 
 ## Non-goals (MVP)
 
-Electron, CEF/Tauri, Chromium forks, Jev/Open-Jev, Laya-as-browser, packing all agents into one Chromium, cloud overflow (stretch behind same lease API), MCP (not yet — HTTP is the external surface).
+Electron, CEF/Tauri, Chromium forks, Jev/Open-Jev, Laya-as-browser, packing all agents into one Chromium, cloud overflow (stretch behind same lease API), **MCP** (cancelled — HTTP + skill/CLI is the agent surface).
