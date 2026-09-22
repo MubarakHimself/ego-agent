@@ -332,3 +332,70 @@ Uses stdlib `urllib`. Env: `SLIPSTREAM_URL` for base URL. Non-zero exit + stderr
 ## RSS sampling hook
 
 `slipstream.rss.sample_tree_rss(pid)` sums `/proc` VmRSS across the process tree (Linux). Returns `None` if unavailable. Exposed on slot status as `rss_bytes` for later K tuning — see README.
+
+
+## user_metadata tags + list filter (session-metadata)
+
+Browserbase-style ops tags for fleets. **No secrets** — denylist keys
+(`password` / `cookie` / `token` / `jwt` / `bearer` / …) are refused (same
+rules as alerts).
+
+### Shape
+
+- JSON **object**; nested objects OK; **string leaves only** (no arrays /
+  numbers / bools — stringify them).
+- Serialized size ≤ **512** chars (`json.dumps` separators compact).
+- Prefer **Space-level** tags (persist for the Space id); leases **inherit**
+  and may **override** per-lease.
+
+### Attach
+
+`PUT /v1/spaces/{space_id}`
+
+```json
+{ "user_metadata": { "env": "staging", "team": "fleet", "run": { "id": "r1" } } }
+```
+
+→ `200` `{ "space_id", "user_metadata" }`
+
+`POST /v1/leases` optional field:
+
+```json
+{
+  "agent_id": "agent-1",
+  "space_id": "task-42",
+  "user_metadata": { "env": "canary" }
+}
+```
+
+Lease response includes effective `user_metadata` (Space ∪ lease override).
+
+### List / filter (`q=`)
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `GET` | `/v1/spaces?q=…` | Known Spaces (tagged and/or currently slotted) |
+| `GET` | `/v1/leases?q=…` | Active leases; matches **effective** metadata |
+
+**`q` grammar** (space-separated AND):
+
+| Token | Match |
+|-------|--------|
+| `key=value` or `key:value` | Exact equality on top-level or dotted path (`run.id=r1`) |
+| `user_metadata['env']:'staging'` | Browserbase-style path equality |
+| bare `substring` | Any string leaf **contains** the token |
+
+Omit `q` → return all. No match → empty list (not 404).
+
+→ `400` `invalid_user_metadata` when attach payload violates rules / denylist.
+
+### CLI
+
+```bash
+slipstream spaces set --space-id task-42 --tag env=staging --tag team=fleet
+slipstream spaces list --q 'env=staging'
+slipstream lease --agent-id a1 --space-id task-42 --tag env=canary
+slipstream leases list --tag env=canary
+```
+
+`--tag` is sugar for `q=` / metadata keys; `--metadata '{"env":"staging"}'` also works.

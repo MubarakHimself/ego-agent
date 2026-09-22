@@ -63,6 +63,10 @@ class Lease:
     cdp_ws_url: str | None = None
     created_at: float = field(default_factory=time.time)
     expires_at: float | None = None
+    # Lease-level override of Space user_metadata (string leaves only).
+    user_metadata_override: dict[str, Any] = field(default_factory=dict)
+    # Effective tags = deep_merge(space_meta, override); set by pool on attach.
+    user_metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -75,6 +79,7 @@ class Lease:
             "cdp_ws_url": self.cdp_ws_url,
             "created_at": self.created_at,
             "expires_at": self.expires_at,
+            "user_metadata": dict(self.user_metadata),
         }
 
 

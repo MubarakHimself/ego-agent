@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import urllib.error
+from urllib.parse import quote
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -135,11 +136,14 @@ def cmd_lease(
     space_id: str,
     ttl_seconds: int | None = None,
     url: str | None = None,
+    user_metadata: dict[str, Any] | None = None,
 ) -> int:
     base = resolve_base_url(url)
     body: dict[str, Any] = {"agent_id": agent_id, "space_id": space_id}
     if ttl_seconds is not None:
         body["ttl_seconds"] = ttl_seconds
+    if user_metadata:
+        body["user_metadata"] = user_metadata
     status, payload = _request("POST", f"{base}/v1/leases", body)
     if status != 200:
         _fail_http(status, payload)
@@ -466,6 +470,105 @@ def cmd_deny(*, confirm_id: str, url: str | None = None) -> int:
     status, payload = _request(
         "POST", f"{base}/v1/confirmations/{confirm_id}", {"action": "deny"}
     )
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0
+
+
+def _parse_metadata_json(raw: str | None) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise CliError(f"invalid --metadata JSON: {e}", exit_code=2) from e
+    if not isinstance(obj, dict):
+        raise CliError("--metadata must be a JSON object", exit_code=2)
+    return obj
+
+
+def _tags_to_metadata(tags: list[str] | None) -> dict[str, Any] | None:
+    """Build a flat user_metadata object from repeated --tag key=value."""
+    if not tags:
+        return None
+    out: dict[str, Any] = {}
+    for t in tags:
+        if "=" in t:
+            k, v = t.split("=", 1)
+        elif ":" in t:
+            k, v = t.split(":", 1)
+        else:
+            raise CliError(f"--tag must be key=value, got {t!r}", exit_code=2)
+        k, v = k.strip(), v.strip()
+        if not k:
+            raise CliError(f"--tag missing key: {t!r}", exit_code=2)
+        out[k] = v
+    return out
+
+
+def cmd_spaces_list(
+    *,
+    q: str | None = None,
+    tags: list[str] | None = None,
+    url: str | None = None,
+) -> int:
+    from slipstream.metadata import MetadataValidationError, combine_q
+
+    base = resolve_base_url(url)
+    try:
+        query = combine_q(q, tags)
+    except MetadataValidationError as e:
+        raise CliError(str(e), exit_code=2) from e
+    path = f"{base}/v1/spaces"
+    if query:
+        path = f"{path}?q={quote(query)}"
+    status, payload = _request("GET", path)
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0
+
+
+def cmd_spaces_set(
+    *,
+    space_id: str,
+    metadata_json: str | None = None,
+    tags: list[str] | None = None,
+    url: str | None = None,
+) -> int:
+    base = resolve_base_url(url)
+    meta = _parse_metadata_json(metadata_json) or {}
+    tag_meta = _tags_to_metadata(tags) or {}
+    meta.update(tag_meta)
+    if not meta and metadata_json is None and not tags:
+        raise CliError("provide --metadata JSON and/or --tag key=value", exit_code=2)
+    status, payload = _request(
+        "PUT", f"{base}/v1/spaces/{space_id}", {"user_metadata": meta}
+    )
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0
+
+
+def cmd_leases_list(
+    *,
+    q: str | None = None,
+    tags: list[str] | None = None,
+    url: str | None = None,
+) -> int:
+    from slipstream.metadata import MetadataValidationError, combine_q
+
+    base = resolve_base_url(url)
+    try:
+        query = combine_q(q, tags)
+    except MetadataValidationError as e:
+        raise CliError(str(e), exit_code=2) from e
+    path = f"{base}/v1/leases"
+    if query:
+        path = f"{path}?q={quote(query)}"
+    status, payload = _request("GET", path)
     if status != 200:
         _fail_http(status, payload)
     _print_json(payload)

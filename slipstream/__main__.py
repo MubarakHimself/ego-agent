@@ -36,6 +36,9 @@ from slipstream.cli import (
     cmd_deny,
     cmd_heartbeat,
     cmd_lease,
+    cmd_leases_list,
+    cmd_spaces_list,
+    cmd_spaces_set,
     cmd_release,
     cmd_status,
     resolve_secret,
@@ -135,6 +138,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional lease TTL (clamped to pool hard TTL)",
+    )
+    p_lease.add_argument(
+        "--metadata",
+        default=None,
+        help='Optional user_metadata JSON object, e.g. \'{"env":"staging"}\'',
+    )
+    p_lease.add_argument(
+        "--tag",
+        action="append",
+        default=None,
+        help="Lease metadata tag key=value (repeatable; overrides/extends --metadata)",
     )
     p_lease.set_defaults(_handler="lease")
 
@@ -300,6 +314,50 @@ def build_parser() -> argparse.ArgumentParser:
     p_deny.set_defaults(_handler="deny")
 
     # --- doctor ---
+
+    # --- spaces ---
+    p_spaces = sub.add_parser("spaces", help="Space registry: list/filter tags, set user_metadata")
+    spaces_sub = p_spaces.add_subparsers(dest="spaces_cmd", metavar="SUBCOMMAND")
+    p_sp_list = spaces_sub.add_parser("list", help="List Spaces (optional --q / --tag filter)")
+    _add_url(p_sp_list)
+    p_sp_list.add_argument("--q", default=None, help="Metadata query (key=value AND… / substring)")
+    p_sp_list.add_argument(
+        "--tag",
+        action="append",
+        default=None,
+        help="Filter tag key=value (repeatable; AND with --q)",
+    )
+    p_sp_list.set_defaults(_handler="spaces_list")
+    p_sp_set = spaces_sub.add_parser("set", help="Set/replace Space user_metadata tags")
+    _add_url(p_sp_set)
+    p_sp_set.add_argument("--space-id", required=True, help="Space id")
+    p_sp_set.add_argument(
+        "--metadata",
+        default=None,
+        help='user_metadata JSON object, e.g. \'{"env":"staging","team":"fleet"}\'',
+    )
+    p_sp_set.add_argument(
+        "--tag",
+        action="append",
+        default=None,
+        help="Tag key=value (repeatable)",
+    )
+    p_sp_set.set_defaults(_handler="spaces_set")
+
+    # --- leases list ---
+    p_leases = sub.add_parser("leases", help="List/filter active leases by user_metadata")
+    leases_sub = p_leases.add_subparsers(dest="leases_cmd", metavar="SUBCOMMAND")
+    p_ls_list = leases_sub.add_parser("list", help="List active leases (optional --q / --tag)")
+    _add_url(p_ls_list)
+    p_ls_list.add_argument("--q", default=None, help="Metadata query (key=value AND… / substring)")
+    p_ls_list.add_argument(
+        "--tag",
+        action="append",
+        default=None,
+        help="Filter tag key=value (repeatable; AND with --q)",
+    )
+    p_ls_list.set_defaults(_handler="leases_list")
+
     p_doc = sub.add_parser(
         "doctor",
         help="Preflight: Chrome, CDP probe, pool healthz, spaces root, skill path",
@@ -341,12 +399,29 @@ def main(argv: list[str] | None = None) -> int:
         if args._handler == "serve":
             return _run_serve(args)
         if args._handler == "lease":
+            from slipstream.cli import _parse_metadata_json, _tags_to_metadata
+
+            meta = _parse_metadata_json(getattr(args, "metadata", None)) or {}
+            tag_meta = _tags_to_metadata(getattr(args, "tag", None)) or {}
+            meta.update(tag_meta)
             return cmd_lease(
                 agent_id=args.agent_id,
                 space_id=args.space_id,
                 ttl_seconds=args.ttl_seconds,
                 url=args.url,
+                user_metadata=meta or None,
             )
+        if args._handler == "spaces_list":
+            return cmd_spaces_list(q=args.q, tags=args.tag, url=args.url)
+        if args._handler == "spaces_set":
+            return cmd_spaces_set(
+                space_id=args.space_id,
+                metadata_json=args.metadata,
+                tags=args.tag,
+                url=args.url,
+            )
+        if args._handler == "leases_list":
+            return cmd_leases_list(q=args.q, tags=args.tag, url=args.url)
         if args._handler == "heartbeat":
             return cmd_heartbeat(lease_id=args.lease_id, url=args.url)
         if args._handler == "release":
