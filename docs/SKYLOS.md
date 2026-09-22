@@ -1,19 +1,21 @@
-# Skylos CI
+# Skylos (local Linux)
 
-[Skylos](https://docs.skylos.dev) — dead code / SAST / quality gate (what QMX-style projects often use in CI).
+[Skylos](https://docs.skylos.dev) — dead-code / SAST / quality gate.
 
-## Modes
+**Preferred setup:** run on Linux locally. No GitHub Actions or cloud token required for a local gate.
 
-- **Local gate (no cloud):** `skylos . --danger --secrets --quality --ai-defects --gate`
-- **GitHub Actions:** `.github/workflows/skylos.yml` (scaffolded via `skylos cicd init`)
-- **Cloud upload / dashboard:** needs `SKYLOS_TOKEN` or OIDC project link — not enabled by default here
-
-## Local run (this machine)
+## One-shot
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install skylos
-skylos . --danger --secrets --quality --ai-defects --gate
+./scripts/skylos_local.sh advisory   # default while adopting
+./scripts/skylos_local.sh gate       # hard fail on thresholds
+./scripts/skylos_local.sh json out.json
 ```
 
-When the captain's laptop is back, we can align thresholds/suppressions with the QMX Skylos project if one exists.
+First run creates `.venv-skylos` and installs `skylos`.
+
+## Equivalent raw CLI
+
+```bash
+skylos . --danger --secrets --quality --ai-defects --gate
+```
