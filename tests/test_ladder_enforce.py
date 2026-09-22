@@ -367,7 +367,7 @@ def test_eval_missing_cdp_does_not_burn(api_server: PoolServer):
 
 
 def test_status_omits_cdp_ports_by_default(api_server: PoolServer, monkeypatch):
-    """ADV-PL-001-BYPASS-RAW-CDP-PORT: status/lease cannot reconstruct CDP without env."""
+    """ADV-PL-001-BYPASS-RAW-CDP-PORT: status/lease omit ports+pid; no CDP reconstruct."""
     monkeypatch.delenv("SLIPSTREAM_EXPOSE_RAW_CDP", raising=False)
     base = api_server.base_url
     lid = _lease(base, "port-leak")
@@ -379,6 +379,7 @@ def test_status_omits_cdp_ports_by_default(api_server: PoolServer, monkeypatch):
         assert "cdp_port" not in slot
         assert "cdp_http_url" not in slot
         assert "cdp_ws_url" not in slot
+        assert "chromium_pid" not in slot
 
     # Lease wire JSON from create already checked in test_lease_omits_raw_cdp_by_default;
     # list leases must also omit reconstructable tip fields.
@@ -398,13 +399,19 @@ def test_status_omits_cdp_ports_by_default(api_server: PoolServer, monkeypatch):
         slot = api_server.pool._find_slot_by_lease(lid)
         assert internal.cdp_http_url
         assert slot is not None and slot.cdp_port is not None
+        assert slot.chromium_pid is not None
         internal_url = internal.cdp_http_url
         internal_port = slot.cdp_port
+        internal_pid = slot.chromium_pid
 
     public_ports = [
         s.get("cdp_port") for s in st["slots"] if s.get("cdp_port") is not None
     ]
     assert internal_port not in public_ports
+    public_pids = [
+        s.get("chromium_pid") for s in st["slots"] if s.get("chromium_pid") is not None
+    ]
+    assert internal_pid not in public_pids
 
     monkeypatch.setenv("SLIPSTREAM_EXPOSE_RAW_CDP", "1")
     code, st2 = ladder_http("GET", f"{base}/v1/pool/status")
@@ -414,6 +421,7 @@ def test_status_omits_cdp_ports_by_default(api_server: PoolServer, monkeypatch):
     assert leased_slots
     assert leased_slots[0]["cdp_port"] == internal_port
     assert leased_slots[0]["cdp_http_url"] == internal_url
+    assert leased_slots[0]["chromium_pid"] == internal_pid
 
 
 def test_nav_matched_false_refunds_grant(api_server: PoolServer, monkeypatch):
