@@ -2,7 +2,7 @@
 
 Transport: **localhost HTTP/JSON** via Python stdlib `ThreadingHTTPServer`.
 
-**No MCP** — this HTTP API is the external surface for agents/tools. The agent-facing **`slipstream` CLI** (`lease` / `heartbeat` / `release` / `status` / `doctor`) is another client of these same endpoints (see `skills/slipstream/SKILL.md`; alias intent `slipstream-browser`). There is no MCP server in this project.
+**No MCP** — this HTTP API is the external surface for agents/tools. The agent-facing **`slipstream` CLI** (`lease` / `heartbeat` / `alert` / `release` / `status` / `doctor`) is another client of these same endpoints (see `skills/slipstream/SKILL.md`; alias intent `slipstream-browser`). There is no MCP server in this project.
 
 Default base URL: `http://127.0.0.1:8755` (override for CLI clients with `SLIPSTREAM_URL` or `--url`).
 
@@ -70,6 +70,67 @@ Renews soft idle window. Agents should heartbeat every ~15–30s (including duri
 
 → `404` if the lease is unknown.
 
+### `POST /v1/leases/{lease_id}/alerts`
+
+Raise a lease-scoped alert. Ship-now events: `need_human`, `task_done`.
+
+```json
+{
+  "event": "need_human",
+  "reason": "captcha",
+  "detail": "short human-safe string",
+  "task_id": "optional",
+  "ttl_s": 300,
+  "watch_url": "optional-override"
+}
+```
+
+→ `200` harness envelope:
+
+```json
+{
+  "alert": {
+    "event": "need_human",
+    "event_id": "…",
+    "ts": "2026-09-22T17:30:00+03:00",
+    "lease_id": "…",
+    "space_id": "…",
+    "task_id": null,
+    "reason": "captcha",
+    "detail": "…",
+    "status": "awaiting_human",
+    "watch_url": "http://127.0.0.1:8755/v1/leases/…/watch",
+    "ttl_s": 300,
+    "outcome": null
+  },
+  "harness": {
+    "action": "pause",
+    "agent_paused": true,
+    "lease_kept": true,
+    "lease_released": false,
+    "captain_message": "Need human (captcha) on lease … — [Watch](…) · [Take-over](…)",
+    "watch_url": "…",
+    "takeover_url": "…?mode=takeover",
+    "idempotent": false
+  }
+}
+```
+
+| Event | Lease effect | Harness `action` |
+|-------|--------------|------------------|
+| `need_human` | **Keep** lease / Chromium; mark `awaiting_human` | `pause` |
+| `task_done` | Notify once, then **release** (warm rules like DELETE) | `continue` |
+
+`task_done` body uses `outcome: {"ok": bool, "summary": "…"}` (no secrets). A second `task_done` for the same `lease_id` returns the prior envelope with `harness.idempotent=true` (safe; no double-release error).
+
+→ `400` `invalid_alert` for unknown event, bad reason, or **secret-like fields** (`cookie`, `password`, `token`, `credential`, `authorization`, … — including nested keys).
+
+→ `404` if the lease is unknown (except idempotent `task_done` replay).
+
+→ `409` `alert_conflict` if `need_human` is raised after a completed `task_done`.
+
+**Refuse in payload:** cookies, passwords, tokens, auth headers, credential-store dumps, secret-bearing paths, raw CDP auth. `watch_url` is a short-TTL handoff placeholder until live pair-browse UI exists.
+
 ### `DELETE /v1/leases/{lease_id}`
 
 Optional JSON body: `{"reason":"done"}`.
@@ -105,6 +166,7 @@ Console script / module entry (`slipstream` or `python -m slipstream`):
 | `slipstream serve` | starts this API server |
 | `slipstream lease --agent-id … --space-id …` | `POST /v1/leases` |
 | `slipstream heartbeat --lease-id …` | `POST /v1/leases/{id}/heartbeat` |
+| `slipstream alert need-human\|done --lease-id …` | `POST /v1/leases/{id}/alerts` |
 | `slipstream release --lease-id …` | `DELETE /v1/leases/{id}` |
 | `slipstream status` | `GET /v1/pool/status` |
 | `slipstream doctor [--json]` | local preflight + `GET /healthz` (Chrome/CDP/spaces/skill) |

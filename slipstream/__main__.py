@@ -22,6 +22,7 @@ from slipstream.api import PoolServer
 from slipstream.cli import (
     CliError,
     DEFAULT_URL,
+    cmd_alert,
     cmd_heartbeat,
     cmd_lease,
     cmd_release,
@@ -61,11 +62,11 @@ def _run_serve(args: argparse.Namespace) -> int:
     )
     print(
         "Endpoints: POST /v1/leases  POST /v1/leases/{id}/heartbeat  "
-        "DELETE /v1/leases/{id}  GET /v1/pool/status",
+        "POST /v1/leases/{id}/alerts  DELETE /v1/leases/{id}  GET /v1/pool/status",
         flush=True,
     )
     print(
-        "Agent CLI: slipstream lease|heartbeat|release|status|doctor  "
+        "Agent CLI: slipstream lease|heartbeat|alert|release|status|doctor  "
         "(see skills/slipstream/SKILL.md)",
         flush=True,
     )
@@ -77,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="slipstream",
         description=(
-            "Slipstream browser pool — serve, lease/heartbeat/release/status, "
+            "Slipstream browser pool — serve, lease/heartbeat/alert/release/status, "
             "or doctor (preflight) against Chrome + pool."
         ),
     )
@@ -147,6 +148,48 @@ def build_parser() -> argparse.ArgumentParser:
     _add_url(p_st)
     p_st.set_defaults(_handler="status")
 
+    # --- alert ---
+    p_alert = sub.add_parser(
+        "alert",
+        help="Raise need_human (pause, keep lease) or task_done (notify + release)",
+    )
+    _add_url(p_alert)
+    p_alert.add_argument(
+        "kind",
+        choices=["need-human", "done"],
+        help="need-human: pause agent, keep Chromium; done: notify once then release",
+    )
+    p_alert.add_argument("--lease-id", required=True, help="Lease id from lease JSON")
+    p_alert.add_argument(
+        "--reason",
+        default=None,
+        help="need_human reason: captcha|login|ambiguous_ui|stuck|other",
+    )
+    p_alert.add_argument("--detail", default=None, help="Short human-safe detail")
+    p_alert.add_argument("--task-id", default=None, help="Optional harness task id")
+    p_alert.add_argument(
+        "--ttl-s",
+        type=int,
+        default=None,
+        help="Watch URL TTL seconds (default 300)",
+    )
+    p_alert.add_argument(
+        "--watch-url",
+        default=None,
+        help="Override watch URL (local placeholder ok)",
+    )
+    p_alert.add_argument(
+        "--fail",
+        action="store_true",
+        help="task_done: outcome.ok=false (default is success)",
+    )
+    p_alert.add_argument(
+        "--summary",
+        default=None,
+        help="task_done: short outcome summary (no secrets)",
+    )
+    p_alert.set_defaults(_handler="alert")
+
     # --- doctor ---
     p_doc = sub.add_parser(
         "doctor",
@@ -192,6 +235,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args._handler == "status":
             return cmd_status(url=args.url)
+        if args._handler == "alert":
+            ok_flag = False if args.fail else True
+            return cmd_alert(
+                kind=args.kind,
+                lease_id=args.lease_id,
+                reason=args.reason,
+                detail=args.detail,
+                task_id=args.task_id,
+                ttl_s=args.ttl_s,
+                ok=ok_flag if args.kind == "done" else None,
+                summary=args.summary,
+                watch_url=args.watch_url,
+                url=args.url,
+            )
         if args._handler == "doctor":
             return cmd_doctor(url=args.url, as_json=args.as_json)
     except CliError as e:

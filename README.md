@@ -33,10 +33,11 @@ slipstream/          # Pool service package
   launcher.py        # ChromiumLauncher (CDP + user-data-dir); mock via SLIPSTREAM_MOCK=1
   cdp_http.py        # Thin DevTools HTTP helpers (smoke/bench; not full driver)
   rss.py             # sample_tree_rss(pid) — /proc tree RSS hook
-  pool.py            # BrowserPool lease/heartbeat/release/evict
+  pool.py            # BrowserPool lease/heartbeat/alert/release/evict
+  alerts.py          # need_human + task_done (no secrets in payload)
   api.py             # HTTP JSON API (stdlib)
   cli.py             # Agent HTTP client helpers (urllib)
-  __main__.py        # slipstream / python -m slipstream (serve|lease|heartbeat|release|status|doctor)
+  __main__.py        # slipstream / python -m slipstream (serve|lease|heartbeat|alert|release|status|doctor)
   doctor.py          # Preflight: Chrome, CDP, healthz, spaces, skill
 skills/
   slipstream/SKILL.md  # Agent skill (alias: slipstream-browser); lifecycle + doctor
@@ -81,6 +82,8 @@ slipstream lease --agent-id a1 --space-id task-1
 # → prints lease JSON (lease_id, cdp_http_url, cdp_ws_url, …)
 
 slipstream heartbeat --lease-id <lease_id>
+slipstream alert need-human --lease-id <lease_id> --reason captcha
+slipstream alert done --lease-id <lease_id> --summary "finished"
 slipstream release --lease-id <lease_id>
 slipstream status
 ```
@@ -105,6 +108,9 @@ curl -s -X POST http://127.0.0.1:8755/v1/leases \
 
 # Heartbeat + release (DELETE only — no POST /release alias)
 curl -s -X POST http://127.0.0.1:8755/v1/leases/<lease_id>/heartbeat
+curl -s -X POST http://127.0.0.1:8755/v1/leases/<lease_id>/alerts \
+  -H 'Content-Type: application/json' \
+  -d '{"event":"need_human","reason":"captcha","detail":"challenge"}'
 curl -s -X DELETE http://127.0.0.1:8755/v1/leases/<lease_id>
 ```
 

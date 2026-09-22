@@ -7,6 +7,15 @@ import threading
 import time
 from typing import Any
 
+from slipstream.alerts import (
+    EVENT_NEED_HUMAN,
+    EVENT_TASK_DONE,
+    AlertConflictError,
+    build_alert_payload,
+    build_harness_envelope,
+    default_takeover_url,
+    parse_alert_request,
+)
 from slipstream.config import PoolConfig
 from slipstream.launcher import ChromiumLauncher, LaunchHandle
 from slipstream.models import Lease, SlotState, SlotStatus, new_lease_id
@@ -47,6 +56,10 @@ class BrowserPool:
         ]
         self._handles: dict[int, LaunchHandle] = {}
         self._leases: dict[str, Lease] = {}
+        # Alerts: per-lease history + task_done idempotency (survives release)
+        self._alert_log: dict[str, list[dict[str, Any]]] = {}
+        self._task_done_envelopes: dict[str, dict[str, Any]] = {}
+        self._api_base_url: str = f"http://{self.config.host}:{self.config.port}"
         # Ensure spaces root exists
         self.config.spaces_root.mkdir(parents=True, exist_ok=True)
 
@@ -475,6 +488,95 @@ class BrowserPool:
         if stop_handle is not None:
             self.launcher.stop(stop_handle)
         return result
+
+
+    def set_api_base_url(self, base_url: str) -> None:
+        """Bind public base URL for watch/takeover placeholders (called by PoolServer)."""
+        self._api_base_url = base_url.rstrip("/")
+
+    def raise_alert(self, lease_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Raise need_human (pause, keep lease) or task_done (notify once, release).
+
+        Returns harness envelope JSON. Double ``task_done`` is idempotent.
+        Rejects secret-like fields. Never dumps cookies/tokens/creds.
+        """
+        parsed = parse_alert_request(body)
+        event = parsed["event"]
+        base = self._api_base_url
+
+        # Idempotent task_done after release (or repeat while still leased)
+        if event == EVENT_TASK_DONE and lease_id in self._task_done_envelopes:
+            prior = self._task_done_envelopes[lease_id]
+            # Shallow copy harness flag
+            out = {
+                "alert": dict(prior["alert"]),
+                "harness": dict(prior["harness"]),
+            }
+            out["harness"]["idempotent"] = True
+            return out
+
+        stop_handle = None
+        with self._lock:
+            lease = self._leases.get(lease_id)
+            if not lease:
+                if event == EVENT_TASK_DONE and lease_id in self._task_done_envelopes:
+                    # Race: released between check and lock — still idempotent
+                    prior = self._task_done_envelopes[lease_id]
+                    out = {
+                        "alert": dict(prior["alert"]),
+                        "harness": dict(prior["harness"]),
+                    }
+                    out["harness"]["idempotent"] = True
+                    return out
+                raise LeaseNotFoundError(lease_id)
+            slot = self._find_slot_by_lease(lease_id)
+            if not slot or slot.status != SlotStatus.LEASED:
+                raise LeaseNotFoundError(lease_id)
+
+            # Already marked done while somehow still leased (shouldn't stick)
+            if event == EVENT_NEED_HUMAN and lease_id in self._task_done_envelopes:
+                raise AlertConflictError("lease already completed via task_done")
+
+            payload = build_alert_payload(
+                lease_id=lease_id,
+                space_id=lease.space_id,
+                parsed=parsed,
+                base_url=base,
+            )
+            takeover = default_takeover_url(lease_id, base_url=base)
+
+            if event == EVENT_NEED_HUMAN:
+                lease.status = "awaiting_human"
+                # Keep Chromium / lease warm — agent pauses
+                envelope = build_harness_envelope(
+                    payload,
+                    lease_kept=True,
+                    lease_released=False,
+                    agent_paused=True,
+                    action="pause",
+                    takeover_url=takeover,
+                    idempotent=False,
+                )
+                self._alert_log.setdefault(lease_id, []).append(payload)
+                return envelope
+
+            # task_done — notify then release once (explicit client-style warm ok)
+            envelope = build_harness_envelope(
+                payload,
+                lease_kept=False,
+                lease_released=True,
+                agent_paused=False,
+                action="continue",
+                takeover_url=takeover,
+                idempotent=False,
+            )
+            self._alert_log.setdefault(lease_id, []).append(payload)
+            self._task_done_envelopes[lease_id] = envelope
+            stop_handle = self._detach_lease_locked(lease_id, allow_warm=True)
+
+        if stop_handle is not None:
+            self.launcher.stop(stop_handle)
+        return envelope
 
     def evict_idle(self, now: float | None = None) -> list[str]:
         """Soft-evict idle leases and hard-TTL-expired leases.
