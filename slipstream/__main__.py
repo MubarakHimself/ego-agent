@@ -11,6 +11,8 @@ Subcommands:
   confirm     POST /v1/confirmations/{id} {action: confirm}
   deny        POST /v1/confirmations/{id} {action: deny}
   doctor     Preflight: Chrome, CDP, pool healthz, spaces, skill, watch_compose
+  downloads  List/get lease session download artifacts
+  uploads    List/put thin lease upload drop
   watch-status  Compose /watch detection (optional; never hard-fail)
 
 Client commands talk to a running pool (SLIPSTREAM_URL or --url).
@@ -21,12 +23,15 @@ from __future__ import annotations
 
 _STORE_TRUE = "store_true"
 _OPT_LEASE_ID = "--lease-id"
+_OPT_AGENT_ID = "--agent-id"
 _OPT_SPACE_ID = "--space-id"
 _OPT_TAG = "--tag"
 _OPT_JSON = "--json"
 _DEST_AS_JSON = "as_json"
 _HANDLER_SESSIONS = "sessions"
 _HANDLER_CAPTCHA = "captcha"
+_HANDLER_DOWNLOADS = "downloads"
+_HANDLER_UPLOADS = "uploads"
 _OPT_DETAIL = "--detail"
 _HELP_DETAIL = "Short non-secret detail"
 
@@ -41,6 +46,10 @@ from slipstream.cli import (
     cmd_act,
     cmd_alert,
     cmd_captcha,
+    cmd_downloads_get,
+    cmd_downloads_list,
+    cmd_uploads_list,
+    cmd_uploads_put,
     cmd_confirm,
     cmd_cred_bind,
     cmd_cred_fill,
@@ -148,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     # --- lease ---
     p_lease = sub.add_parser("lease", help="Acquire a lease (prints lease JSON)")
     _add_url(p_lease)
-    p_lease.add_argument("--agent-id", required=True, help="Calling agent id")
+    p_lease.add_argument(_OPT_AGENT_ID, required=True, help="Calling agent id")
     p_lease.add_argument(_OPT_SPACE_ID, required=True, help="Space / user-data-dir id")
     p_lease.add_argument(
         "--ttl-seconds",
@@ -258,6 +267,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_url(p_cap)
     p_cap.set_defaults(_handler=_HANDLER_CAPTCHA)
+
+
+    # --- downloads (session artifacts) ---
+    p_dl = sub.add_parser(
+        _HANDLER_DOWNLOADS,
+        help="List/get lease-scoped download artifacts (no absolute paths)",
+    )
+    dl_sub = p_dl.add_subparsers(dest="downloads_cmd", metavar="DL_CMD")
+    p_dll = dl_sub.add_parser("list", help="GET /v1/leases/{id}/downloads")
+    _add_url(p_dll)
+    p_dll.add_argument(_OPT_LEASE_ID, required=True)
+    p_dll.add_argument(_OPT_AGENT_ID, default=None, help="Optional ownership check")
+    p_dll.add_argument(
+        "--rel-path",
+        action=_STORE_TRUE,
+        help="Include lease-relative path (never absolute)",
+    )
+    p_dll.set_defaults(_handler="downloads_list")
+    p_dlg = dl_sub.add_parser("get", help="GET /v1/leases/{id}/downloads/{artifact_id}")
+    _add_url(p_dlg)
+    p_dlg.add_argument(_OPT_LEASE_ID, required=True)
+    p_dlg.add_argument("--artifact-id", required=True)
+    p_dlg.add_argument("-o", "--output", default=None, help="Write bytes to file")
+    p_dlg.add_argument(_OPT_AGENT_ID, default=None)
+    p_dlg.set_defaults(_handler="downloads_get")
+
+    # --- uploads (thin drop) ---
+    p_up = sub.add_parser(
+        _HANDLER_UPLOADS,
+        help="Thin lease-scoped upload drop (list/put)",
+    )
+    up_sub = p_up.add_subparsers(dest="uploads_cmd", metavar="UP_CMD")
+    p_upl = up_sub.add_parser("list", help="GET /v1/leases/{id}/uploads")
+    _add_url(p_upl)
+    p_upl.add_argument(_OPT_LEASE_ID, required=True)
+    p_upl.add_argument(_OPT_AGENT_ID, default=None)
+    p_upl.set_defaults(_handler="uploads_list")
+    p_upp = up_sub.add_parser("put", help="POST /v1/leases/{id}/uploads")
+    _add_url(p_upp)
+    p_upp.add_argument(_OPT_LEASE_ID, required=True)
+    p_upp.add_argument("--filename", required=True)
+    p_upp.add_argument("--file", required=True, help="Local regular file to upload")
+    p_upp.add_argument(_OPT_AGENT_ID, default=None)
+    p_upp.set_defaults(_handler="uploads_put")
+
 
 
     # --- cred (bind/unbind/list/fill) ---
@@ -430,7 +484,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_url(p_sp_lo)
     p_sp_lo.add_argument(_OPT_SPACE_ID, required=True, help="Space id")
-    p_sp_lo.add_argument("--agent-id", required=True, help="Agent id for the lease")
+    p_sp_lo.add_argument(_OPT_AGENT_ID, required=True, help="Agent id for the lease")
     p_sp_lo.add_argument(_OPT_DETAIL, default=None, help="Human-safe detail string")
     p_sp_lo.add_argument("--host", default=None, help="Optional host hint for later badge")
     p_sp_lo.add_argument("--ttl-s", type=int, default=None, help="Watch TTL seconds")
@@ -606,6 +660,35 @@ def main(argv: list[str] | None = None) -> int:
                 provider=args.provider,
                 timeout_s=args.timeout_s,
                 url=args.url,
+            )
+        if args._handler == "downloads_list":
+            return cmd_downloads_list(
+                lease_id=args.lease_id,
+                url=args.url,
+                agent_id=args.agent_id,
+                rel_path=bool(getattr(args, "rel_path", False)),
+            )
+        if args._handler == "downloads_get":
+            return cmd_downloads_get(
+                lease_id=args.lease_id,
+                artifact_id=args.artifact_id,
+                output=args.output,
+                url=args.url,
+                agent_id=args.agent_id,
+            )
+        if args._handler == "uploads_list":
+            return cmd_uploads_list(
+                lease_id=args.lease_id,
+                url=args.url,
+                agent_id=args.agent_id,
+            )
+        if args._handler == "uploads_put":
+            return cmd_uploads_put(
+                lease_id=args.lease_id,
+                filename=args.filename,
+                file_path=args.file,
+                url=args.url,
+                agent_id=args.agent_id,
             )
         if args._handler == "cred_bind":
             secret = resolve_secret(

@@ -20,10 +20,11 @@ MVP is always **isolated** mode (one process tree per Space). There is no `mode`
 | `lease_hard_ttl_seconds` | 1800 | Hard lease ceiling (enforced on heartbeat / idle sweep / re-lease); always stops Chromium |
 | `spaces_root` | `./data/spaces` | Space = `{spaces_root}/{space_id}/` = Chromium `--user-data-dir` |
 | `vault_root` | `./data/vault` | Credential vault (**must** be outside `spaces_root`; fail-closed at config/pool init) |
+| `artifacts_root` | `./data/artifacts` | Lease downloads/uploads (**must** be outside `spaces_root` + `vault_root`) |
 | `cdp_base_port` | 9222 | Slot *i* uses port `9222 + i` |
 | `host` / `port` | `127.0.0.1` / `8755` | API bind |
 
-Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm seconds, default 60), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted unless Space/lease lockdown applies), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers).
+Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_ARTIFACTS_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm seconds, default 60), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted unless Space/lease lockdown applies), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers).
 
 ## Endpoints
 
@@ -408,6 +409,46 @@ Watch HTML shows a high-salience chip/banner when state is solving or
 failed/escalated. Activity feed kind `captcha`. CLI:
 `slipstream captcha started|finished|failed --lease-id …`.
 
+
+### Downloads / uploads as session artifacts (thin)
+
+Browserbase-style **lease-scoped files** (peers-deep #7). Chrome downloads are
+directed into `{artifacts_root}/leases/{lease_id}/downloads/` via CDP
+`Browser.setDownloadBehavior` (mock records the call). Agents list/fetch by
+**artifact id** — absolute host paths are omitted by default (optional
+`?rel_path=1` returns lease-relative `downloads/…` only).
+
+```http
+GET /v1/leases/{lease_id}/downloads
+GET /v1/leases/{lease_id}/downloads?agent_id=…&rel_path=1
+→ 200 { "lease_id", "downloads": [
+    { "id", "filename", "bytes", "sha256", "created_at", "kind":"download", "path?" }
+  ], "total" }
+
+GET /v1/leases/{lease_id}/downloads/{artifact_id}
+→ 200 application/octet-stream  (X-Slipstream-Sha256)
+→ 200 application/json when Accept: application/json  { "lease_id", "download": {…} }
+```
+
+Optional thin **upload drop** (same discipline):
+
+```http
+POST /v1/leases/{lease_id}/uploads
+{ "filename": "drop.bin", "content_b64": "…", "agent_id?": "…" }
+→ 201 { "lease_id", "upload": { id, filename, bytes, sha256, created_at, kind:"upload" } }
+
+GET /v1/leases/{lease_id}/uploads
+GET /v1/leases/{lease_id}/uploads/{artifact_id}
+```
+
+Safety: Path containment + `O_NOFOLLOW`; symlink escape refused; secret-looking
+filenames denylisted; optional `agent_id` must match lease owner. Env:
+`SLIPSTREAM_ARTIFACTS_ROOT`, `SLIPSTREAM_MAX_UPLOAD_BYTES` (default 5 MiB).
+
+CLI: `slipstream downloads list|get` · `slipstream uploads list|put`.
+
+**Not included:** cloud object storage, full upload product polish, Electron, MCP, Monid.
+
 ### Ops session list (thin)
 
 Browserbase-style **fleet / ops list** (ui-peers steal #7). Joins active leases with status, duration, tags, signed-in badge, and **watch_url only when a valid tokenized Watch already exists** (need_human / awaiting_human). Treat `watch_url` as a screen-share secret — never log it; do not invent long-lived public URLs.
@@ -428,7 +469,7 @@ GET /v1/ops/
 
 CLI: `slipstream sessions` (table; watch presence only) · `slipstream sessions --json` (includes tokenized URLs).
 
-**Not included here:** downloads product, full dashboard WS, Monid, Electron, MCP. CAPTCHA chips: see below.
+**Not included here:** full dashboard WS, Monid, Electron, MCP. Downloads: see above. CAPTCHA chips: see above.
 
 ### `DELETE /v1/leases/{lease_id}`
 
