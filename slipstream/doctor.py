@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from slipstream import __version__
-from slipstream.cli import DEFAULT_URL, resolve_base_url
+from slipstream.cli import DEFAULT_URL, _validate_api_request_url, resolve_base_url
 from slipstream.config import PoolConfig
 from slipstream.launcher import find_chrome_binary
 
@@ -272,7 +272,7 @@ def _check_cdp_probe(chrome: CheckResult) -> CheckResult:
 
 
 def _check_pool_healthz(base_url: str) -> CheckResult:
-    url = f"{base_url.rstrip('/')}/healthz"
+    url = _validate_api_request_url(f"{base_url.rstrip('/')}/healthz")
     try:
         with urllib.request.urlopen(url, timeout=3.0) as resp:
             raw = resp.read().decode("utf-8", errors="replace")

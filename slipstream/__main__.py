@@ -31,6 +31,7 @@ from slipstream.cli import (
     cmd_lease,
     cmd_release,
     cmd_status,
+    resolve_secret,
 )
 from slipstream.doctor import cmd_doctor
 from slipstream.config import PoolConfig
@@ -204,7 +205,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_bind.add_argument("--origin", required=True)
     p_bind.add_argument("--username", required=True)
     p_bind.add_argument(
-        "--secret", required=True, help="Secret (not logged; local/captain only)"
+        "--secret",
+        default=None,
+        help="Secret on argv (refused unless SLIPSTREAM_ALLOW_SECRET_ARGV=1)",
+    )
+    p_bind.add_argument(
+        "--secret-env",
+        default=None,
+        help="Read secret from environment variable NAME (preferred)",
+    )
+    p_bind.add_argument(
+        "--secret-file",
+        default=None,
+        help="Read secret from file path (preferred)",
+    )
+    p_bind.add_argument(
+        "--prompt",
+        action="store_true",
+        help="Prompt for secret via getpass (no echo)",
     )
     p_bind.set_defaults(_handler="cred_bind")
 
@@ -292,12 +310,18 @@ def main(argv: list[str] | None = None) -> int:
                 url=args.url,
             )
         if args._handler == "cred_bind":
+            secret = resolve_secret(
+                secret=args.secret,
+                secret_env=args.secret_env,
+                secret_file=args.secret_file,
+                prompt=bool(args.prompt),
+            )
             return cmd_cred_bind(
                 space_id=args.space_id,
                 label=args.label,
                 origin=args.origin,
                 username=args.username,
-                secret=args.secret,
+                secret=secret,
                 url=args.url,
             )
         if args._handler == "cred_unbind":

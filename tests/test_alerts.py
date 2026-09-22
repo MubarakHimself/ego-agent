@@ -21,6 +21,7 @@ from slipstream.alerts import (
 from slipstream.api import PoolServer
 from slipstream.config import PoolConfig
 from slipstream.pool import BrowserPool
+from slipstream.cli import _validate_api_request_url
 
 
 @pytest.fixture
@@ -46,13 +47,13 @@ def _req(method: str, url: str, body: dict | None = None) -> tuple[int, dict]:
         raise ValueError(f"test helper refuses non-loopback URL: {url!r}")
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
-        url,
+        _validate_api_request_url(url),
         data=data,
         method=method,
         headers={"Content-Type": "application/json"} if data else {},
     )
     try:
-        with urllib.request.urlopen(request, timeout=5) as resp:
+        with urllib.request.urlopen(request, timeout=5) as resp:  # skylos: ignore[SKY-D216] loopback test helper; URL via _validate_api_request_url
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode("utf-8"))
@@ -247,6 +248,9 @@ def test_scrub_detail_and_summary(api_server: PoolServer):
     assert "password=[REDACTED]" in scrub_text("user password=s3cret ok")
     assert "cookie=[REDACTED]" in scrub_text("cookie=abc; path=/")
     assert "token=[REDACTED]" in scrub_text("token=xyz")
+    assert "secret=[REDACTED]" in scrub_text("secret=hunter2")
+    assert "authorization=[REDACTED]" in scrub_text("authorization=Bearer abc")
+    assert "bearer=[REDACTED]" in scrub_text("bearer=xyz")
     parsed = parse_alert_request(
         {
             "event": "need_human",

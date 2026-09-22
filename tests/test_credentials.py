@@ -14,12 +14,15 @@ from slipstream import __main__ as mainmod
 from slipstream.api import PoolServer
 from slipstream.cdp_inject import MockCdpInjector
 from slipstream.config import PoolConfig
+from slipstream.cli import _validate_api_request_url
 from slipstream.pool import BrowserPool
 from slipstream.vault import (
     CredNotFoundError,
     CredVault,
+    VaultUnavailableError,
     VaultValidationError,
     material_for_field,
+    origins_match,
     parse_fill_body,
 )
 
@@ -37,7 +40,7 @@ def api_server(tmp_path):
         port=18790,
     )
     pool = BrowserPool(cfg)
-    pool._cdp_injector = MockCdpInjector()
+    pool._cdp_injector = MockCdpInjector(current_url="https://github.com/login")
     server = PoolServer(pool, port=18790)
     server.start(background=True)
     yield server
@@ -47,13 +50,13 @@ def api_server(tmp_path):
 def _req(method: str, url: str, body: dict | None = None) -> tuple[int, dict]:
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
-        url,
+        _validate_api_request_url(url),
         data=data,
         method=method,
         headers={"Content-Type": "application/json"} if data else {},
     )
     try:
-        with urllib.request.urlopen(request, timeout=5) as resp:
+        with urllib.request.urlopen(request, timeout=5) as resp:  # skylos: ignore[SKY-D216] loopback test helper; URL via _validate_api_request_url
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode("utf-8"))
@@ -166,6 +169,7 @@ def test_http_bind_list_fill_unbind(api_server: PoolServer):
 
     code, cookies = _req("GET", f"{base}/v1/spaces/s1/credentials/cookies")
     assert code == 404
+    assert cookies["error"] == "refused"
 
     code, ub = _req(
         "POST",
@@ -200,6 +204,9 @@ def test_cli_cred_bind_list_fill(api_server: PoolServer):
             code = mainmod.main(argv)
         return code, out.getvalue(), err.getvalue()
 
+    import os
+
+    os.environ["SLIPSTREAM_BIND_SECRET"] = "p"
     code, out, err = run(
         [
             "cred",
@@ -211,11 +218,11 @@ def test_cli_cred_bind_list_fill(api_server: PoolServer):
             "--label",
             "l",
             "--origin",
-            "https://example.com",
+            "https://github.com",
             "--username",
             "u",
-            "--secret",
-            "p",
+            "--secret-env",
+            "SLIPSTREAM_BIND_SECRET",
         ]
     )
     assert code == 0, err
@@ -294,3 +301,125 @@ def test_need_human_login_path(api_server: PoolServer):
     blob = json.dumps(env).lower()
     assert "password=" not in blob
     assert "sekrit" not in blob
+
+
+def test_vault_inside_spaces_fails(tmp_path):
+    """ADV-002: vault_root under spaces_root fail-closed."""
+    spaces = tmp_path / "spaces"
+    spaces.mkdir()
+    vault = spaces / "vault"
+    cfg = PoolConfig(spaces_root=spaces, vault_root=vault, mock=True, K=1)
+    with pytest.raises(ValueError, match="outside"):
+        BrowserPool(cfg)
+
+
+def test_vault_posix_permissions(tmp_path):
+    """ADV-004: vault dir 0o700; bindings 0o600 (POSIX)."""
+    import os
+    import stat
+
+    if os.name == "nt":
+        pytest.skip("POSIX modes")
+    v = CredVault(tmp_path / "v", mock=True)
+    v.bind(
+        "s",
+        label="l",
+        origin="https://example.com",
+        username="u",
+        secret="x",
+    )
+    mode_dir = stat.S_IMODE(v.vault_root.stat().st_mode)
+    assert mode_dir == 0o700
+    mode_meta = stat.S_IMODE(v._meta_path.stat().st_mode)
+    assert mode_meta == 0o600
+
+
+def test_parse_fill_recursive_secret_reject():
+    """ADV-007: nested secret-like keys refused."""
+    with pytest.raises(VaultValidationError, match="secret"):
+        parse_fill_body(
+            {
+                "cred_id": "c1",
+                "fields": {"username": "#u"},
+                "extra": {"token": "leak"},
+            }
+        )
+    with pytest.raises(VaultValidationError, match="authorization|refused"):
+        parse_fill_body(
+            {"cred_id": "c1", "authorization": "Bearer x", "fields": {"username": "#u"}}
+        )
+
+
+def test_vault_key_refused_outside_mock(tmp_path, monkeypatch):
+    """ADV-011: SLIPSTREAM_VAULT_KEY refused unless mock or allow."""
+    monkeypatch.setenv("SLIPSTREAM_VAULT_KEY", "dGVzdC1rZXktbm90LXJlYWwtZmVybmV0LWtleSE=")
+    monkeypatch.delenv("SLIPSTREAM_ALLOW_VAULT_KEY", raising=False)
+    monkeypatch.delenv("SLIPSTREAM_MOCK", raising=False)
+    with pytest.raises(VaultUnavailableError, match="VAULT_KEY refused"):
+        CredVault(tmp_path / "v", mock=False)
+
+
+def test_origins_match_helper():
+    assert origins_match("https://github.com", "https://github.com/login")
+    assert not origins_match("https://github.com", "https://evil.example/login")
+
+
+def test_fill_origin_mismatch_400(api_server: PoolServer):
+    """ADV-010: fill refuses when page origin != cred.origin."""
+    base = api_server.base_url
+    inj = api_server.pool._cdp_injector
+    assert isinstance(inj, MockCdpInjector)
+    code, bind = _req(
+        "POST",
+        f"{base}/v1/spaces/orig/credentials/bind",
+        {
+            "label": "gh",
+            "origin": "https://github.com",
+            "username": "bob",
+            "secret": "sekrit",
+        },
+    )
+    assert code == 200
+    code, lease = _req(
+        "POST", f"{base}/v1/leases", {"agent_id": "a", "space_id": "orig"}
+    )
+    assert code == 200
+    inj.current_url = "https://evil.example/phishing"
+    code, err = _req(
+        "POST",
+        f"{base}/v1/leases/{lease['lease_id']}/credentials/fill",
+        {
+            "cred_id": bind["cred_id"],
+            "fields": {"username": "#u", "password": "#p"},
+        },
+    )
+    assert code == 400
+    assert err["error"] == "invalid_credentials"
+    assert "origin mismatch" in err["detail"]
+
+
+def test_cli_refuses_bare_secret_argv(api_server: PoolServer, monkeypatch):
+    """ADV-005: bare --secret refused without allow flag."""
+    monkeypatch.delenv("SLIPSTREAM_ALLOW_SECRET_ARGV", raising=False)
+    out, err = __import__("io").StringIO(), __import__("io").StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = mainmod.main(
+            [
+                "cred",
+                "bind",
+                "--url",
+                api_server.base_url,
+                "--space-id",
+                "x",
+                "--label",
+                "l",
+                "--origin",
+                "https://github.com",
+                "--username",
+                "u",
+                "--secret",
+                "nope",
+            ]
+        )
+    assert code == 2
+    assert "refusing bare --secret" in err.getvalue()

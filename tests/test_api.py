@@ -11,6 +11,7 @@ import pytest
 from slipstream.api import PoolServer
 from slipstream.config import PoolConfig
 from slipstream.pool import BrowserPool
+from slipstream.cli import _validate_api_request_url
 
 
 @pytest.fixture
@@ -37,13 +38,13 @@ def _req(method: str, url: str, body: dict | None = None) -> tuple[int, dict]:
         raise ValueError(f"test helper refuses non-loopback URL: {url!r}")
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
-        url,
+        _validate_api_request_url(url),
         data=data,
         method=method,
         headers={"Content-Type": "application/json"} if data else {},
     )
     try:
-        with urllib.request.urlopen(request, timeout=5) as resp:
+        with urllib.request.urlopen(request, timeout=5) as resp:  # skylos: ignore[SKY-D216] loopback test helper; URL via _validate_api_request_url
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode("utf-8"))

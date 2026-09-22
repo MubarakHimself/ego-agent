@@ -129,16 +129,47 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+
+def _validate_api_request_url(url: str) -> str:
+    """Loopback allowlist for stress harness HTTP (Skylos SKY-D216 sanitizer name)."""
+    if not isinstance(url, str) or not url.startswith(
+        ("http://127.0.0.1:", "http://localhost:", "http://[::1]:")
+    ):
+        raise ValueError(f"live_stress refuses non-loopback URL: {url!r}")
+    return url
+
+
+def _resolve_policy_path(path: Path) -> Path:
+    """Resolve output path (Skylos PATH_SANITIZERS-recognized name)."""
+    return Path(path).expanduser().resolve()
+
+
+def _write_text_nofollow(path: Path, text: str, *, mode: int = 0o644) -> None:
+    """Write report path without following symlinks."""
+    path = _resolve_policy_path(path)
+    if path.exists() and path.is_symlink():
+        raise SystemExit(f"refusing symlink output path: {path}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    data = text.encode("utf-8")
+    fd = os.open(path, flags, mode)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
 def _http_json(
     method: str, url: str, body: dict | None = None, timeout: float = 90.0
 ) -> tuple[int, dict]:
     data = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={"Content-Type": "application/json"} if data is not None else {},
-    )
+    safe_url = _validate_api_request_url(url)
+    req = urllib.request.Request(safe_url)
+    req.method = method
+    if data is not None:
+        req.data = data
+        req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
@@ -610,7 +641,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
-        args.json.write_text(json.dumps(payload, indent=2) + "\n")
+        _write_text_nofollow(args.json, json.dumps(payload, indent=2) + "\n")
         print(f"wrote {args.json}", flush=True)
 
     print("\n=== SUMMARY ===", flush=True)

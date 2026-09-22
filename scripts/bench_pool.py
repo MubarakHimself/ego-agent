@@ -47,6 +47,29 @@ from slipstream.launcher import find_chrome_binary
 from slipstream.pool import BrowserPool
 
 
+def _resolve_policy_path(path):
+    from pathlib import Path as _P
+    return _P(path).expanduser().resolve()
+
+
+def _write_text_nofollow(path, text: str, *, mode: int = 0o644) -> None:
+    """Write bench --out without following symlinks (SKY-D324)."""
+    import os
+    from pathlib import Path
+    path = _resolve_policy_path(path)
+    if path.exists() and path.is_symlink():
+        raise SystemExit(f"refusing symlink output path: {path}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, mode)
+    try:
+        os.write(fd, text.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+
 def _ms(t0: float, t1: float | None = None) -> float:
     end = time.perf_counter() if t1 is None else t1
     return round((end - t0) * 1000.0, 3)
@@ -294,7 +317,7 @@ def main(argv: list[str] | None = None) -> int:
     print(text)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(text + "\n", encoding="utf-8")
+        _write_text_nofollow(args.out, text + "\n")
         print(f"# wrote {args.out}", file=sys.stderr)
 
     return 0 if payload["ok"] else 1
