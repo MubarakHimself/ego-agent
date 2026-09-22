@@ -386,3 +386,87 @@ def cmd_cred_fill(
         _fail_http(status, payload)
     _print_json(payload)
     return 0
+
+
+def cmd_act(
+    *,
+    lease_id: str,
+    category: str,
+    summary: str,
+    url: str | None = None,
+    confirm_interactive: bool = False,
+) -> int:
+    """POST /v1/leases/{id}/actions — gate eval|download|upload|nav_irreversible.
+
+    On confirmation_required (HTTP 202): print JSON and exit 0 (orchestrator
+    mode). With --confirm-interactive: prompt on TTY; Non-TTY → auto-deny.
+    """
+    base = resolve_base_url(url)
+    body = {"category": category, "summary": summary}
+    status, payload = _request(
+        "POST", f"{base}/v1/leases/{lease_id}/actions", body
+    )
+    if status not in (200, 202):
+        _fail_http(status, payload)
+
+    if payload.get("status") == "confirmation_required" and confirm_interactive:
+        confirm_id = payload.get("confirm_id")
+        if not confirm_id:
+            raise CliError("confirmation_required missing confirm_id", exit_code=1)
+        if not sys.stdin.isatty():
+            # Non-TTY → deny (agent-browser pattern)
+            d_status, d_payload = _request(
+                "POST",
+                f"{base}/v1/confirmations/{confirm_id}",
+                {"action": "deny"},
+            )
+            if d_status != 200:
+                _fail_http(d_status, d_payload)
+            _print_json(d_payload)
+            return 1
+        sys.stderr.write(
+            f"Allow {payload.get('category')} "
+            f"({payload.get('summary')!r})? [y/N] "
+        )
+        sys.stderr.flush()
+        try:
+            answer = sys.stdin.readline().strip().lower()
+        except EOFError:
+            answer = ""
+        action = "confirm" if answer in ("y", "yes") else "deny"
+        r_status, r_payload = _request(
+            "POST",
+            f"{base}/v1/confirmations/{confirm_id}",
+            {"action": action},
+        )
+        if r_status != 200:
+            _fail_http(r_status, r_payload)
+        _print_json(r_payload)
+        return 0 if action == "confirm" else 1
+
+    _print_json(payload)
+    return 0
+
+
+def cmd_confirm(*, confirm_id: str, url: str | None = None) -> int:
+    """POST /v1/confirmations/{confirm_id} {action: confirm}."""
+    base = resolve_base_url(url)
+    status, payload = _request(
+        "POST", f"{base}/v1/confirmations/{confirm_id}", {"action": "confirm"}
+    )
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0
+
+
+def cmd_deny(*, confirm_id: str, url: str | None = None) -> int:
+    """POST /v1/confirmations/{confirm_id} {action: deny}."""
+    base = resolve_base_url(url)
+    status, payload = _request(
+        "POST", f"{base}/v1/confirmations/{confirm_id}", {"action": "deny"}
+    )
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0

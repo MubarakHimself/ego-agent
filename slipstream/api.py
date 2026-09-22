@@ -6,6 +6,8 @@ Endpoints:
   POST   /v1/leases
   POST   /v1/leases/{id}/heartbeat
   POST   /v1/leases/{id}/alerts
+  POST   /v1/leases/{id}/actions
+  POST   /v1/leases/{id}/confirmations/{confirm_id}
   POST   /v1/leases/{id}/credentials/fill
   POST   /v1/leases/{id}/watch/confirm
   POST   /v1/leases/{id}/watch/input
@@ -29,6 +31,11 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from slipstream.alerts import AlertConflictError, AlertValidationError
+from slipstream.actions import (
+    ActionValidationError,
+    ConfirmationGoneError,
+    ConfirmationNotFoundError,
+)
 from slipstream.watch import (
     WATCH_CLICKJACK_HEADERS,
     WatchAuthError,
@@ -455,6 +462,105 @@ def make_handler(pool: BrowserPool):
                         self,
                         404,
                         {"error": "lease_not_found", "lease_id": lease_id},
+                    )
+                return
+
+            # POST /v1/leases/{lease_id}/actions — permission ladder gate
+            if (
+                len(parts) == 4
+                and parts[0] == "v1"
+                and parts[1] == "leases"
+                and parts[3] == "actions"
+            ):
+                lease_id = parts[2]
+                try:
+                    result = pool.request_action(lease_id, body)
+                    _json_response(self, 202, result)
+                except ActionValidationError as e:
+                    _json_response(
+                        self, 400, {"error": "invalid_action", "detail": str(e)}
+                    )
+                except AlertConflictError as e:
+                    _json_response(
+                        self, 409, {"error": "alert_conflict", "detail": str(e)}
+                    )
+                except LeaseNotFoundError:
+                    _json_response(
+                        self, 404, {"error": "lease_not_found", "lease_id": lease_id}
+                    )
+                return
+
+            # POST /v1/leases/{lease_id}/confirmations/{confirm_id}
+            if (
+                len(parts) == 5
+                and parts[0] == "v1"
+                and parts[1] == "leases"
+                and parts[3] == "confirmations"
+            ):
+                lease_id = parts[2]
+                confirm_id = parts[4]
+                try:
+                    result = pool.resolve_confirmation(lease_id, confirm_id, body)
+                    _json_response(self, 200, result)
+                except ActionValidationError as e:
+                    _json_response(
+                        self, 400, {"error": "invalid_action", "detail": str(e)}
+                    )
+                except ConfirmationGoneError as e:
+                    _json_response(
+                        self,
+                        410,
+                        {
+                            "error": "confirmation_gone",
+                            "confirm_id": confirm_id,
+                            "detail": str(e),
+                        },
+                    )
+                except ConfirmationNotFoundError:
+                    _json_response(
+                        self,
+                        404,
+                        {"error": "confirmation_not_found", "confirm_id": confirm_id},
+                    )
+                except LeaseNotFoundError:
+                    _json_response(
+                        self, 404, {"error": "lease_not_found", "lease_id": lease_id}
+                    )
+                return
+
+            # POST /v1/confirmations/{confirm_id} — CLI confirm|deny by id alone
+            if (
+                len(parts) == 3
+                and parts[0] == "v1"
+                and parts[1] == "confirmations"
+            ):
+                confirm_id = parts[2]
+                try:
+                    result = pool.resolve_confirmation_by_id(confirm_id, body)
+                    _json_response(self, 200, result)
+                except ActionValidationError as e:
+                    _json_response(
+                        self, 400, {"error": "invalid_action", "detail": str(e)}
+                    )
+                except ConfirmationGoneError as e:
+                    _json_response(
+                        self,
+                        410,
+                        {
+                            "error": "confirmation_gone",
+                            "confirm_id": confirm_id,
+                            "detail": str(e),
+                        },
+                    )
+                except ConfirmationNotFoundError:
+                    _json_response(
+                        self,
+                        404,
+                        {"error": "confirmation_not_found", "confirm_id": confirm_id},
+                    )
+                except LeaseNotFoundError as e:
+                    _json_response(
+                        self, 404, {"error": "lease_not_found", "lease_id": str(e)}
                     )
                 return
 

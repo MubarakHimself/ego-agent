@@ -23,7 +23,7 @@ MVP is always **isolated** mode (one process tree per Space). There is no `mode`
 | `cdp_base_port` | 9222 | Slot *i* uses port `9222 + i` |
 | `host` / `port` | `127.0.0.1` / `8755` | API bind |
 
-Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`.
+Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm seconds, default 60).
 
 ## Endpoints
 
@@ -168,6 +168,67 @@ On `need_human` the pool mints an unguessable token and returns:
 
 **In-memory alert state:** `_alert_log`, `_task_done_envelopes`, and `_watches` are **process-lifetime** maps (survive lease release for idempotent `task_done` / revoked-watch `410`; cleared on pool shutdown / process exit). Bounded LRU eviction is deferred.
 
+### Permission ladder (confirm-actions v1)
+
+Gate irreversible/sensitive acts **before** the agent proceeds with CDP. Soft browse
+(snapshot / click / scroll / wait) stays free. Categories:
+
+| Category | Intent |
+|----------|--------|
+| `eval` | `Runtime.evaluate` / script inject |
+| `download` | file download |
+| `upload` | file upload / `DOM.setFileInputFiles` |
+| `nav_irreversible` | open/back/forward/reload that leave allowlist or POST/destructive forms |
+
+```http
+POST /v1/leases/{lease_id}/actions
+{"category":"eval","summary":"probe document.title"}
+→ 202
+{
+  "status": "confirmation_required",
+  "confirm_id": "c_…",
+  "category": "eval",
+  "summary": "probe document.title",
+  "lease_id": "…",
+  "expires_at": "2026-09-22T21:00:00+03:00",
+  "alert": { "event":"need_human", "kind":"confirmation_required", "confirm_id":"c_…",
+             "reason":"confirmation_required", "watch_url":"…", "status":"awaiting_human", … },
+  "harness": { "action":"pause", "agent_paused":true, "lease_kept":true,
+               "watch_url":"…", "takeover_url":"…" }
+}
+```
+
+Sibling **`need_human`** on the **same alerts bus** (`kind=confirmation_required` +
+`confirm_id`) — captain gets Watch / Take-over URL. No second notification path.
+Lease stays warm (`awaiting_human`); soft-idle eviction skipped (hard TTL still applies).
+
+```http
+POST /v1/leases/{lease_id}/confirmations/{confirm_id}
+{"action":"confirm"}   # or "deny"
+→ 200 {"status":"confirmed","decision":"allow", …}   # once
+→ 200 {"status":"denied","decision":"deny", …}
+→ 410 confirmation_gone (expired / already resolved)
+```
+
+CLI convenience (same resolve): `POST /v1/confirmations/{confirm_id}` with `{action}`.
+
+**TTL:** pending confirmations auto-deny after ~60s (`SLIPSTREAM_CONFIRM_TTL`, default 60).
+**Non-TTY:** `slipstream act … --confirm-interactive` auto-denies when stdin is not a TTY.
+**Secrets:** reuse alerts denylist/scrub — never put passwords/cookies/tokens in `summary`.
+
+**Defer:** once/always/never policy matrix, domain allowlist, content-boundaries, Comet UI.
+
+CLI:
+
+```bash
+slipstream act --lease-id "$L" --category eval --summary "probe title"
+# → confirmation_required JSON (exit 0); then:
+slipstream confirm c_…
+slipstream deny c_…
+# interactive (TTY prompt; Non-TTY → deny):
+slipstream act --lease-id "$L" --category eval --summary "…" --confirm-interactive
+```
+
 ### Credential vault (bound to Space)
 
 Vault root is **outside** Space `user-data-dir` (`SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, default `./data/vault`). Pool init **fail-closes** if `vault_root` resolves inside (or equal to) `spaces_root`. Space profiles keep **session cookies only** — never a password dump. Vault dirs/files use POSIX `0700` / `0600` when the OS supports chmod.
@@ -252,6 +313,8 @@ Console script / module entry (`slipstream` or `python -m slipstream`):
 | `slipstream lease --agent-id … --space-id …` | `POST /v1/leases` |
 | `slipstream heartbeat --lease-id …` | `POST /v1/leases/{id}/heartbeat` |
 | `slipstream alert need-human\|done --lease-id …` | `POST /v1/leases/{id}/alerts` |
+| `slipstream act --lease-id … --category … --summary …` | `POST /v1/leases/{id}/actions` |
+| `slipstream confirm\|deny <confirm_id>` | `POST /v1/confirmations/{id}` |
 | `slipstream release --lease-id …` | `DELETE /v1/leases/{id}` |
 | `slipstream status` | `GET /v1/pool/status` |
 | `slipstream doctor [--json]` | local preflight + `GET /healthz` (Chrome/CDP/spaces/skill) |

@@ -6,6 +6,9 @@ Subcommands:
   heartbeat   POST /v1/leases/{id}/heartbeat
   release     DELETE /v1/leases/{id}
   status      GET /v1/pool/status
+  act         POST /v1/leases/{id}/actions — gate eval|download|upload|nav_irreversible
+  confirm     POST /v1/confirmations/{id} {action: confirm}
+  deny        POST /v1/confirmations/{id} {action: deny}
   doctor     Preflight: Chrome, CDP, pool healthz, spaces, skill, watch_compose
   watch-status  Compose /watch detection (optional; never hard-fail)
 
@@ -23,11 +26,14 @@ from slipstream.api import PoolServer
 from slipstream.cli import (
     CliError,
     DEFAULT_URL,
+    cmd_act,
     cmd_alert,
+    cmd_confirm,
     cmd_cred_bind,
     cmd_cred_fill,
     cmd_cred_list,
     cmd_cred_unbind,
+    cmd_deny,
     cmd_heartbeat,
     cmd_lease,
     cmd_release,
@@ -72,7 +78,7 @@ def _run_serve(args: argparse.Namespace) -> int:
         flush=True,
     )
     print(
-        "Agent CLI: slipstream lease|heartbeat|alert|release|status|doctor|watch-status  "
+        "Agent CLI: slipstream lease|heartbeat|alert|act|confirm|deny|release|status|doctor  "
         "(see skills/slipstream/SKILL.md)",
         flush=True,
     )
@@ -252,6 +258,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_fill.set_defaults(_handler="cred_fill")
 
+    # --- act (permission ladder) ---
+    p_act = sub.add_parser(
+        "act",
+        help="Request gated act (eval|download|upload|nav_irreversible); may need confirm",
+    )
+    _add_url(p_act)
+    p_act.add_argument("--lease-id", required=True)
+    p_act.add_argument(
+        "--category",
+        required=True,
+        choices=["eval", "download", "upload", "nav_irreversible"],
+    )
+    p_act.add_argument(
+        "--summary",
+        required=True,
+        help="Short human-safe summary (no secrets)",
+    )
+    p_act.add_argument(
+        "--confirm-interactive",
+        action="store_true",
+        help="Prompt y/N on TTY; Non-TTY auto-denies",
+    )
+    p_act.set_defaults(_handler="act")
+
+    # --- confirm / deny ---
+    p_confirm = sub.add_parser(
+        "confirm",
+        help="Confirm a pending gated action (allow once)",
+    )
+    _add_url(p_confirm)
+    p_confirm.add_argument("confirm_id", help="confirm_id from confirmation_required")
+    p_confirm.set_defaults(_handler="confirm")
+
+    p_deny = sub.add_parser(
+        "deny",
+        help="Deny a pending gated action (fail closed)",
+    )
+    _add_url(p_deny)
+    p_deny.add_argument("confirm_id", help="confirm_id from confirmation_required")
+    p_deny.set_defaults(_handler="deny")
+
     # --- doctor ---
     p_doc = sub.add_parser(
         "doctor",
@@ -353,6 +400,18 @@ def main(argv: list[str] | None = None) -> int:
                 fields_json=args.fields,
                 url=args.url,
             )
+        if args._handler == "act":
+            return cmd_act(
+                lease_id=args.lease_id,
+                category=args.category,
+                summary=args.summary,
+                url=args.url,
+                confirm_interactive=bool(args.confirm_interactive),
+            )
+        if args._handler == "confirm":
+            return cmd_confirm(confirm_id=args.confirm_id, url=args.url)
+        if args._handler == "deny":
+            return cmd_deny(confirm_id=args.confirm_id, url=args.url)
         if args._handler == "doctor":
             return cmd_doctor(url=args.url, as_json=args.as_json)
         if args._handler == "watch_status":
