@@ -228,3 +228,47 @@ def test_doctor_watch_compose_ok_when_present(tmp_path, monkeypatch):
     names = {c.name: c for c in report.checks}
     assert names["watch_compose"].status == "ok"
     assert report.ok is True
+
+
+def test_pool_healthz_http_503_fails_and_exit_1(tmp_path, monkeypatch):
+    """HTTPError (e.g. 503) must fail doctor (not WARN) and exit 1."""
+    import urllib.error
+
+    monkeypatch.delenv("SLIPSTREAM_MOCK", raising=False)
+    monkeypatch.setenv("SLIPSTREAM_SPACES_ROOT", str(tmp_path / "spaces-503"))
+    fake_bin = tmp_path / "fake-chrome"
+    fake_bin.write_text("#!/bin/sh\nexit 0\n")
+    fake_bin.chmod(0o755)
+    monkeypatch.setenv("SLIPSTREAM_CHROME", str(fake_bin))
+
+    def boom(*_a, **_k):
+        raise urllib.error.HTTPError(
+            url="http://127.0.0.1:8755/healthz",
+            code=503,
+            msg="Service Unavailable",
+            hdrs=None,
+            fp=None,
+        )
+
+    ok_cdp = CheckResult(name="cdp_probe", status="ok", message="ok", detail={})
+    with patch("slipstream.doctor._probe_cdp_with_chrome", return_value=ok_cdp):
+        with patch("urllib.request.urlopen", side_effect=boom):
+            report = run_doctor(url="http://127.0.0.1:8755")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = cmd_doctor(url="http://127.0.0.1:8755", as_json=False)
+
+    names = {c.name: c for c in report.checks}
+    assert names["pool_healthz"].status == "fail"
+    assert "503" in names["pool_healthz"].message
+    assert report.ok is False
+    assert code == 1
+
+
+def test_ephemeral_loopback_port_is_free_int():
+    from slipstream.doctor import _ephemeral_loopback_port
+
+    p1 = _ephemeral_loopback_port()
+    p2 = _ephemeral_loopback_port()
+    assert isinstance(p1, int) and 0 < p1 < 65536
+    assert isinstance(p2, int) and 0 < p2 < 65536

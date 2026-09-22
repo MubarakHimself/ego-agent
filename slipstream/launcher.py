@@ -41,6 +41,12 @@ class LaunchHandle:
 
 
 def find_chrome_binary(explicit: str | None = None) -> str | None:
+    """Resolve Chrome/Chromium binary.
+
+    If ``explicit`` (SLIPSTREAM_CHROME / path) is set and missing/non-executable,
+    return None — do **not** fall through to PATH candidates. Auto-detect only
+    when no explicit path/name was requested.
+    """
     if explicit:
         path = Path(explicit)
         if path.is_file() and os.access(path, os.X_OK):
@@ -48,6 +54,7 @@ def find_chrome_binary(explicit: str | None = None) -> str | None:
         found = shutil.which(explicit)
         if found:
             return found
+        return None  # explicit set but unusable — no PATH fallthrough
     for name in CHROME_CANDIDATES:
         found = shutil.which(name)
         if found:
@@ -70,7 +77,8 @@ class ChromiumLauncher:
 
     def __init__(self, config: PoolConfig):
         self.config = config
-        self._binary = config.chrome_binary or find_chrome_binary()
+        # Validate via find_chrome_binary (explicit missing → None)
+        self._binary = find_chrome_binary(config.chrome_binary)
 
     @property
     def binary(self) -> str | None:

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import signal
 import subprocess
 import sys
@@ -83,16 +84,30 @@ def find_watch_skill() -> Path | None:
 
 
 def find_skill_path() -> Path | None:
-    """Locate skills/slipstream/SKILL.md (repo layout preferred)."""
-    pkg_root = Path(__file__).resolve().parent.parent  # repo root when editable
-    candidates = [
-        pkg_root / "skills" / "slipstream" / "SKILL.md",
-        Path.cwd() / "skills" / "slipstream" / "SKILL.md",
-        Path.cwd() / "skills" / "slipstream-browser" / "SKILL.md",
-    ]
+    """Locate skills/slipstream/SKILL.md (repo, packaged, or override).
+
+    Prefers SLIPSTREAM_SKILL_PATH, then installed ``skills.slipstream`` package
+    data (non-editable wheels), then editable/repo layout.
+    """
+    candidates: list[Path] = []
     env = os.environ.get("SLIPSTREAM_SKILL_PATH")
     if env:
-        candidates.insert(0, Path(env))
+        candidates.append(Path(env))
+    try:
+        import skills.slipstream as _skill_pkg  # type: ignore[import-not-found]
+
+        bundled = Path(_skill_pkg.__file__).resolve().parent / "SKILL.md"
+        candidates.append(bundled)
+    except Exception:  # noqa: BLE001 — optional import path
+        pass
+    pkg_root = Path(__file__).resolve().parent.parent  # repo root when editable
+    candidates.extend(
+        [
+            pkg_root / "skills" / "slipstream" / "SKILL.md",
+            Path.cwd() / "skills" / "slipstream" / "SKILL.md",
+            Path.cwd() / "skills" / "slipstream-browser" / "SKILL.md",
+        ]
+    )
     for path in candidates:
         if path.is_file():
             return path.resolve()
@@ -137,9 +152,17 @@ def _check_chrome() -> CheckResult:
     )
 
 
+def _ephemeral_loopback_port() -> int:
+    """Bind :0 on loopback and return a free TCP port (race-tolerant)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
+
+
 def _probe_cdp_with_chrome(binary: str, *, timeout: float = 12.0) -> CheckResult:
     """Launch ephemeral headless Chrome, probe /json/version, then stop."""
-    port = 19299  # doctor-only temp port; avoid colliding with pool 9222+
+    port = _ephemeral_loopback_port()
     user_data = Path(tempfile.mkdtemp(prefix="slipstream-doctor-"))
     args = [
         binary,
@@ -270,6 +293,19 @@ def _check_pool_healthz(base_url: str) -> CheckResult:
                 message=f"Pool healthz HTTP {resp.status}",
                 detail={"url": url, "status": resp.status, "body": payload},
             )
+    except urllib.error.HTTPError as e:
+        # HTTPError is a URLError subclass — catch first so 4xx/5xx fail doctor
+        raw = e.read().decode("utf-8", errors="replace") if e.fp is not None else ""
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            payload = {"raw": raw or e.reason}
+        return CheckResult(
+            name="pool_healthz",
+            status="fail",
+            message=f"Pool healthz HTTP {e.code}",
+            detail={"url": url, "status": e.code, "body": payload},
+        )
     except urllib.error.URLError as e:
         return CheckResult(
             name="pool_healthz",

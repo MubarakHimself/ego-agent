@@ -6,10 +6,12 @@ SLIPSTREAM_URL for the base URL. Stdlib urllib only — no third-party HTTP.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -25,10 +27,40 @@ class CliError(Exception):
         self.exit_code = exit_code
 
 
+def _host_is_loopback(host: str) -> bool:
+    """True for localhost / 127.0.0.0/8 / ::1 (literal hosts only)."""
+    h = host.strip().lower().strip("[]")
+    if h in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        return bool(ipaddress.ip_address(h).is_loopback)
+    except ValueError:
+        return False
+
+
+def assert_url_allowed(url: str) -> None:
+    """Refuse non-loopback pool URLs unless SLIPSTREAM_ALLOW_REMOTE_URL=1."""
+    if os.environ.get("SLIPSTREAM_ALLOW_REMOTE_URL", "") == "1":
+        return
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname
+    if not host or not _host_is_loopback(host):
+        raise CliError(
+            f"refusing non-loopback pool URL {url!r}; "
+            "use 127.0.0.1 / ::1 / localhost, or set SLIPSTREAM_ALLOW_REMOTE_URL=1",
+            exit_code=2,
+        )
+
+
 def resolve_base_url(url: str | None = None) -> str:
-    """Resolve pool base URL: --url > SLIPSTREAM_URL > default."""
-    raw = (url or os.environ.get("SLIPSTREAM_URL") or DEFAULT_URL).strip()
-    return raw.rstrip("/")
+    """Resolve pool base URL: --url > SLIPSTREAM_URL > default.
+
+    Default allowlist is loopback only (127.0.0.1 / ::1 / localhost).
+    Escape hatch: SLIPSTREAM_ALLOW_REMOTE_URL=1.
+    """
+    raw = (url or os.environ.get("SLIPSTREAM_URL") or DEFAULT_URL).strip().rstrip("/")
+    assert_url_allowed(raw)
+    return raw
 
 
 def _request(

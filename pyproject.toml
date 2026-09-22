@@ -22,7 +22,10 @@ dev = [
 slipstream = "slipstream.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["slipstream*"]
+include = ["slipstream*", "skills*"]
+
+[tool.setuptools.package-data]
+"skills.slipstream" = ["SKILL.md", "*.md"]
 
 [tool.pytest.ini_options]
 markers = [

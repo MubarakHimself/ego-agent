@@ -166,3 +166,23 @@ def test_space_in_use_via_cli(api_server: PoolServer):
     with pytest.raises(CliError) as ei:
         cmd_lease(agent_id="a2", space_id="shared", url=base)
     assert "409" in str(ei.value) or "space_in_use" in str(ei.value)
+
+
+def test_resolve_base_url_rejects_remote(monkeypatch):
+    monkeypatch.delenv("SLIPSTREAM_ALLOW_REMOTE_URL", raising=False)
+    monkeypatch.delenv("SLIPSTREAM_URL", raising=False)
+    with pytest.raises(CliError) as ei:
+        resolve_base_url("http://example.com:8755")
+    assert ei.value.exit_code == 2
+    assert "loopback" in str(ei.value).lower() or "refusing" in str(ei.value).lower()
+
+
+def test_resolve_base_url_allows_remote_with_escape(monkeypatch):
+    monkeypatch.setenv("SLIPSTREAM_ALLOW_REMOTE_URL", "1")
+    assert resolve_base_url("http://example.com:8755") == "http://example.com:8755"
+
+
+def test_resolve_base_url_allows_localhost(monkeypatch):
+    monkeypatch.delenv("SLIPSTREAM_ALLOW_REMOTE_URL", raising=False)
+    assert resolve_base_url("http://localhost:8755") == "http://localhost:8755"
+    assert resolve_base_url("http://127.0.0.1:9999/") == "http://127.0.0.1:9999"
