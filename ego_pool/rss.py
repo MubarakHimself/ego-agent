@@ -12,8 +12,14 @@ from pathlib import Path
 
 def sample_rss_kb(pid: int) -> int | None:
     """Return RSS of a single process in KiB, or None if unavailable."""
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    # Only read /proc/<pid>/status for a validated positive int PID.
+    status_path = Path("/proc") / str(pid) / "status"
     try:
-        status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+        if not status_path.is_file():
+            return None
+        status = status_path.read_text(encoding="utf-8")
     except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
         return None
     for line in status.splitlines():
