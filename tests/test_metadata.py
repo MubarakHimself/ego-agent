@@ -56,7 +56,19 @@ def test_validate_rejects_oversize():
 
 
 def test_validate_rejects_secret_keys():
-    for bad in ("password", "cookie", "token", "jwt", "bearer", "api_key"):
+    for bad in (
+        "password",
+        "cookie",
+        "token",
+        "jwt",
+        "bearer",
+        "api_key",
+        "accessToken",
+        "sessionToken",
+        "clientSecret",
+        "myPassword",
+        "cookieJar",
+    ):
         with pytest.raises(MetadataValidationError):
             validate_user_metadata({bad: "nope"})
 
@@ -198,3 +210,12 @@ def test_api_metadata_flow(tmp_path):
         assert bad["error"] == "invalid_user_metadata"
     finally:
         server.stop()
+
+
+def test_effective_metadata_size_cap_after_merge():
+    left = {"a": "x" * 200, "b": "y" * 200}
+    right = {"c": "z" * 200}
+    validate_user_metadata(left)
+    validate_user_metadata(right)
+    with pytest.raises(MetadataValidationError, match="effective"):
+        effective_metadata(left, right)

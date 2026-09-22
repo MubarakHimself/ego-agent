@@ -7,6 +7,7 @@ Endpoints:
   POST   /v1/leases/{id}/heartbeat
   POST   /v1/leases/{id}/alerts
   POST   /v1/leases/{id}/actions
+  POST   /v1/leases/{id}/navigate
   POST   /v1/leases/{id}/confirmations/{confirm_id}
   POST   /v1/leases/{id}/credentials/fill
   POST   /v1/leases/{id}/watch/confirm
@@ -34,6 +35,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from slipstream.alerts import AlertConflictError, AlertValidationError
+from slipstream.domains import DomainAllowlistError
 from slipstream.actions import (
     ActionValidationError,
     ConfirmationGoneError,
@@ -414,17 +416,25 @@ def make_handler(pool: BrowserPool):
                     )
                     return
                 user_metadata = body.get("user_metadata")
+                allowed_domains = body.get("allowed_domains")
                 try:
                     result = pool.lease(
                         agent_id,
                         space_id,
                         ttl_seconds=ttl,
                         user_metadata=user_metadata,
+                        allowed_domains=allowed_domains,
                     )
                     _json_response(self, 200, result)
                 except MetadataValidationError as e:
                     _json_response(
                         self, 400, {"error": "invalid_user_metadata", "detail": str(e)}
+                    )
+                except DomainAllowlistError as e:
+                    _json_response(
+                        self,
+                        400,
+                        {"error": "invalid_allowed_domains", "detail": str(e)},
                     )
                 except PoolFullError as e:
                     _json_response(self, 503, {"error": "pool_full", "detail": str(e)})
@@ -502,6 +512,16 @@ def make_handler(pool: BrowserPool):
                 try:
                     result = pool.request_action(lease_id, body)
                     _json_response(self, 202, result)
+                except DomainAllowlistError as e:
+                    _json_response(
+                        self,
+                        403,
+                        {
+                            "error": "domain_not_allowed",
+                            "detail": str(e),
+                            "host": getattr(e, "host", None),
+                        },
+                    )
                 except ActionValidationError as e:
                     _json_response(
                         self, 400, {"error": "invalid_action", "detail": str(e)}
@@ -509,6 +529,33 @@ def make_handler(pool: BrowserPool):
                 except AlertConflictError as e:
                     _json_response(
                         self, 409, {"error": "alert_conflict", "detail": str(e)}
+                    )
+                except LeaseNotFoundError:
+                    _json_response(
+                        self, 404, {"error": "lease_not_found", "lease_id": lease_id}
+                    )
+                return
+
+            # POST /v1/leases/{lease_id}/navigate — top-frame nav + domain allowlist
+            if (
+                len(parts) == 4
+                and parts[0] == "v1"
+                and parts[1] == "leases"
+                and parts[3] == "navigate"
+            ):
+                lease_id = parts[2]
+                try:
+                    result = pool.navigate(lease_id, body)
+                    _json_response(self, 200, result)
+                except DomainAllowlistError as e:
+                    _json_response(
+                        self,
+                        403,
+                        {
+                            "error": "domain_not_allowed",
+                            "detail": str(e),
+                            "host": getattr(e, "host", None),
+                        },
                     )
                 except LeaseNotFoundError:
                     _json_response(
@@ -674,7 +721,7 @@ def make_handler(pool: BrowserPool):
         def do_PUT(self) -> None:  # noqa: N802
             path = urlparse(self.path).path.rstrip("/") or "/"
             parts = path.strip("/").split("/")
-            # PUT /v1/spaces/{space_id}  { "user_metadata": {…} }
+            # PUT /v1/spaces/{space_id}  { user_metadata? , allowed_domains? }
             if len(parts) == 3 and parts[0] == "v1" and parts[1] == "spaces":
                 space_id = parts[2]
                 try:
@@ -685,19 +732,37 @@ def make_handler(pool: BrowserPool):
                 if not isinstance(body, dict):
                     _json_response(self, 400, {"error": "invalid_json"})
                     return
-                if "user_metadata" not in body:
+                has_meta = "user_metadata" in body
+                has_domains = "allowed_domains" in body
+                if not has_meta and not has_domains:
                     _json_response(
                         self,
                         400,
-                        {"error": "user_metadata_required", "detail": "body must include user_metadata"},
+                        {
+                            "error": "space_update_required",
+                            "detail": "body must include user_metadata and/or allowed_domains",
+                        },
                     )
                     return
                 try:
-                    result = pool.set_space_metadata(space_id, body.get("user_metadata"))
+                    result = pool.set_space_metadata(
+                        space_id,
+                        body.get("user_metadata") if has_meta else None,
+                        allowed_domains=body.get("allowed_domains") if has_domains else None,
+                        clear_allowed_domains=(
+                            has_domains and body.get("allowed_domains") is None
+                        ),
+                    )
                     _json_response(self, 200, result)
                 except MetadataValidationError as e:
                     _json_response(
                         self, 400, {"error": "invalid_user_metadata", "detail": str(e)}
+                    )
+                except DomainAllowlistError as e:
+                    _json_response(
+                        self,
+                        400,
+                        {"error": "invalid_allowed_domains", "detail": str(e)},
                     )
                 except ValueError as e:
                     _json_response(self, 400, {"error": "bad_request", "detail": str(e)})

@@ -99,11 +99,15 @@ _FORBIDDEN_SEGMENT_PAIRS = frozenset(
     }
 )
 
-# Light scrub of free-text detail/summary values (trust boundary: callers must
-# not put secrets in text; we still redact common password=/cookie=/token= leaks).
-_SCRUB_VALUE_RE = re.compile(
-    r"(?i)\b(password|cookie|token|secret|authorization|bearer)\s*=\s*\S+"
+# Light scrub of free-text detail/summary/need_human values (trust boundary:
+# callers must not put secrets in text; we still redact denylist-stem leaks
+# aligned with reject_secret_fields — ADV-PL-002: jwt=/access_key=/private_key=/
+# api_key=/passwd=/… must not survive into summary/detail payloads).
+_SCRUB_STEMS = (
+    r"passwords?|passwd|cookies?|tokens?|secrets?|authorization|bearers?|"
+    r"jwts?|api[_-]?keys?|private[_-]?keys?|access[_-]?keys?|credentials?"
 )
+_SCRUB_VALUE_RE = re.compile(rf"(?i)\b({_SCRUB_STEMS})\s*=\s*\S+")
 
 DEFAULT_WATCH_TTL_S = 300
 
@@ -125,6 +129,20 @@ def now_ts() -> str:
     return datetime.now(_EAT).isoformat(timespec="seconds")
 
 
+def _key_segments(key: str) -> list[str]:
+    """Split key into lowercase segments including camelCase boundaries.
+
+    ADV-META-001: accessToken / sessionToken / clientSecret / myPassword /
+    cookieJar / apiKey must segment so denylist stems match (not only
+    underscore/hyphen splits).
+    """
+    # fooBar → foo_Bar; HTTPSConnection → HTTPS_Connection
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s)
+    lowered = s.lower().replace("-", "_")
+    return [seg for seg in re.split(r"[_.\-]", lowered) if seg]
+
+
 def _key_forbidden(key: str) -> bool:
     """True if key looks secret-bearing (exact / token-boundary; not bare substring)."""
     if _FORBIDDEN_KEY_RE.match(key):
@@ -132,7 +150,7 @@ def _key_forbidden(key: str) -> bool:
     lowered = key.lower().replace("-", "_")
     if lowered in _FORBIDDEN_FRAGMENTS:
         return True
-    segments = [s for s in re.split(r"[_.\-]", lowered) if s]
+    segments = _key_segments(key)
     if any(seg in _FORBIDDEN_SEGMENTS for seg in segments):
         return True
     for i in range(len(segments) - 1):
@@ -142,7 +160,7 @@ def _key_forbidden(key: str) -> bool:
 
 
 def scrub_text(value: str) -> str:
-    """Redact password=/cookie=/token=/secret=/authorization=/bearer= in free-text."""
+    """Redact denylist-stem ``name=value`` leaks in free-text (ADV-PL-002)."""
     if not value:
         return value
     return _SCRUB_VALUE_RE.sub(

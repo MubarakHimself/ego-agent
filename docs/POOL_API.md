@@ -23,7 +23,7 @@ MVP is always **isolated** mode (one process tree per Space). There is no `mode`
 | `cdp_base_port` | 9222 | Slot *i* uses port `9222 + i` |
 | `host` / `port` | `127.0.0.1` / `8755` | API bind |
 
-Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm seconds, default 60).
+Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm seconds, default 60), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers).
 
 ## Endpoints
 
@@ -125,7 +125,7 @@ Request must **not** include `watch_url` or `status` — both are server-derived
 
 `task_done` body uses `outcome: {"ok": bool, "summary": "…"}` (no secrets). A second `task_done` for the same `lease_id` returns the prior envelope with `harness.idempotent=true` (safe; no double-release error).
 
-→ `400` `invalid_alert` for unknown event, bad reason, client-supplied `watch_url`/`status`, or **secret-like fields** (`cookie`, `password`, `token`, `private_key`, `jwt`, `bearer`, `access_key`, `credential`, `authorization`, … — including nested keys; token-boundary match so `secretary_note` is allowed).
+→ `400` `invalid_alert` for unknown event, bad reason, client-supplied `watch_url`/`status`, or **secret-like fields** (`cookie`, `password`, `token`, `private_key`, `jwt`, `bearer`, `access_key`, `credential`, `authorization`, … — including nested keys and **camelCase** compounds like `accessToken` / `sessionToken` / `clientSecret` / `myPassword` / `cookieJar` — ADV-META-001; token-boundary match so `secretary_note` is allowed). Free-text `detail`/`summary` scrub extends the same stems (`jwt=` / `access_key=` / … — ADV-PL-002).
 
 → `404` if the lease is unknown (except idempotent `task_done` replay). After a completed `task_done` the lease is released, so a later `need_human` for that `lease_id` is **`404`** (not `409`).
 
@@ -214,9 +214,11 @@ CLI convenience (same resolve): `POST /v1/confirmations/{confirm_id}` with `{act
 
 **TTL:** pending confirmations auto-deny after ~60s (`SLIPSTREAM_CONFIRM_TTL`, default 60).
 **Non-TTY:** `slipstream act … --confirm-interactive` auto-denies when stdin is not a TTY.
-**Secrets:** reuse alerts denylist/scrub — never put passwords/cookies/tokens in `summary`.
+**Secrets:** reuse alerts denylist/scrub (incl. `jwt=` / `access_key=` / `private_key=` / `api_key=` / `passwd=` — ADV-PL-002) — never put passwords/cookies/tokens in `summary`.
 
-**Defer:** once/always/never policy matrix, domain allowlist, content-boundaries, Comet UI.
+**Honor-system (ADV-PL-001):** permission-ladder v1 is **advisory**. `POST /actions` pauses the agent and emits `need_human`, but **CDP fill / eval / nav are not server-enforced** by this ladder yet — a client that skips `act` and talks to CDP directly is not blocked. Server-enforced ladder = later track. (Domain allowlist on `POST …/navigate` **is** enforced at the pool gate when set.)
+
+**Defer:** once/always/never policy matrix, Comet UI, full server-enforced ladder.
 
 CLI:
 
@@ -228,6 +230,43 @@ slipstream deny c_…
 # interactive (TTY prompt; Non-TTY → deny):
 slipstream act --lease-id "$L" --category eval --summary "…" --confirm-interactive
 ```
+
+### Domain allowlist (top-frame navigate)
+
+Pattern-steal Browserbase `allowedDomains` / agent-browser domain allowlist.
+
+When an allowlist is set, **top-frame** `http(s)` navigations outside the list are **refused** (`403 domain_not_allowed`). **Empty allowlist = unrestricted.**
+
+Sources (first set wins): lease `allowed_domains` → Space `allowed_domains` → `SLIPSTREAM_ALLOWED_DOMAINS` / pool config.
+
+```http
+PUT /v1/spaces/{space_id}
+{"allowed_domains":["example.com","*.example.org"]}
+
+POST /v1/leases
+{"agent_id":"a1","space_id":"task-42","allowed_domains":["github.com"]}
+
+POST /v1/leases/{lease_id}/navigate
+{"url":"https://www.example.com/path"}
+→ 200 {"ok":true,"url":"…","matched":true,…}
+→ 403 {"error":"domain_not_allowed","host":"evil.example",…}
+```
+
+Patterns: bare `example.com` matches itself + subdomains (Browserbase-style); `*.example.com` matches bare + subdomains. Non-`http(s)` (`about:blank`, `chrome://`, …) are not gated.
+
+**v1 limitation (like BB experimental):** iframe / subframe loads and subresource requests (scripts, XHR, images) are **not** blocked. WebRTC/UDP containment deferred.
+
+CLI: `slipstream navigate --lease-id ID --page-url URL` · `slipstream lease … --allowed-domains a.com,b.com` · `slipstream spaces set --space-id S --allowed-domains a.com`.
+
+`nav_irreversible` with a body `url` outside the allowlist is also refused (`403`) before minting confirmation.
+
+### Content-boundary markers (thin)
+
+agent-browser `--content-boundaries` pattern: nonce-wrapped markers separate untrusted page output from trusted tool output in skill/CLI echoes (prompt-injection hygiene).
+
+Enable: `SLIPSTREAM_CONTENT_BOUNDARIES=1`. Helper: `slipstream.boundaries.wrap_page_content(text, origin=…)`. Minimal — not a full sandbox.
+
+### Credential vault (bound to Space)
 
 ### Credential vault (bound to Space)
 
@@ -337,7 +376,7 @@ Uses stdlib `urllib`. Env: `SLIPSTREAM_URL` for base URL. Non-zero exit + stderr
 ## user_metadata tags + list filter (session-metadata)
 
 Browserbase-style ops tags for fleets. **No secrets** — denylist keys
-(`password` / `cookie` / `token` / `jwt` / `bearer` / …) are refused (same
+(`password` / `cookie` / `token` / `jwt` / `bearer` / camelCase `accessToken` / …) are refused (same
 rules as alerts).
 
 ### Shape
@@ -345,7 +384,7 @@ rules as alerts).
 - JSON **object**; nested objects OK; **string leaves only** (no arrays /
   numbers / bools — stringify them).
 - Serialized size ≤ **512** chars (`json.dumps` separators compact).
-- Prefer **Space-level** tags (persist for the Space id); leases **inherit**
+- Prefer **Space-level** tags (persist for the Space id); leases **inherit**; effective Space∪lease merge re-checked ≤512 chars (ADV-META-002)
   and may **override** per-lease.
 
 ### Attach

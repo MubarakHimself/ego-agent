@@ -137,6 +137,7 @@ def cmd_lease(
     ttl_seconds: int | None = None,
     url: str | None = None,
     user_metadata: dict[str, Any] | None = None,
+    allowed_domains: list[str] | None = None,
 ) -> int:
     base = resolve_base_url(url)
     body: dict[str, Any] = {"agent_id": agent_id, "space_id": space_id}
@@ -144,6 +145,8 @@ def cmd_lease(
         body["ttl_seconds"] = ttl_seconds
     if user_metadata:
         body["user_metadata"] = user_metadata
+    if allowed_domains is not None:
+        body["allowed_domains"] = allowed_domains
     status, payload = _request("POST", f"{base}/v1/leases", body)
     if status != 200:
         _fail_http(status, payload)
@@ -507,6 +510,37 @@ def _tags_to_metadata(tags: list[str] | None) -> dict[str, Any] | None:
     return out
 
 
+
+def cmd_navigate(
+    *,
+    lease_id: str,
+    page_url: str,
+    url: str | None = None,
+) -> int:
+    """POST /v1/leases/{id}/navigate — top-frame nav; refused outside allowlist."""
+    base = resolve_base_url(url)
+    status, payload = _request(
+        "POST",
+        f"{base}/v1/leases/{lease_id}/navigate",
+        {"url": page_url},
+    )
+    if status == 403:
+        detail = payload.get("detail") if isinstance(payload, dict) else payload
+        raise CliError(f"domain_not_allowed: {detail}", exit_code=3)
+    if status != 200:
+        _fail_http(status, payload)
+    # Optional content-boundary wrap for page-derived title/observed_url echoes.
+    from slipstream.boundaries import content_boundaries_enabled, wrap_page_content
+
+    if content_boundaries_enabled() and isinstance(payload, dict):
+        origin = page_url
+        if "title" in payload and isinstance(payload["title"], str):
+            payload = dict(payload)
+            payload["title"] = wrap_page_content(payload["title"], origin=origin)
+    _print_json(payload)
+    return 0
+
+
 def cmd_spaces_list(
     *,
     q: str | None = None,
@@ -535,17 +569,24 @@ def cmd_spaces_set(
     space_id: str,
     metadata_json: str | None = None,
     tags: list[str] | None = None,
+    allowed_domains: list[str] | None = None,
     url: str | None = None,
 ) -> int:
     base = resolve_base_url(url)
     meta = _parse_metadata_json(metadata_json) or {}
     tag_meta = _tags_to_metadata(tags) or {}
     meta.update(tag_meta)
-    if not meta and metadata_json is None and not tags:
-        raise CliError("provide --metadata JSON and/or --tag key=value", exit_code=2)
-    status, payload = _request(
-        "PUT", f"{base}/v1/spaces/{space_id}", {"user_metadata": meta}
-    )
+    body: dict[str, Any] = {}
+    if meta or metadata_json is not None or tags:
+        body["user_metadata"] = meta
+    if allowed_domains is not None:
+        body["allowed_domains"] = allowed_domains
+    if not body:
+        raise CliError(
+            "provide --metadata/--tag and/or --allowed-domains",
+            exit_code=2,
+        )
+    status, payload = _request("PUT", f"{base}/v1/spaces/{space_id}", body)
     if status != 200:
         _fail_http(status, payload)
     _print_json(payload)

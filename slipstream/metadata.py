@@ -97,8 +97,19 @@ def effective_metadata(
     space_meta: dict[str, Any] | None,
     lease_override: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Space tags inherited by lease; lease override wins on conflict."""
-    return deep_merge(space_meta or {}, lease_override or {})
+    """Space tags inherited by lease; lease override wins on conflict.
+
+    ADV-META-002: after Space∪lease deep_merge, re-validate serialized size
+    ≤ ``MAX_METADATA_CHARS`` (fail closed — do not clamp silently).
+    """
+    merged = deep_merge(space_meta or {}, lease_override or {})
+    size = _serialized_len(merged)
+    if size > MAX_METADATA_CHARS:
+        raise MetadataValidationError(
+            f"effective user_metadata serialized length {size} exceeds "
+            f"{MAX_METADATA_CHARS} after Space∪lease merge"
+        )
+    return merged
 
 
 def _lookup_path(meta: dict[str, Any], parts: list[str]) -> Any:

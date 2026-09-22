@@ -67,6 +67,10 @@ class Lease:
     user_metadata_override: dict[str, Any] = field(default_factory=dict)
     # Effective tags = deep_merge(space_meta, override); set by pool on attach.
     user_metadata: dict[str, Any] = field(default_factory=dict)
+    # None = inherit Space/config; explicit list (incl. empty) = lease override.
+    allowed_domains_override: list[str] | None = None
+    # Effective top-frame allowlist (empty = unrestricted); set by pool on attach.
+    allowed_domains: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -80,6 +84,7 @@ class Lease:
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "user_metadata": dict(self.user_metadata),
+            "allowed_domains": list(self.allowed_domains),
         }
 
 

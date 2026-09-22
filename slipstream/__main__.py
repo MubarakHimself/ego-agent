@@ -7,6 +7,7 @@ Subcommands:
   release     DELETE /v1/leases/{id}
   status      GET /v1/pool/status
   act         POST /v1/leases/{id}/actions — gate eval|download|upload|nav_irreversible
+  navigate    POST /v1/leases/{id}/navigate — top-frame nav (domain allowlist)
   confirm     POST /v1/confirmations/{id} {action: confirm}
   deny        POST /v1/confirmations/{id} {action: deny}
   doctor     Preflight: Chrome, CDP, pool healthz, spaces, skill, watch_compose
@@ -37,6 +38,7 @@ from slipstream.cli import (
     cmd_heartbeat,
     cmd_lease,
     cmd_leases_list,
+    cmd_navigate,
     cmd_spaces_list,
     cmd_spaces_set,
     cmd_release,
@@ -149,6 +151,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=None,
         help="Lease metadata tag key=value (repeatable; overrides/extends --metadata)",
+    )
+    p_lease.add_argument(
+        "--allowed-domains",
+        default=None,
+        help="Comma-separated top-frame host allowlist for this lease (empty=unrestricted)",
     )
     p_lease.set_defaults(_handler="lease")
 
@@ -315,6 +322,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- doctor ---
 
+
+    # --- navigate ---
+    p_nav = sub.add_parser(
+        "navigate",
+        help="Top-frame navigate on a lease (refused outside domain allowlist)",
+    )
+    _add_url(p_nav)
+    p_nav.add_argument("--lease-id", required=True)
+    p_nav.add_argument("--page-url", required=True, help="http(s) URL to open")
+    p_nav.set_defaults(_handler="navigate")
+
     # --- spaces ---
     p_spaces = sub.add_parser("spaces", help="Space registry: list/filter tags, set user_metadata")
     spaces_sub = p_spaces.add_subparsers(dest="spaces_cmd", metavar="SUBCOMMAND")
@@ -341,6 +359,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=None,
         help="Tag key=value (repeatable)",
+    )
+    p_sp_set.add_argument(
+        "--allowed-domains",
+        default=None,
+        help="Comma-separated Space top-frame allowlist (omit to leave unchanged)",
     )
     p_sp_set.set_defaults(_handler="spaces_set")
 
@@ -404,20 +427,40 @@ def main(argv: list[str] | None = None) -> int:
             meta = _parse_metadata_json(getattr(args, "metadata", None)) or {}
             tag_meta = _tags_to_metadata(getattr(args, "tag", None)) or {}
             meta.update(tag_meta)
+            domains = None
+            raw_dom = getattr(args, "allowed_domains", None)
+            if raw_dom is not None:
+                from slipstream.domains import parse_allowed_domains
+
+                domains = parse_allowed_domains(raw_dom)
             return cmd_lease(
                 agent_id=args.agent_id,
                 space_id=args.space_id,
                 ttl_seconds=args.ttl_seconds,
                 url=args.url,
                 user_metadata=meta or None,
+                allowed_domains=domains,
+            )
+        if args._handler == "navigate":
+            return cmd_navigate(
+                lease_id=args.lease_id,
+                page_url=args.page_url,
+                url=args.url,
             )
         if args._handler == "spaces_list":
             return cmd_spaces_list(q=args.q, tags=args.tag, url=args.url)
         if args._handler == "spaces_set":
+            sp_domains = None
+            raw_sp = getattr(args, "allowed_domains", None)
+            if raw_sp is not None:
+                from slipstream.domains import parse_allowed_domains
+
+                sp_domains = parse_allowed_domains(raw_sp)
             return cmd_spaces_set(
                 space_id=args.space_id,
                 metadata_json=args.metadata,
                 tags=args.tag,
+                allowed_domains=sp_domains,
                 url=args.url,
             )
         if args._handler == "leases_list":
