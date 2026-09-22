@@ -65,6 +65,13 @@ def test_live_chrome_lease_navigate_heartbeat_release(tmp_path):
         # Warm reuse path (W=1): same space should come back without relaunch race
         lease2 = pool.lease("live-agent", "live-space")
         assert lease2["status"] == "leased"
+        assert lease2["cdp_http_url"] == lease["cdp_http_url"]
+        pid2 = None
+        for s in pool.status()["slots"]:
+            if s["lease_id"] == lease2["lease_id"]:
+                pid2 = s["chromium_pid"]
+                break
+        assert pid2 == pid
         wait_cdp_ready(lease2["cdp_http_url"], timeout=5.0)
         pool.release(lease2["lease_id"])
     finally:

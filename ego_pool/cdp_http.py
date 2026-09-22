@@ -74,16 +74,19 @@ def navigate_via_json_new(
             url = t.get("url") or ""
             last = t
             title_ok = (
-                expect_title_substr is None
-                or expect_title_substr.lower() in title.lower()
+                expect_title_substr is not None
+                and expect_title_substr.lower() in title.lower()
             )
-            # Prefer a non-empty title once navigation has settled.
+            # When no title expectation: require URL containment (do not
+            # settle on any non-empty title alone — about:blank etc.).
+            needle = page_url.rstrip("/")
+            url_ok = needle in (url or "") or page_url in (url or "")
             if expect_title_substr is not None:
                 if title_ok:
                     out = dict(t)
                     out["matched"] = True
                     return out
-            elif title or page_url.rstrip("/") in url:
+            elif url_ok:
                 out = dict(t)
                 out["matched"] = True
                 return out

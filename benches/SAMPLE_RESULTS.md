@@ -3,19 +3,19 @@
 Captured on Firstmate box during `ego-runtime-livebench-001`.
 
 - Chrome: `Chrome/151.0.7922.169` via `/usr/bin/google-chrome-stable`
-- Generated (UTC): `2026-09-22T13:28:47.608814+00:00`
+- Generated (UTC): `2026-09-22T13:33:41.204731+00:00`
 - Harness: `python scripts/bench_pool.py --mode BOTH`
 
 ## LIVE (real Chrome)
 
 | Metric | ms |
 |---|---|
-| cold lease | 305.361 |
-| CDP ready (`/json/version`) | 30.779 |
-| navigate (`https://example.com` + title) | 176.817 |
-| heartbeat RTT | 0.02 |
-| release (→ FREE_WARM) | 0.014 |
-| warm reuse lease (same space) | 0.102 |
+| cold lease | 303.522 |
+| CDP ready (`/json/version`) | 59.346 |
+| navigate (`https://example.com` + title) | 411.782 |
+| heartbeat RTT | 0.015 |
+| release (→ FREE_WARM) | 0.01 |
+| warm reuse lease (same space) | 0.097 |
 
 Navigate snapshot: title=`Example Domain`, url=`https://example.com/`, warm_reuse_same_cdp=`True`.
 
@@ -23,10 +23,10 @@ Navigate snapshot: title=`Example Domain`, url=`https://example.com/`, warm_reus
 
 | Metric | ms |
 |---|---|
-| cold lease | 0.134 |
-| heartbeat RTT | 0.005 |
+| cold lease | 0.12 |
+| heartbeat RTT | 0.006 |
 | release | 0.008 |
-| warm reuse lease | 0.029 |
+| warm reuse lease | 0.026 |
 
 CDP ready / navigate are N/A under MOCK (no real browser).
 

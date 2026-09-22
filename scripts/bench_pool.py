@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -128,7 +129,7 @@ def _run_once(*, mock: bool, chrome_binary: str | None, navigate_url: str) -> di
 
         # --- release (explicit → FREE_WARM when W=1) ---
         t0 = time.perf_counter()
-        rel = pool.release(lease["lease_id"], reason="bench_done")
+        pool.release(lease["lease_id"], reason="bench_done")
         timings["release_ms"] = _ms(t0)
         status = pool.status()
         warm = status.get("warm", 0)
@@ -139,19 +140,28 @@ def _run_once(*, mock: bool, chrome_binary: str | None, navigate_url: str) -> di
         lease2 = pool.lease("bench-agent", "bench-space")
         timings["warm_reuse_lease_ms"] = _ms(t0)
         assert lease2["status"] == "leased", lease2
-        meta["warm_reuse_same_cdp"] = (
-            lease2.get("cdp_http_url") == lease.get("cdp_http_url")
-        )
+        same_cdp = lease2.get("cdp_http_url") == lease.get("cdp_http_url")
+        meta["warm_reuse_same_cdp"] = same_cdp
+        if warm < 1:
+            meta["errors"].append(
+                f"warm_after_release={warm} (expected >= 1); cold-start is not warm reuse"
+            )
+        if not same_cdp:
+            meta["errors"].append(
+                "warm_reuse_same_cdp is False "
+                f"(first={lease.get('cdp_http_url')!r} second={lease2.get('cdp_http_url')!r})"
+            )
         # Confirm still reachable in LIVE
         if not mock:
             wait_cdp_ready(lease2["cdp_http_url"], timeout=5.0)
 
         pool.release(lease2["lease_id"], reason="bench_cleanup")
     except Exception as e:
+        # Keep partial timings; do not re-raise so callers get timings_ms.
         meta["errors"].append(f"{type(e).__name__}: {e}")
-        raise
     finally:
         pool.shutdown()
+        shutil.rmtree(spaces, ignore_errors=True)
 
     return {
         "mode": mode,
@@ -210,36 +220,15 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             continue
-        # Clear mock env for LIVE so PoolConfig.from_env side-effects do not leak
-        prev = os.environ.get("EGO_POOL_MOCK")
-        try:
-            if mock:
-                os.environ["EGO_POOL_MOCK"] = "1"
-            elif "EGO_POOL_MOCK" in os.environ:
-                del os.environ["EGO_POOL_MOCK"]
-            run = _run_once(
-                mock=mock,
-                chrome_binary=None if mock else chrome,
-                navigate_url=args.navigate_url,
-            )
-            results.append(run)
-            if not run["ok"]:
-                errors.extend(run["meta"].get("errors") or [])
-        except Exception as e:
-            errors.append(f"{mode}: {type(e).__name__}: {e}")
-            results.append(
-                {
-                    "mode": mode,
-                    "ok": False,
-                    "timings_ms": {},
-                    "meta": {"errors": [f"{type(e).__name__}: {e}"]},
-                }
-            )
-        finally:
-            if prev is None:
-                os.environ.pop("EGO_POOL_MOCK", None)
-            else:
-                os.environ["EGO_POOL_MOCK"] = prev
+        # mock= is passed explicitly to PoolConfig; no EGO_POOL_MOCK env mutate.
+        run = _run_once(
+            mock=mock,
+            chrome_binary=None if mock else chrome,
+            navigate_url=args.navigate_url,
+        )
+        results.append(run)
+        if not run["ok"]:
+            errors.extend(run["meta"].get("errors") or [])
 
     payload = {
         "benchmark": "ego-runtime-livebench-001",
