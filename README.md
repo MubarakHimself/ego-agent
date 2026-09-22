@@ -92,12 +92,15 @@ slipstream status
 
 ```bash
 # Real path — mock OFF (out-of-box). Checks Chrome, CDP probe, pool healthz,
-# Spaces root, skills/slipstream/SKILL.md (alias: slipstream-browser).
+# Spaces root, skills/slipstream/SKILL.md (alias: slipstream-browser), and
+# optional composed /watch (watch_compose WARN if missing — never fails).
 slipstream doctor
 slipstream doctor --json
 ```
 
-Exit 0 if no failures (warnings/skips allowed, e.g. pool not yet started).
+Exit 0 if no failures (warnings/skips allowed, e.g. pool not yet started or
+`/watch` not installed). Client `--url` / `SLIPSTREAM_URL` are loopback-only
+by default; set `SLIPSTREAM_ALLOW_REMOTE_URL=1` for remote pools.
 
 curl still works (HTTP is primary):
 

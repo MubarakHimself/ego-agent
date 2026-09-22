@@ -61,8 +61,18 @@ slipstream doctor --json
 ```
 
 `doctor` checks: Chrome binary, ephemeral CDP probe (`/json/version`), pool
-`GET /healthz`, Spaces root writable, this skill file present. Exit 0 if no
-failures (warnings/skips allowed).
+`GET /healthz`, Spaces root writable, this skill file present, and optional
+composed `/watch` (`watch_compose` — **warn** only if missing; never fails;
+never vendored). Exit 0 if no failures (warnings/skips allowed).
+
+**Versions:** package `slipstream.__version__` is `0.1.0`. Skill
+`metadata.version` (`0.2.0`) is the skill-doc revision and may differ —
+agents should not assume they are equal. Skill ships as package data under
+`skills.slipstream` so non-editable installs keep `skill_path`.
+
+**URL allowlist:** `--url` / `SLIPSTREAM_URL` default to loopback
+(`127.0.0.1` / `::1` / `localhost`) only. Set `SLIPSTREAM_ALLOW_REMOTE_URL=1`
+to reach a remote pool.
 
 Start the pool (**real Chrome** out-of-box; mock is CI/unit only):
 
@@ -217,11 +227,13 @@ Thin in-house helpers (`slipstream.cdp_http`) are for smoke/bench only.
 
 | Var | Purpose |
 |---|---|
-| `SLIPSTREAM_URL` | Client base URL (default `http://127.0.0.1:8755`) |
+| `SLIPSTREAM_URL` | Client base URL (default `http://127.0.0.1:8755`; loopback-only unless allow-remote) |
+| `SLIPSTREAM_ALLOW_REMOTE_URL=1` | Escape hatch: allow non-loopback `--url` / `SLIPSTREAM_URL` |
 | `SLIPSTREAM_MOCK=1` | Mock Chromium launches (**tests/CI only**) |
-| `SLIPSTREAM_CHROME` | Path to Chrome/Chromium binary |
+| `SLIPSTREAM_CHROME` | Path to Chrome/Chromium binary (explicit missing → fail; no PATH fallthrough) |
 | `SLIPSTREAM_SPACES_ROOT` | Space profile root (default `./data/spaces`) |
 | `SLIPSTREAM_SKILL_PATH` | Override skill file path for `doctor` |
+| `SLIPSTREAM_WATCH_SKILL` | Override path to composed `/watch` skill for `doctor` |
 | `SLIPSTREAM_K` / `SLIPSTREAM_W` | Override hard cap / warm count |
 | `SLIPSTREAM_PORT` | Server bind port (default 8755) |
 | `SLIPSTREAM_HEADLESS=0` | Headed Chromium |
