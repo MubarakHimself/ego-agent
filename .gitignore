@@ -17,22 +17,20 @@ venv/
 # Pool runtime data (Spaces / Chrome profiles)
 data/
 data/spaces/
-
 # Chrome / Chromium profiles & debugging
 *.log
 chrome_debug/
 .chrome-*/
-
 # OS / editor
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
 *.swp
-
 # Editable install metadata
-*.egg-info/
-
 .venv-skylos/
 skylos-results.json
 .skylos/
+# Benchmark runtime output (samples under benches/ are committed)
+benches/latest.json
+benches/*.local.json

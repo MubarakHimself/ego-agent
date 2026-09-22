@@ -2,6 +2,8 @@
 
 Transport: **localhost HTTP/JSON** via Python stdlib `ThreadingHTTPServer`.
 
+**No MCP yet** — this HTTP API is the external surface for agents/tools; an MCP wrapper may come later atop the same lease endpoints.
+
 Default base URL: `http://127.0.0.1:8755`
 
 Agents **must not** spawn Chromium themselves — only this service launches browsers (hard K-cap).

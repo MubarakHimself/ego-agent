@@ -24,5 +24,6 @@ include = ["ego_pool*"]
 [tool.pytest.ini_options]
 markers = [
     "live: optional live smoke requiring a real Chrome/Chromium binary",
+    "bench: optional pool speed benchmark (MOCK or LIVE)",
 ]
 testpaths = ["tests"]
