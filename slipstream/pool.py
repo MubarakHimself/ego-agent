@@ -21,6 +21,7 @@ from slipstream.watch import (
     WatchCaptureError,
     WatchForbiddenError,
     WatchGoneError,
+    WatchInputError,
     WatchNotFoundError,
     WatchSession,
     capture_jpeg_frame,
@@ -254,7 +255,7 @@ class BrowserPool:
         # Revoke any live Watch URL when the lease leaves the pool.
         sess = self._lookup_watch(lease_id)
         if sess is not None:
-            sess.revoked = True
+            self._invalidate_pair_browse_locked(sess, revoke=True)
 
         keep_warm = allow_warm and self._count_warm() < self.config.W
         del self._leases[lease_id]
@@ -714,7 +715,7 @@ class BrowserPool:
             # task_done — revoke watch_url, notify, then release once
             sess = self._lookup_watch(lease_id)
             if sess is not None:
-                sess.revoked = True
+                self._invalidate_pair_browse_locked(sess, revoke=True)
             envelope = build_harness_envelope(
                 payload,
                 lease_kept=False,
@@ -746,6 +747,10 @@ class BrowserPool:
         evicted: list[str] = []
         pending_stops: list[LaunchHandle] = []
         with self._lock:
+            # ADV-PAIR-001: Watch TTL sweep returns drive even before next watch hit.
+            for sess in list(self._watches.values()):
+                if (not sess.revoked) and now >= sess.expires_at:
+                    self._invalidate_pair_browse_locked(sess, revoke=False)
             candidates = [
                 s.lease_id
                 for s in self._slots
@@ -798,6 +803,23 @@ class BrowserPool:
         """Dict lookup for watch state (name avoids Session.get SSRF false-positive)."""
         return self._watches[lease_id] if lease_id in self._watches else None
 
+    def _invalidate_pair_browse_locked(
+        self, sess: WatchSession, *, revoke: bool = False
+    ) -> None:
+        """ADV-PAIR-001/002: Cede OR Watch TTL (or revoke) returns drive to agent.
+
+        Clears pair-browse flags, bumps ``input_epoch`` so in-flight CDP input
+        cannot ack success, and sets ``lease.status`` back to ``leased`` when it
+        was ``awaiting_human``. Must hold ``self._lock``.
+        """
+        sess.input_enabled = False
+        sess.takeover_confirmed = False
+        sess.input_epoch += 1
+        if revoke:
+            sess.revoked = True
+        lease = self._leases.get(sess.lease_id)
+        if lease is not None and lease.status == "awaiting_human":
+            lease.status = "leased"
 
     def _get_watch_session_locked(
         self, lease_id: str, token: str | None
@@ -818,6 +840,8 @@ class BrowserPool:
         if sess.revoked:
             raise WatchGoneError("watch_url revoked")
         if now >= sess.expires_at:
+            # ADV-PAIR-001: expiry mirrors Cede — return drive, then 410.
+            self._invalidate_pair_browse_locked(sess, revoke=False)
             raise WatchGoneError("watch_url expired")
         return sess
 
@@ -830,7 +854,7 @@ class BrowserPool:
             # Lease must still be live for streaming; revoked already handled.
             if lease_id not in self._leases:
                 # Session exists but lease gone without revoke race — treat gone
-                sess.revoked = True
+                self._invalidate_pair_browse_locked(sess, revoke=True)
                 raise WatchGoneError("lease no longer active")
             expires_in = max(0, int(sess.expires_at - time.time()))
             reason = sess.reason
@@ -873,6 +897,7 @@ class BrowserPool:
         if sess is None or sess.revoked:
             raise WatchGoneError("watch_url revoked during capture")
         if time.time() >= sess.expires_at:
+            self._invalidate_pair_browse_locked(sess, revoke=False)
             raise WatchGoneError("watch_url expired during capture")
         lease = self._leases.get(lease_id)
         if not lease:
@@ -926,7 +951,7 @@ class BrowserPool:
             sess = self._get_watch_session_locked(lease_id, token)
             lease = self._leases.get(lease_id)
             if not lease:
-                sess.revoked = True
+                self._invalidate_pair_browse_locked(sess, revoke=True)
                 raise WatchGoneError("lease no longer active")
             lease.status = "awaiting_human"
             slot = self._find_slot_by_lease(lease_id)
@@ -952,7 +977,9 @@ class BrowserPool:
         """Bridge human click/type/scroll into leased CDP after Take-over confirm.
 
         Observe-only (pre-confirm / post-cede) → WatchForbiddenError (403).
-        Revoked / TTL → WatchGoneError (410). Never echoes typed text.
+        Revoked / TTL / concurrent cede (epoch change) → WatchGoneError (410).
+        Never echoes typed text. ADV-PAIR-002: capture ``input_epoch`` under lock
+        before CDP; re-check after CDP before acknowledging success.
         """
         event = parse_watch_input(body)
         with self._lock:
@@ -964,13 +991,14 @@ class BrowserPool:
                 )
             lease = self._leases.get(lease_id)
             if not lease:
-                sess.revoked = True
+                self._invalidate_pair_browse_locked(sess, revoke=True)
                 raise WatchGoneError("lease no longer active")
             if lease.status != "awaiting_human":
                 raise WatchForbiddenError("agent not paused for pair-browse")
             cdp = lease.cdp_http_url or ""
             slot_id = lease.slot_id
             mock = self.config.mock
+            epoch = sess.input_epoch
             # Heartbeat warm while human drives
             slot = self._find_slot_by_lease(lease_id)
             if slot is not None:
@@ -991,24 +1019,34 @@ class BrowserPool:
                 lease_id, slot_id=slot_id, cdp_http_url=cdp
             )
             sess = self._lookup_watch(lease_id)
-            if sess is None or not sess.input_enabled:
-                raise WatchForbiddenError("input disabled during dispatch")
+            # ADV-PAIR-002: concurrent cede/revoke/TTL bumped epoch → 410, no success.
+            if (
+                sess is None
+                or sess.revoked
+                or sess.input_epoch != epoch
+                or not sess.input_enabled
+            ):
+                raise WatchGoneError("pair-browse invalidated during dispatch")
         # Scrubbed ack only
         return {"ok": True, "kind": result["kind"], "input_enabled": True}
 
     def cede_watch_control(
         self, lease_id: str, token: str | None
     ) -> dict[str, Any]:
-        """Cede pair-browse: disable input, clear pause; lease stays until task_done."""
+        """Cede pair-browse: disable input, clear pause; lease stays until task_done.
+
+        ADV-PAIR-004: requires prior Take-over confirm (``takeover_confirmed`` or
+        ``input_enabled``); otherwise ``WatchInputError`` → HTTP 400 nothing to cede.
+        """
         with self._lock:
             sess = self._get_watch_session_locked(lease_id, token)
             lease = self._leases.get(lease_id)
             if not lease:
-                sess.revoked = True
+                self._invalidate_pair_browse_locked(sess, revoke=True)
                 raise WatchGoneError("lease no longer active")
-            sess.input_enabled = False
-            sess.takeover_confirmed = False  # back to observe-only; Confirm re-enables
-            lease.status = "leased"
+            if not sess.takeover_confirmed and not sess.input_enabled:
+                raise WatchInputError("nothing to cede")
+            self._invalidate_pair_browse_locked(sess, revoke=False)
             slot = self._find_slot_by_lease(lease_id)
             if slot is not None:
                 slot.last_heartbeat = time.time()

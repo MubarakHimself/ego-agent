@@ -148,13 +148,13 @@ On `need_human` the pool mints an unguessable token and returns:
 | `GET` | `/v1/leases/{id}/watch/frame?token=…` | `image/jpeg` viewport via CDP `Page.captureScreenshot` (mock JPEG under `SLIPSTREAM_MOCK`) |
 | `POST` | `/v1/leases/{id}/watch/confirm?token=…` | Confirm Take-over → `{action: pause, agent_paused: true, input_enabled: true, lease_kept: true}` |
 | `POST` | `/v1/leases/{id}/watch/input?token=…` | Bridge click/type/key/scroll into leased CDP (requires confirm; exclusive pause) |
-| `POST` | `/v1/leases/{id}/watch/cede?token=…` | Disable input, clear pause → `{action: continue, agent_paused: false, input_enabled: false}`; lease stays until `task_done` |
+| `POST` | `/v1/leases/{id}/watch/cede?token=…` | Disable input, clear pause → `{action: continue, agent_paused: false, input_enabled: false}`; lease stays until `task_done`. Requires prior Confirm (`takeover_confirmed` / `input_enabled`); otherwise `400` nothing to cede |
 
-**Input body (JSON):** `{ "kind": "click"|"type"|"key"|"scroll", … }` — click needs `x,y`; type needs `text` (≤64); key needs `key`; scroll needs `deltaX`/`deltaY`. Response is a scrubbed ack (`ok` + `kind`) — **never** echoes typed text. Secret-like fields (`password`, `cookie`, `token`, …) are refused (`400`).
+**Input body (JSON):** `{ "kind": "click"|"type"|"key"|"scroll", … }` — click needs `x,y`; type needs `text` (≤64); key needs `key`; scroll needs `deltaX`/`deltaY`. Response is a scrubbed ack (`ok` + `kind`) — **never** echoes typed text. Secret-like fields (`password`, `cookie`, `token`, …) are refused (`400`). Mock recorder stores `text_len` only (never full typed text).
 
-**Gate:** observe-only / post-cede / unpaused → `403` on `/watch/input`. Agent stays `awaiting_human` (paused exclusive) from confirm until Cede or Watch TTL / cancel.
+**Gate:** observe-only / post-cede / unpaused → `403` on `/watch/input`. Agent stays `awaiting_human` (paused exclusive) from confirm until **Cede or Watch TTL** (both clear `input_enabled` / `takeover_confirmed` and set `lease.status=leased` so the agent can resume). Concurrent cede/revoke/TTL during in-flight CDP input bumps an `input_epoch`; post-CDP revalidation fails → `410` (no success ack).
 
-→ `401` missing/wrong/cross-lease token · `403` input while observe-only / after Cede · `400` bad input · `410` after `task_done`, lease release, Watch TTL expiry, or revoke/identity race mid-frame · `404` unknown lease / no watch session.
+→ `401` missing/wrong/cross-lease token (including `/watch/input` and `/watch/cede`) · `403` input while observe-only / after Cede · `400` bad input **or cede without confirm** · `410` after `task_done`, lease release, Watch TTL expiry, concurrent cede/epoch race mid-input, or revoke/identity race mid-frame · `404` unknown lease / no watch session.
 
 **Credential-in-URL (v1):** `watch_url` carries `?token=…` — treat the whole URL as a **screen-share secret** (anyone with the link can see live viewport screenshots for the TTL). Do not paste into group chat / tickets / logs. **HttpOnly cookie migration** (token out of the URL / HTML) is deferred — wait for Firstmate / captain before implementing.
 
