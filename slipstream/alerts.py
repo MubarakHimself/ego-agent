@@ -21,14 +21,17 @@ SHIP_EVENTS = frozenset({EVENT_NEED_HUMAN, EVENT_TASK_DONE})
 REASONS = frozenset({"captcha", "login", "ambiguous_ui", "stuck", "other"})
 
 # Keys that must never appear in alert request/response bodies (case-insensitive).
+# Prefer exact / token-boundary matches over bare substring so benign keys like
+# secretary_note are not false-positive rejects.
 _FORBIDDEN_KEY_RE = re.compile(
     r"(?i)^(cookies?|passwords?|passwd|tokens?|secrets?|credentials?|"
     r"auth(_?headers?)?|authorization|api[_-]?keys?|"
     r"cookie[_-]?paths?|secret[_-]?paths?|cdp[_-]?auth|"
-    r"session[_-]?cookies?|set-cookie)$"
+    r"session[_-]?cookies?|set-cookie|"
+    r"private[_-]?keys?|jwts?|bearers?|access[_-]?keys?)$"
 )
 
-# Nested path fragments that also trip rejection.
+# Exact key names (after lower + hyphen→underscore) that trip rejection.
 _FORBIDDEN_FRAGMENTS = frozenset(
     {
         "cookie",
@@ -45,13 +48,61 @@ _FORBIDDEN_FRAGMENTS = frozenset(
         "auth_header",
         "auth_headers",
         "api_key",
-        "api-key",
         "cookie_path",
         "secret_path",
         "cdp_auth",
         "session_cookie",
-        "set-cookie",
+        "set_cookie",
+        "private_key",
+        "jwt",
+        "bearer",
+        "access_key",
     }
+)
+
+# Whole path segments (split on _ / - / .) that count as secret stems.
+_FORBIDDEN_SEGMENTS = frozenset(
+    {
+        "cookie",
+        "cookies",
+        "password",
+        "passwd",
+        "passwords",
+        "token",
+        "tokens",
+        "secret",
+        "secrets",
+        "credential",
+        "credentials",
+        "authorization",
+        "jwt",
+        "jwts",
+        "bearer",
+        "bearers",
+    }
+)
+
+# Adjacent segment pairs that form secret compounds (token-boundary).
+_FORBIDDEN_SEGMENT_PAIRS = frozenset(
+    {
+        ("private", "key"),
+        ("access", "key"),
+        ("api", "key"),
+        ("auth", "header"),
+        ("auth", "headers"),
+        ("session", "cookie"),
+        ("session", "cookies"),
+        ("cookie", "path"),
+        ("secret", "path"),
+        ("cdp", "auth"),
+        ("set", "cookie"),
+    }
+)
+
+# Light scrub of free-text detail/summary values (trust boundary: callers must
+# not put secrets in text; we still redact common password=/cookie=/token= leaks).
+_SCRUB_VALUE_RE = re.compile(
+    r"(?i)\b(password|cookie|token)\s*=\s*\S+"
 )
 
 DEFAULT_WATCH_TTL_S = 300
@@ -75,16 +126,29 @@ def now_ts() -> str:
 
 
 def _key_forbidden(key: str) -> bool:
+    """True if key looks secret-bearing (exact / token-boundary; not bare substring)."""
     if _FORBIDDEN_KEY_RE.match(key):
         return True
     lowered = key.lower().replace("-", "_")
     if lowered in _FORBIDDEN_FRAGMENTS:
         return True
-    # Catch compound names like session_token, auth_token, cookie_jar
-    for frag in ("cookie", "password", "passwd", "token", "secret", "credential"):
-        if frag in lowered:
+    segments = [s for s in re.split(r"[_.\-]", lowered) if s]
+    if any(seg in _FORBIDDEN_SEGMENTS for seg in segments):
+        return True
+    for i in range(len(segments) - 1):
+        if (segments[i], segments[i + 1]) in _FORBIDDEN_SEGMENT_PAIRS:
             return True
     return False
+
+
+def scrub_text(value: str) -> str:
+    """Redact password=/cookie=/token= patterns in free-text fields."""
+    if not value:
+        return value
+    return _SCRUB_VALUE_RE.sub(
+        lambda m: m.group(1) + "=[REDACTED]",
+        value,
+    )
 
 
 def reject_secret_fields(obj: Any, *, path: str = "") -> None:
@@ -159,7 +223,7 @@ def normalize_outcome(raw: Any) -> dict[str, Any] | None:
         raise AlertValidationError("outcome.summary must be a string")
     if len(summary) > 500:
         raise AlertValidationError("outcome.summary too long (max 500)")
-    return {"ok": ok, "summary": summary}
+    return {"ok": ok, "summary": scrub_text(summary)}
 
 
 def parse_alert_request(body: dict[str, Any]) -> dict[str, Any]:
@@ -196,6 +260,7 @@ def parse_alert_request(body: dict[str, Any]) -> dict[str, Any]:
         raise AlertValidationError("detail must be a string")
     if len(detail) > 500:
         raise AlertValidationError("detail too long (max 500)")
+    detail = scrub_text(detail)
 
     task_id = body.get("task_id")
     if task_id is not None and not isinstance(task_id, str):
@@ -211,19 +276,11 @@ def parse_alert_request(body: dict[str, Any]) -> dict[str, Any]:
     if event == EVENT_NEED_HUMAN and outcome is not None:
         raise AlertValidationError("need_human must not include outcome")
 
-    watch_url = body.get("watch_url")
-    if watch_url is not None:
-        if not isinstance(watch_url, str) or not watch_url.strip():
-            raise AlertValidationError("watch_url must be a non-empty string")
-        # No credential-bearing query dumps
-        lowered = watch_url.lower()
-        for bad in ("cookie=", "token=", "password=", "authorization=", "api_key="):
-            if bad in lowered:
-                raise AlertValidationError("watch_url must not carry secrets")
-
-    status_in = body.get("status")
-    if status_in is not None and not isinstance(status_in, str):
-        raise AlertValidationError("status must be a string")
+    # Client must not override watch_url or status — server derives both.
+    if "watch_url" in body:
+        raise AlertValidationError("watch_url is server-derived; omit from request")
+    if "status" in body:
+        raise AlertValidationError("status is server-derived; omit from request")
 
     return {
         "event": event,
@@ -232,8 +289,6 @@ def parse_alert_request(body: dict[str, Any]) -> dict[str, Any]:
         "task_id": task_id,
         "ttl_s": ttl_s,
         "outcome": outcome,
-        "watch_url": watch_url.strip() if isinstance(watch_url, str) else None,
-        "status_in": status_in,
     }
 
 
@@ -248,13 +303,13 @@ def build_alert_payload(
 ) -> dict[str, Any]:
     """Assemble the public alert payload (never includes secrets)."""
     event = parsed["event"]
-    watch = parsed.get("watch_url") or default_watch_url(lease_id, base_url=base_url)
+    watch = default_watch_url(lease_id, base_url=base_url)
     if event == EVENT_NEED_HUMAN:
-        status = parsed.get("status_in") or "awaiting_human"
+        status = "awaiting_human"
         outcome = None
     else:
         outcome = parsed.get("outcome") or {"ok": True, "summary": ""}
-        status = parsed.get("status_in") or ("done" if outcome.get("ok") else "failed")
+        status = "done" if outcome.get("ok") else "failed"
 
     payload: dict[str, Any] = {
         "event": event,
