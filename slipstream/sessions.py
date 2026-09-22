@@ -56,6 +56,8 @@ def session_row(
     signed_in_host: str | None = None,
     watch_url: str | None = None,
     keep_alive: bool = False,
+    tier: str = "ephemeral",
+    risk_label: str | None = None,
     now: float | None = None,
 ) -> dict[str, Any]:
     """One ops session row (safe for JSON; omit watch_url when absent)."""
@@ -67,7 +69,10 @@ def session_row(
         "user_metadata": dict(user_metadata or {}),
         "signed_in": bool(signed_in),
         "keep_alive": bool(keep_alive),
+        "tier": tier,
     }
+    if risk_label:
+        row["risk_label"] = risk_label
     if lease_id:
         row["lease_id"] = lease_id
     if agent_id:

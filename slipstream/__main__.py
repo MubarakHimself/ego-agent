@@ -215,6 +215,30 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Send keep_alive:false explicitly (clears survival on re-lease)",
     )
+    p_lease.add_argument(
+        "--tier",
+        choices=("ephemeral", "named", "attach"),
+        default=None,
+        help="Space tier: ephemeral (default pool spawn), named (durable profile), "
+        "attach (existing Chrome CDP; needs SLIPSTREAM_ALLOW_ATTACH=1)",
+    )
+    p_lease.add_argument(
+        "--mode",
+        choices=("attach",),
+        default=None,
+        help="Alias: --mode attach == --tier attach",
+    )
+    p_lease.add_argument(
+        "--cdp-url",
+        default=None,
+        help="Attach: CDP http(s)/ws(s) URL (loopback or SLIPSTREAM_ATTACH_ALLOW_HOSTS)",
+    )
+    p_lease.add_argument(
+        "--cdp-port",
+        type=int,
+        default=None,
+        help="Attach: CDP port on 127.0.0.1 (alternative to --cdp-url)",
+    )
     p_lease.set_defaults(_handler="lease", keep_alive=None)
 
     # --- heartbeat ---
@@ -647,6 +671,10 @@ def main(argv: list[str] | None = None) -> int:
                 user_metadata=meta or None,
                 allowed_domains=domains,
                 keep_alive=getattr(args, "keep_alive", None),
+                tier=getattr(args, "tier", None),
+                mode=getattr(args, "mode", None),
+                cdp_url=getattr(args, "cdp_url", None),
+                cdp_port=getattr(args, "cdp_port", None),
             )
         if args._handler == "navigate":
             return cmd_navigate(
