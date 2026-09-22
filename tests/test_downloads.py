@@ -1,4 +1,4 @@
-"""Downloads as session artifacts — ADV-DL-001..005 + ADV-DL-010/011 ancestor symlink + baseline path safety."""
+"""Downloads as session artifacts — ADV-DL-001..005 + ADV-DL-010/011/013/014/015 path safety."""
 
 from __future__ import annotations
 
@@ -364,15 +364,37 @@ def test_upload_drop(api_server):
 
 
 def test_unit_read_path_containment(tmp_path):
-    root = tmp_path / "downloads"
-    root.mkdir()
-    (root / "a.txt").write_bytes(b"abc")
-    items = list_artifacts(root, kind="downloads")
+    art = tmp_path / "artifacts"
+    art.mkdir()
+    lease = "lease-unit1"
+    from slipstream.downloads import ensure_lease_artifact_dirs, write_upload
+
+    ensure_lease_artifact_dirs(art, lease)
+    write_upload(
+        filename="a.txt",
+        data=b"abc",
+        kind="downloads",
+        artifacts_root=art,
+        lease_id=lease,
+    )
+    items = list_artifacts(
+        kind="downloads", artifacts_root=art, lease_id=lease
+    )
     assert len(items) == 1
-    meta, data = read_artifact(root, items[0]["id"], kind="downloads")
+    meta, data = read_artifact(
+        artifact_id=items[0]["id"],
+        kind="downloads",
+        artifacts_root=art,
+        lease_id=lease,
+    )
     assert data == b"abc"
     with pytest.raises(ArtifactNotFoundError):
-        read_artifact(root, "dl_0000000000000000", kind="downloads")
+        read_artifact(
+            artifact_id="dl_0000000000000000",
+            kind="downloads",
+            artifacts_root=art,
+            lease_id=lease,
+        )
 
 
 def test_adv_dl_010_lease_id_symlink_refused(api_server, tmp_path):
@@ -488,3 +510,188 @@ def test_adv_dl_011_leases_dir_symlink_refused(api_server, tmp_path):
     assert code in (400, 403), err
     assert not (escape / lid / "uploads" / "escape.bin").exists()
     assert not list(escape.rglob("escape.bin"))
+
+
+def _replace_dir_with_symlink(path: Path, target: Path) -> None:
+    if path.is_symlink():
+        path.unlink()
+    elif path.is_dir():
+        for child in list(path.iterdir()):
+            if child.is_symlink() or child.is_file():
+                child.unlink()
+            elif child.is_dir():
+                for gc in list(child.iterdir()):
+                    if gc.is_file() or gc.is_symlink():
+                        gc.unlink()
+                    elif gc.is_dir():
+                        os.rmdir(gc)
+                os.rmdir(child)
+        path.rmdir()
+    path.symlink_to(target)
+
+
+def test_adv_dl_013_post_walk_symlink_swap_refused(api_server, tmp_path):
+    """ADV-DL-013: intermediate symlink after walk must not cross-lease read/write."""
+    from slipstream.downloads import (
+        ensure_lease_artifact_dirs,
+        list_artifacts,
+        read_artifact,
+        write_upload,
+        DownloadValidationError,
+    )
+    from slipstream.artifact_walk import walk_lease_kind_dir
+
+    server, pool = api_server
+    base = server.base_url
+    lid_a = _lease(base, space="dl-toctou-a", agent="agent-a")
+    lid_b = _lease(base, space="dl-toctou-b", agent="agent-b")
+    pool.record_mock_download(lid_b, "peer-b.pdf", b"PEER-BYTES")
+
+    art = pool.config.artifacts_root
+    vault = pool.config.vault_root
+    vault.mkdir(parents=True, exist_ok=True)
+    (vault / "creds.db").write_bytes(b"vault-secret")
+
+    # Hold kind_fd for A; rename A aside + plant symlink → B (fd keeps inode)
+    handle = walk_lease_kind_dir(art, lid_a, "downloads", create=True)
+    try:
+        lease_a = art / "leases" / lid_a
+        lease_b = art / "leases" / lid_b
+        aside = art / "leases" / f"{lid_a}.aside"
+        lease_a.rename(aside)
+        lease_a.symlink_to(lease_b)
+        # pathname under leases/A would see peer; held fd must NOT
+        names = handle.listdir()
+        assert "peer-b.pdf" not in names
+        # fresh walk after swap must refuse
+        with pytest.raises(DownloadValidationError):
+            walk_lease_kind_dir(art, lid_a, "downloads", create=False).close()
+    finally:
+        handle.close()
+
+    # HTTP list/get after swap refuse (no peer bytes)
+    code, err, _ = _req(
+        "GET", f"{base}/v1/leases/{lid_a}/downloads?agent_id=agent-a"
+    )
+    assert code in (400, 403), err
+
+    # Recreate A, swap to vault, write must not land in vault
+    if (art / "leases" / lid_a).is_symlink():
+        (art / "leases" / lid_a).unlink()
+    ensure_lease_artifact_dirs(art, lid_a)
+    _replace_dir_with_symlink(art / "leases" / lid_a, vault)
+    code, err, _ = _req(
+        "POST",
+        f"{base}/v1/leases/{lid_a}/uploads",
+        {
+            "filename": "pwn.bin",
+            "content_b64": base64.b64encode(b"pwn").decode("ascii"),
+            "agent_id": "agent-a",
+        },
+    )
+    assert code in (400, 403), err
+    assert not (vault / "pwn.bin").exists()
+    assert not (vault / "uploads" / "pwn.bin").exists()
+
+    # Direct API TOCTOU: walk A, swap to B mid-flight still uses held fd
+    if (art / "leases" / lid_a).is_symlink():
+        (art / "leases" / lid_a).unlink()
+    ensure_lease_artifact_dirs(art, lid_a)
+    write_upload(
+        filename="own.txt",
+        data=b"OWN",
+        kind="downloads",
+        artifacts_root=art,
+        lease_id=lid_a,
+    )
+    # Simulate concurrent swap during read path by swapping before API call
+    # (API re-walks and must refuse rather than serve peer)
+    _replace_dir_with_symlink(art / "leases" / lid_a, art / "leases" / lid_b)
+    with pytest.raises(DownloadValidationError):
+        list_artifacts(kind="downloads", artifacts_root=art, lease_id=lid_a)
+    with pytest.raises(DownloadValidationError):
+        read_artifact(
+            artifact_id="dl_0000000000000000",
+            kind="downloads",
+            artifacts_root=art,
+            lease_id=lid_a,
+        )
+
+
+def test_adv_dl_014_cdp_path_nofollow_after_swap(api_server, tmp_path):
+    """ADV-DL-014: CDP downloadPath must not Path.resolve into vault after swap."""
+    from slipstream.downloads import ensure_lease_artifact_dirs
+    from slipstream.download_cdp import (
+        MockDownloadRecorder,
+        configure_chrome_download_behavior,
+    )
+    from slipstream.downloads import DownloadValidationError
+
+    server, pool = api_server
+    base = server.base_url
+    lid = _lease(base, space="dl-cdp-swap", agent="agent-dl")
+    art = pool.config.artifacts_root
+    vault = pool.config.vault_root
+    vault.mkdir(parents=True, exist_ok=True)
+    (vault / "downloads").mkdir(exist_ok=True)
+
+    ensure_lease_artifact_dirs(art, lid)
+    # Plant lease → vault after ensure (classic TOCTOU)
+    _replace_dir_with_symlink(art / "leases" / lid, vault)
+
+    rec = MockDownloadRecorder()
+    with pytest.raises(DownloadValidationError):
+        configure_chrome_download_behavior(
+            "http://127.0.0.1:9",
+            artifacts_root=art,
+            lease_id=lid,
+            mock=True,
+            recorder=rec,
+        )
+    assert not rec.calls
+    # No recorded path under vault
+    for c in rec.calls:
+        assert str(vault) not in c["download_path"]
+
+
+def test_adv_dl_015_dir_path_only_refused(tmp_path):
+    """ADV-DL-015: dir_path-only list/read/write skip ancestor walk — refused."""
+    from slipstream.downloads import (
+        DownloadValidationError,
+        ensure_lease_artifact_dirs,
+        list_artifacts,
+        read_artifact,
+        write_upload,
+    )
+
+    art = tmp_path / "artifacts"
+    art.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    lease = "leaseC"
+    ensure_lease_artifact_dirs(art, lease)
+    # Plant leases → outside
+    leases = art / "leases"
+    real = art / "leases.real"
+    leases.rename(real)
+    leases.symlink_to(outside)
+
+    # Walk-based ensure refuses
+    with pytest.raises(DownloadValidationError):
+        ensure_lease_artifact_dirs(art, lease)
+
+    # dir_path-only must also refuse (not write under outside)
+    planted = art / "leases" / lease / "uploads"
+    # recreate path appearance via the symlink
+    planted.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(DownloadValidationError):
+        write_upload(
+            planted,
+            filename="via-dirpath.bin",
+            data=b"nope",
+        )
+    assert not (outside / lease / "uploads" / "via-dirpath.bin").exists()
+    with pytest.raises(DownloadValidationError):
+        list_artifacts(planted, kind="uploads")
+    with pytest.raises(DownloadValidationError):
+        read_artifact(planted, "up_0000000000000000", kind="uploads")

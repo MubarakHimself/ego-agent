@@ -981,13 +981,14 @@ class BrowserPool:
 
     def _prepare_lease_downloads(self, lease_id: str, cdp_http_url: str | None) -> None:
         """Create lease artifact dirs; configure Chrome download path (or mock)."""
-        dirs = ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)
+        ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)
         if not cdp_http_url:
             return
         try:
             configure_chrome_download_behavior(
                 cdp_http_url,
-                dirs[KIND_DOWNLOADS],
+                artifacts_root=self.config.artifacts_root,
+                lease_id=lease_id,
                 mock=self.config.mock,
                 recorder=self._download_recorder if self.config.mock else None,
             )

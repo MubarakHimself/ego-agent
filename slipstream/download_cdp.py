@@ -2,27 +2,22 @@
 
 from __future__ import annotations
 
-import json
 import threading
 import time
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from slipstream.downloads import DownloadError, DownloadValidationError
-
+from slipstream.artifact_walk import walk_lease_kind_dir
+from slipstream.downloads import (
+    KIND_DOWNLOADS,
+    DownloadError,
+    DownloadValidationError,
+)
 
 
 _BEHAVIOR_ALLOW = "allow"
-def _resolve_policy_path(path: Path) -> Path:
-    return Path(path).expanduser().resolve()
-
-
-# ---------------------------------------------------------------------------
-# CDP download behavior + mock recorder
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -72,21 +67,45 @@ def _browser_ws_url(cdp_http_url: str) -> str:
     return ws
 
 
+def _verified_download_path(artifacts_root: Path, lease_id: str) -> str:
+    """ADV-DL-014: path via held kind_fd /proc — never Path.resolve ancestors."""
+    with walk_lease_kind_dir(
+        artifacts_root, lease_id, KIND_DOWNLOADS, create=True
+    ) as handle:
+        path = handle.path_via_proc()
+        # Refuse if final path is not under verified lease kind dir inode.
+        # path_via_proc is the opened inode; require downloads suffix.
+        if path.name != KIND_DOWNLOADS:
+            raise DownloadValidationError("download path not under lease kind dir")
+        return str(path)
+
+
 def configure_chrome_download_behavior(
     cdp_http_url: str,
-    download_dir: Path,
+    download_dir: Path | None = None,
     *,
+    artifacts_root: Path | None = None,
+    lease_id: str | None = None,
     mock: bool = False,
     recorder: MockDownloadRecorder | None = None,
 ) -> dict[str, Any]:
     """CDP Browser.setDownloadBehavior → lease downloads dir (or mock record).
 
     When mock=True, records the call and returns without talking to Chrome.
-    Absolute ``download_dir`` is used for Chrome; never returned to agents.
+    Absolute download path is used for Chrome; never returned to agents.
+
+    ADV-DL-014: prefer ``artifacts_root``+``lease_id`` nofollow walk; never
+    ``Path.resolve`` through unverified ancestors. ``download_dir`` alone is
+    refused (stale Path after symlink swap).
     """
-    abs_dir = _resolve_policy_path(download_dir)
-    abs_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path_str = str(abs_dir)
+    if artifacts_root is not None and lease_id is not None:
+        path_str = _verified_download_path(artifacts_root, lease_id)
+    else:
+        raise DownloadValidationError(
+            "artifacts_root and lease_id required for downloadPath"
+        )
+    # download_dir ignored when walk kwargs present (API compat).
+    _ = download_dir
     if mock:
         if recorder is not None:
             recorder.record(download_path=path_str, behavior=_BEHAVIOR_ALLOW)
@@ -108,5 +127,3 @@ def configure_chrome_download_behavior(
     except CdpInjectError as e:
         raise DownloadError(str(e)) from e
     return {"ok": True, "mocked": False, "behavior": _BEHAVIOR_ALLOW}
-
-configure_chrome_download_behavior = configure_chrome_download_behavior
