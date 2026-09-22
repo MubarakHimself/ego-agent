@@ -64,11 +64,23 @@ def navigate_via_json_new(
     *,
     expect_title_substr: str | None = None,
     settle_timeout: float = 10.0,
+    allowed_domains: list[str] | None = None,
 ) -> dict[str, Any]:
     """Open ``page_url`` with PUT /json/new and wait for title/url to settle.
 
     Returns the matching target dict plus ``matched`` (bool).
+
+    When ``allowed_domains`` is None, uses ``SLIPSTREAM_ALLOWED_DOMAINS`` (empty
+    = unrestricted). Raises DomainAllowlistError if the host is outside the list.
     """
+    from slipstream.domains import allowed_domains_from_env, check_navigate_url
+
+    patterns = (
+        list(allowed_domains)
+        if allowed_domains is not None
+        else allowed_domains_from_env()
+    )
+    check_navigate_url(page_url, patterns)
     base = cdp_http_url.rstrip("/")
     # Chrome requires PUT for /json/new (GET → 405 on modern builds).
     req = urllib.request.Request(

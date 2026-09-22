@@ -26,6 +26,8 @@ class PoolConfig:
     headless: bool = True
     mock: bool = field(default_factory=lambda: os.environ.get("SLIPSTREAM_MOCK", "") == "1")
     chrome_binary: str | None = None  # auto-detect if None
+    # Top-frame nav allowlist (empty = unrestricted). Env: SLIPSTREAM_ALLOWED_DOMAINS.
+    allowed_domains: list[str] = field(default_factory=list)
 
     @staticmethod
     def normalize_space_id(space_id: str) -> str:
@@ -96,5 +98,8 @@ class PoolConfig:
             cfg.W = int(w)
         if port := os.environ.get("SLIPSTREAM_PORT"):
             cfg.port = int(port)
+        from slipstream.domains import allowed_domains_from_env
+
+        cfg.allowed_domains = allowed_domains_from_env()
         cfg.ensure_vault_outside_spaces()
         return cfg

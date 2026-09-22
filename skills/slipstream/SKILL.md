@@ -167,10 +167,43 @@ slipstream deny c_…        # fail closed; agent resumes with error
 Pending confirmations **auto-deny after ~60s** (`SLIPSTREAM_CONFIRM_TTL`).
 `--confirm-interactive` prompts on a TTY; **Non-TTY → deny**.
 
-Never put secrets/cookies/passwords in `--summary`. Credential **fill** stays
-vault-gated (not rebuilt here).
+Never put secrets/cookies/passwords in `--summary` (scrub also redacts
+`jwt=` / `access_key=` / `private_key=` / `api_key=` / `passwd=`).
 
-Defer: once/always/never policy matrix, domain allowlist, content-boundaries.
+**Honor-system (ADV-PL-001):** `act` is an advisory pause — CDP fill/eval/nav
+are **not** server-enforced by the ladder yet. Prefer always calling `act`
+before irreversible work. Domain allowlist on `navigate` **is** enforced when set.
+
+Defer: once/always/never policy matrix, full server-enforced ladder, Comet UI.
+
+## Domain allowlist (top-frame)
+
+Restrict top-frame navigation when set. **Empty = unrestricted.**
+
+```bash
+export SLIPSTREAM_ALLOWED_DOMAINS="example.com,*.example.org"
+# or per-Space / per-lease:
+slipstream spaces set --space-id task-42 --allowed-domains example.com,github.com
+slipstream lease --agent-id a1 --space-id task-42 --allowed-domains example.com
+slipstream navigate --lease-id "$LEASE_ID" --page-url https://www.example.com/
+# outside list → refuse (domain_not_allowed)
+```
+
+**Limitation (v1):** iframe/subresource loads are not blocked (Browserbase experimental mirror).
+
+## Content-boundary markers
+
+Opt-in prompt-injection hygiene for page-derived skill/CLI echoes:
+
+```bash
+export SLIPSTREAM_CONTENT_BOUNDARIES=1
+# wraps page text as:
+# --- SLIPSTREAM_PAGE_CONTENT nonce=… origin=https://… ---
+# …untrusted page output…
+# --- END_SLIPSTREAM_PAGE_CONTENT nonce=… ---
+```
+
+Helper: `from slipstream.boundaries import wrap_page_content`. Minimal — not a sandbox.
 
 ## Compose /watch (video intents — do not reimplement)
 
@@ -362,8 +395,9 @@ Thin in-house helpers (`slipstream.cdp_http`) are for smoke/bench only.
 
 Ops labels for fleets (Browserbase-style). Attach on a **Space** (inherited by
 leases) and/or override on **lease**. String leaves only; nested objects OK;
-≤512 chars serialized. **Never** put secrets in metadata — keys like
-`password` / `cookie` / `token` / `jwt` / `bearer` are refused.
+≤512 chars serialized (Space∪lease **effective** merge re-checked — ADV-META-002).
+**Never** put secrets in metadata — keys like
+`password` / `cookie` / `token` / `jwt` / `bearer` / camelCase `accessToken` / `sessionToken` / `clientSecret` are refused.
 
 ```bash
 # Tag a Space, then filter
@@ -407,6 +441,7 @@ slipstream lease   --agent-id ID --space-id ID [--ttl-seconds N] [--url URL]
 slipstream heartbeat --lease-id ID [--url URL]
 slipstream alert   need-human|done --lease-id ID [options] [--url URL]
 slipstream act     --lease-id ID --category CAT --summary TEXT [--confirm-interactive]
+slipstream navigate --lease-id ID --page-url URL
 slipstream confirm CONFIRM_ID [--url URL]
 slipstream deny    CONFIRM_ID [--url URL]
 slipstream release --lease-id ID [--reason REASON] [--url URL]
@@ -427,8 +462,9 @@ slipstream cred    bind|unbind|list|fill …
 - Simultaneous human+agent drive, pair-browse UI polish, optional stuck/captcha chips
   lock are **later**.
 - Compose `/watch` remains upstream (see **Compose /watch**; doctor WARN if
-  missing). Alerts, credential vault/fill, and confirm-actions **are** on the
-  CLI/HTTP surface. Domain allowlist / once-always-never / content-boundaries
+  missing). Alerts, credential vault/fill, confirm-actions, domain allowlist
+  navigate, and content-boundary helpers **are** on the CLI/HTTP surface.
+  Once-always-never / full server-enforced ladder
   are **later**.
 
 ## Examples

@@ -35,6 +35,12 @@ from slipstream.watch import (
     render_watch_html,
 )
 from slipstream.config import PoolConfig
+from slipstream.domains import (
+    DomainAllowlistError,
+    check_navigate_url,
+    effective_allowed_domains,
+    parse_allowed_domains,
+)
 from slipstream.launcher import ChromiumLauncher, LaunchHandle
 from slipstream.models import Lease, SlotState, SlotStatus, new_lease_id
 from slipstream.metadata import (
@@ -106,6 +112,10 @@ class BrowserPool:
         self._leases: dict[str, Lease] = {}
         # Space-level user_metadata registry (process-lifetime; leases inherit).
         self._space_metadata: dict[str, dict[str, Any]] = {}
+        # Space-level allowed_domains (None key absent = inherit config/env).
+        self._space_allowed_domains: dict[str, list[str]] = {}
+        # Mock navigate recorder (tests); never returned with secrets.
+        self._nav_log: list[dict[str, Any]] = []
         # Alerts: per-lease history + task_done idempotency (survives release).
         # Process-lifetime in-memory only (cleared on pool shutdown / process exit).
         # Bounded LRU eviction is deferred — document trust: single long-lived process.
@@ -209,6 +219,24 @@ class BrowserPool:
         except (ProcessLookupError, PermissionError, OSError):
             return False
 
+
+    def _space_domains(self, space_id: str) -> list[str] | None:
+        """Return Space allowlist if set, else None (fall through to config)."""
+        if space_id in self._space_allowed_domains:
+            return list(self._space_allowed_domains[space_id])
+        return None
+
+    def _effective_domains_for(
+        self,
+        space_id: str,
+        lease_override: list[str] | None,
+    ) -> list[str]:
+        return effective_allowed_domains(
+            lease_domains=lease_override,
+            space_domains=self._space_domains(space_id),
+            config_domains=list(self.config.allowed_domains),
+        )
+
     def _attach_lease(
         self,
         slot: SlotState,
@@ -219,6 +247,7 @@ class BrowserPool:
         cdp_http_url: str | None,
         cdp_ws_url: str | None,
         user_metadata: dict[str, Any] | None = None,
+        allowed_domains: list[str] | None = None,
     ) -> dict[str, Any]:
         """Wire Lease + slot lease fields; caller sets process/CDP fields as needed."""
         now = time.time()
@@ -228,6 +257,9 @@ class BrowserPool:
         hard_ttl = min(requested, self.config.lease_hard_ttl_seconds)
         override = validate_user_metadata(user_metadata) if user_metadata else {}
         space_meta = dict(self._space_metadata.get(space_id, {}))
+        domains_override = (
+            parse_allowed_domains(allowed_domains) if allowed_domains is not None else None
+        )
         lease = Lease(
             lease_id=lease_id,
             slot_id=slot.slot_id,
@@ -240,6 +272,8 @@ class BrowserPool:
             expires_at=now + hard_ttl,
             user_metadata_override=override,
             user_metadata=effective_metadata(space_meta, override),
+            allowed_domains_override=domains_override,
+            allowed_domains=self._effective_domains_for(space_id, domains_override),
         )
         self._leases[lease_id] = lease
         slot.status = SlotStatus.LEASED
@@ -330,6 +364,7 @@ class BrowserPool:
         handle: LaunchHandle,
         *,
         user_metadata: dict[str, Any] | None = None,
+        allowed_domains: list[str] | None = None,
     ) -> dict[str, Any]:
         """Under lock: attach lease after a successful launch outside the lock."""
         self._handles[slot.slot_id] = handle
@@ -341,6 +376,7 @@ class BrowserPool:
             cdp_http_url=handle.cdp_http_url,
             cdp_ws_url=handle.cdp_ws_url,
             user_metadata=user_metadata,
+            allowed_domains=allowed_domains,
         )
         slot.chromium_pid = handle.pid
         slot.cdp_port = handle.cdp_port
@@ -359,11 +395,16 @@ class BrowserPool:
         *,
         ttl_seconds: int | None = None,
         user_metadata: dict[str, Any] | None = None,
+        allowed_domains: list[str] | None = None,
     ) -> dict[str, Any]:
         # Validate early (rejects ".", "..", "/", NULs, empty, unsafe)
         space_id = self.config.normalize_space_id(space_id)
         # Validate metadata before taking the lock (raises MetadataValidationError).
         meta_override = validate_user_metadata(user_metadata) if user_metadata else None
+        # None = inherit; list (incl. empty) = lease override. Raises DomainAllowlistError.
+        domains_override = (
+            parse_allowed_domains(allowed_domains) if allowed_domains is not None else None
+        )
 
         # Handles that must be stopped outside the lock (released/replaced trees).
         pending_stops: list[LaunchHandle] = []
@@ -406,6 +447,11 @@ class BrowserPool:
                                 self._space_metadata.get(space_id, {}),
                                 existing.user_metadata_override,
                             )
+                        if domains_override is not None:
+                            existing.allowed_domains_override = domains_override
+                        existing.allowed_domains = self._effective_domains_for(
+                            space_id, existing.allowed_domains_override
+                        )
                         early_result = existing.to_dict()
                         break
 
@@ -442,6 +488,7 @@ class BrowserPool:
                                 cdp_http_url=matching_warm.cdp_http_url,
                                 cdp_ws_url=matching_warm.cdp_ws_url,
                                 user_metadata=meta_override,
+                                allowed_domains=domains_override,
                             )
                         else:
                             port, h = self._reserve_starting_locked(
@@ -523,6 +570,7 @@ class BrowserPool:
                     ttl_seconds,
                     handle,
                     user_metadata=meta_override,
+                    allowed_domains=domains_override,
                 )
 
         self.launcher.stop(orphan)
@@ -793,6 +841,9 @@ class BrowserPool:
 
         Soft browse is not gated here. Categories: eval|download|upload|nav_irreversible.
         Lease stays warm on awaiting_human; agent pauses. Auto-deny after TTL (~60s).
+
+        When category is nav_irreversible and body includes ``url``, refuse outside
+        the lease allowlist (DomainAllowlistError) before minting confirmation.
         """
         parsed = parse_action_request(body)
         ttl = confirm_ttl_seconds()
@@ -804,6 +855,13 @@ class BrowserPool:
             lease = self._leases.get(lease_id)
             if not lease:
                 raise LeaseNotFoundError(lease_id)
+            nav_url = body.get("url") if isinstance(body, dict) else None
+            if (
+                parsed["category"] == "nav_irreversible"
+                and isinstance(nav_url, str)
+                and nav_url.strip()
+            ):
+                check_navigate_url(nav_url.strip(), lease.allowed_domains)
             slot = self._find_slot_by_lease(lease_id)
             if not slot or slot.status != SlotStatus.LEASED:
                 raise LeaseNotFoundError(lease_id)
@@ -1300,25 +1358,114 @@ class BrowserPool:
             }
 
 
+    # --- navigate (domain allowlist gate) ------------------------------
+
+    def navigate(self, lease_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Top-frame navigate via CDP (or mock). Refuse outside allowlist.
+
+        Empty effective allowlist = unrestricted. iframe/subresource not gated (v1).
+        """
+        if not isinstance(body, dict):
+            raise DomainAllowlistError("body must be a JSON object")
+        url = body.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise DomainAllowlistError("url must be a non-empty string")
+        url = url.strip()
+
+        with self._lock:
+            lease = self._leases.get(lease_id)
+            if not lease:
+                raise LeaseNotFoundError(lease_id)
+            slot = self._find_slot_by_lease(lease_id)
+            if not slot or slot.status != SlotStatus.LEASED:
+                raise LeaseNotFoundError(lease_id)
+            patterns = list(lease.allowed_domains)
+            cdp_http = slot.cdp_http_url
+            mock = self.config.mock
+
+        check_navigate_url(url, patterns)
+
+        if mock:
+            with self._lock:
+                self._nav_log.append(
+                    {"lease_id": lease_id, "url": url, "allowed_domains": patterns}
+                )
+            return {
+                "ok": True,
+                "url": url,
+                "matched": True,
+                "mock": True,
+                "allowed_domains": patterns,
+            }
+
+        if not cdp_http:
+            raise DomainAllowlistError("lease has no cdp_http_url")
+        from slipstream.cdp_http import navigate_via_json_new
+
+        result = navigate_via_json_new(cdp_http, url)
+        return {
+            "ok": bool(result.get("matched")),
+            "url": url,
+            "matched": bool(result.get("matched")),
+            "title": (result.get("title") or "")[:200],
+            "observed_url": result.get("url") or "",
+            "allowed_domains": patterns,
+        }
+
     # --- user_metadata / list ------------------------------------------
 
     def set_space_metadata(
-        self, space_id: str, user_metadata: dict[str, Any] | None
+        self,
+        space_id: str,
+        user_metadata: dict[str, Any] | None = None,
+        *,
+        allowed_domains: list[str] | None = None,
+        clear_allowed_domains: bool = False,
     ) -> dict[str, Any]:
-        """Set/replace Space-level tags. Leases inherit; lease overrides win."""
+        """Set/replace Space-level tags and/or allowed_domains.
+
+        Leases inherit; lease overrides win. ``allowed_domains=None`` leaves the
+        Space allowlist unchanged unless ``clear_allowed_domains`` is True.
+        """
         space_id = self.config.normalize_space_id(space_id)
-        meta = validate_user_metadata(user_metadata) if user_metadata else {}
+        meta = (
+            validate_user_metadata(user_metadata)
+            if user_metadata is not None
+            else None
+        )
+        domains = (
+            parse_allowed_domains(allowed_domains)
+            if allowed_domains is not None
+            else None
+        )
         with self._lock:
-            if meta:
-                self._space_metadata[space_id] = meta
-            else:
-                self._space_metadata.pop(space_id, None)
+            if meta is not None:
+                if meta:
+                    self._space_metadata[space_id] = meta
+                else:
+                    self._space_metadata.pop(space_id, None)
+            if clear_allowed_domains:
+                self._space_allowed_domains.pop(space_id, None)
+            elif domains is not None:
+                self._space_allowed_domains[space_id] = domains
+            space_meta = dict(self._space_metadata.get(space_id, {}))
             for lease in self._leases.values():
                 if lease.space_id == space_id:
                     lease.user_metadata = effective_metadata(
-                        meta, lease.user_metadata_override
+                        space_meta, lease.user_metadata_override
                     )
-            return {"space_id": space_id, "user_metadata": dict(meta)}
+                    lease.allowed_domains = self._effective_domains_for(
+                        space_id, lease.allowed_domains_override
+                    )
+            out: dict[str, Any] = {
+                "space_id": space_id,
+                "user_metadata": dict(self._space_metadata.get(space_id, {})),
+            }
+            if space_id in self._space_allowed_domains:
+                out["allowed_domains"] = list(self._space_allowed_domains[space_id])
+            else:
+                out["allowed_domains"] = None
+            return out
 
     def get_space_metadata(self, space_id: str) -> dict[str, Any]:
         space_id = self.config.normalize_space_id(space_id)
@@ -1326,12 +1473,17 @@ class BrowserPool:
             return {
                 "space_id": space_id,
                 "user_metadata": dict(self._space_metadata.get(space_id, {})),
+                "allowed_domains": list(self._space_allowed_domains[space_id])
+                if space_id in self._space_allowed_domains
+                else None,
             }
 
     def list_spaces(self, *, q: str | None = None) -> dict[str, Any]:
         """List known Spaces (tagged and/or currently slotted) filtered by q=."""
         with self._lock:
-            known: set[str] = set(self._space_metadata.keys())
+            known: set[str] = set(self._space_metadata.keys()) | set(
+                self._space_allowed_domains.keys()
+            )
             for slot in self._slots:
                 if slot.space_id:
                     known.add(slot.space_id)
@@ -1352,6 +1504,9 @@ class BrowserPool:
                     {
                         "space_id": sid,
                         "user_metadata": meta,
+                        "allowed_domains": list(self._space_allowed_domains[sid])
+                        if sid in self._space_allowed_domains
+                        else None,
                         "leased": leased,
                         "warm": warm,
                     }

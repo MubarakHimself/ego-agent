@@ -7,8 +7,13 @@ Gated act → confirmation_required + sibling need_human on the same alerts bus
 (kind=confirmation_required + confirm_id). Confirm|deny within ~60s; auto-deny
 on expiry. Non-TTY interactive confirm → deny.
 
-Defer: once/always/never policy matrix, domain allowlist, content-boundaries,
-Comet UI. Pattern from agent-browser Security docs (no code theft).
+Defer: once/always/never policy matrix, Comet UI. Domain allowlist +
+content-boundaries ship separately (pool navigate gate / boundaries helper).
+Pattern from agent-browser Security docs (no code theft).
+
+v1 honor-system (ADV-PL-001): POST /actions is an advisory pause — CDP fill /
+eval / nav are not server-enforced by this ladder yet. Server-enforced ladder
+is a later track. Domain allowlist on navigate IS enforced at the pool gate.
 """
 
 from __future__ import annotations
@@ -102,7 +107,16 @@ def parse_action_request(body: dict[str, Any]) -> dict[str, Any]:
                 f"{forbidden} is server-derived; omit from request"
             )
 
-    return {"category": category, "summary": summary}
+    out: dict[str, Any] = {"category": category, "summary": summary}
+    # Optional url for nav_irreversible (pool allowlist gate); scrub if present.
+    url = body.get("url")
+    if url is not None:
+        if not isinstance(url, str):
+            raise ActionValidationError("url must be a string")
+        url = scrub_text(url.strip())
+        if url:
+            out["url"] = url
+    return out
 
 
 def parse_confirmation_action(body: dict[str, Any]) -> str:
