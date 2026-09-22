@@ -24,6 +24,7 @@ include = ["slipstream*"]
 [tool.pytest.ini_options]
 markers = [
     "live: optional live smoke requiring a real Chrome/Chromium binary",
+    "live_stress: live out-of-box stress/edge cases requiring real Chrome",
     "bench: optional pool speed benchmark (MOCK or LIVE)",
 ]
 testpaths = ["tests"]

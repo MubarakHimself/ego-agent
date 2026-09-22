@@ -1,4 +1,4 @@
-"""Chromium launcher stub — one process tree per slot via CDP.
+"""Chromium launcher — one process tree per slot via CDP.
 
 Finds google-chrome / chromium / Chrome-for-Testing. Launches with
 --remote-debugging-port and --user-data-dir=<Space>. When SLIPSTREAM_MOCK=1
@@ -12,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -108,8 +109,8 @@ class ChromiumLauncher:
         ]
         if self.config.headless:
             args.append("--headless=new")
-        # Avoid GPU issues on headless boxes
-        args.extend(["--disable-gpu", "--no-sandbox"])
+        # Avoid GPU / tiny-/dev/shm issues on headless boxes
+        args.extend(["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"])
         args.append("about:blank")
 
         proc = subprocess.Popen(
@@ -118,12 +119,48 @@ class ChromiumLauncher:
             stderr=subprocess.DEVNULL,
             start_new_session=True,  # own process group / tree
         )
-        # Brief wait so CDP port may bind (stub — callers can poll)
-        time.sleep(0.3)
+        cdp_http_url = f"http://127.0.0.1:{cdp_port}"
+        # Wait until DevTools HTTP answers (or process dies). The old 0.3s sleep
+        # stub could return handles whose CDP was not yet bound — live K=5 stress
+        # then saw Connection refused / lease-with-dead-CDP.
+        ready_timeout = float(os.environ.get("SLIPSTREAM_CDP_READY_TIMEOUT", "20"))
+        deadline = time.monotonic() + ready_timeout
+        last_err: Exception | None = None
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"Chromium exited early (code={proc.returncode}) before CDP "
+                    f"ready on port {cdp_port} for space_id={space_id!r}"
+                )
+            try:
+                with urllib.request.urlopen(
+                    f"{cdp_http_url}/json/version", timeout=0.5
+                ) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception as e:  # noqa: BLE001 — probe loop
+                last_err = e
+                time.sleep(0.05)
+            else:
+                break
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            raise RuntimeError(
+                f"CDP not ready at {cdp_http_url} within {ready_timeout}s "
+                f"for space_id={space_id!r} (last={last_err})"
+            )
+
         return LaunchHandle(
             pid=proc.pid,
             cdp_port=cdp_port,
-            cdp_http_url=f"http://127.0.0.1:{cdp_port}",
+            cdp_http_url=cdp_http_url,
             cdp_ws_url=None,  # discover via /json/version when needed
             user_data_dir=user_data,
             process=proc,
