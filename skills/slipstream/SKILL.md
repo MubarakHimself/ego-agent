@@ -502,6 +502,26 @@ slipstream sessions --json           # includes watch_url when need_human minted
   another lease; do not spawn your own browser.
 - **Agents never own a permanent browser PID** — only leases.
 
+
+## Space tiers (ephemeral / named / attach)
+
+| Tier | Meaning |
+| --- | --- |
+| `ephemeral` | **Default.** Pool-spawned Chromium; Space dir is a disposable profile label (no attach). |
+| `named` | Durable/named Space profile id (`user-data-dir` under `spaces_root`) — login-once / warm reuse. |
+| `attach` | Attach to **existing** Chrome via user CDP URL/port — **no** pool Chromium spawn. Requires `SLIPSTREAM_ALLOW_ATTACH=1`. |
+
+- Default lease tier is **`ephemeral`** (pool-spawned Chromium).
+- **`named`**: durable Space profile under `spaces_root` (login-once / warm reuse).
+- **`attach`**: bind to an **existing** Chrome via `cdp_url` or `cdp_port`. Requires `SLIPSTREAM_ALLOW_ATTACH=1`. Pool does **not** spawn Chromium; **release ≠ quit Chrome**.
+- Attach risk (also on lease JSON `risk_label`): shared cookies/tabs; raw CDP / `SLIPSTREAM_EXPOSE_RAW_CDP` is **honor-system** for the ladder when driving the attached browser directly.
+
+```bash
+# Attach (Chrome already started with --remote-debugging-port=9222)
+SLIPSTREAM_ALLOW_ATTACH=1 slipstream lease --agent-id me --space-id my-chrome \
+  --tier attach --cdp-port 9222
+```
+
 ## Driver attach recipes
 
 Slipstream owns **pool lease**. **Default drive** is pool HTTP (navigate / eval /

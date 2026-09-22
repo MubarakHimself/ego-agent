@@ -126,6 +126,18 @@ from slipstream.metadata import (
     validate_user_metadata,
 )
 from slipstream.sessions import alive_watch_url, session_row
+from slipstream.tiers import (
+    ATTACH_RISK_LABEL,
+    TIER_ATTACH,
+    TIER_EPHEMERAL,
+    TIER_NAMED,
+    AttachDisabledError,
+    TierError,
+    attach_allowed,
+    parse_tier,
+    resolve_attach_cdp,
+    risk_label_for_tier,
+)
 from slipstream.signed_in import (
     SignedInValidationError,
     badge_from_registry,
@@ -190,6 +202,22 @@ class SpaceInUseError(Exception):
     """Raised when another agent already holds a lease on this space_id."""
 
 
+
+# SKY-L027 string constants (quality-debt claw)
+_S_CLICK = "click"
+_S_CONFIRM = "confirm"
+_S_SIGNED_IN = "signed_in"
+_S_CONFIRMATION_REQUIRED = "confirmation_required"
+_S_PAUSE = "pause"
+_S_CONTINUE = "continue"
+_S_TAKEOVER = "takeover"
+_S_REASON = "reason"
+_S_NO_CDP = "lease has no cdp_http_url"
+_S_CONFIRMATION_PREFIX = "confirmation "
+_S_POOL_AT_K = "pool at hard K="
+_S_LEASE_SLOT_CHANGED = "lease/slot identity changed during capture"
+
+
 class BrowserPool:
     """Owns ≤K Chromium process trees; agents lease slots, never own PIDs.
 
@@ -214,6 +242,8 @@ class BrowserPool:
         self._space_allowed_domains: dict[str, list[str]] = {}
         # Space signed-in badge (persist cookies via profile dir; badge is metadata).
         self._space_signed_in: dict[str, dict[str, Any]] = {}
+        # Space default tier (ephemeral|named|attach); leases may override.
+        self._space_tiers: dict[str, str] = {}
         # Mock navigate recorder (tests); never returned with secrets.
         self._nav_log: list[dict[str, Any]] = []
         # Stagehand-style /act mock recorder + primary-fail budget (tests).
@@ -324,7 +354,7 @@ class BrowserPool:
         handle = self._handles.get(slot.slot_id)
         if handle is None:
             return False
-        if handle.mocked:
+        if handle.mocked or getattr(handle, "external", False):
             return True
         if handle.process is not None:
             return handle.process.poll() is None
@@ -367,6 +397,8 @@ class BrowserPool:
         user_metadata: dict[str, Any] | None = None,
         allowed_domains: list[str] | None = None,
         keep_alive: bool = False,
+        tier: str = TIER_EPHEMERAL,
+        external_attach: bool = False,
     ) -> dict[str, Any]:
         """Wire Lease + slot lease fields; caller sets process/CDP fields as needed."""
         now = time.time()
@@ -394,9 +426,12 @@ class BrowserPool:
             user_metadata=effective_metadata(space_meta, override),
             allowed_domains_override=domains_override,
             allowed_domains=self._effective_domains_for(space_id, domains_override),
-            signed_in=bool(badge.get("signed_in")),
+            signed_in=bool(badge.get(_S_SIGNED_IN)),
             signed_in_host=badge.get(_KEY_SIGNED_IN_HOST),
             keep_alive=bool(keep_alive),
+            tier=tier,
+            risk_label=risk_label_for_tier(tier),
+            external_attach=bool(external_attach),
         )
         self._leases[lease_id] = lease
         slot.status = SlotStatus.LEASED
@@ -445,7 +480,17 @@ class BrowserPool:
         self._captcha.pop(lease_id, None)
         self._confirmations.clear_lease(lease_id)
 
-        keep_warm = allow_warm and self._count_warm() < self.config.W
+        # Attach / external handles never go warm — we do not own that Chrome,
+        # and must not hand a user CDP to the next agent without ALLOW_ATTACH.
+        handle_peek = self._handles.get(slot.slot_id)
+        external = bool(getattr(lease, "external_attach", False)) or (
+            handle_peek is not None and bool(getattr(handle_peek, "external", False))
+        )
+        keep_warm = (
+            allow_warm
+            and not external
+            and self._count_warm() < self.config.W
+        )
         del self._leases[lease_id]
 
         if keep_warm:
@@ -516,6 +561,219 @@ class BrowserPool:
 
     # --- lease API -----------------------------------------------------
 
+
+
+
+    def _apply_tier_to_lease_dict(self, result: dict[str, Any], tier: str) -> dict[str, Any]:
+        """Stamp tier (+ risk_label) on lease object and response dict."""
+        lid = result.get("lease_id")
+        lease = self._leases.get(lid) if lid else None
+        if lease is not None:
+            lease.tier = tier
+            lease.risk_label = risk_label_for_tier(tier)
+            lease.external_attach = tier == TIER_ATTACH
+            return lease.to_dict()
+        result = dict(result)
+        result["tier"] = tier
+        rl = risk_label_for_tier(tier)
+        if rl:
+            result["risk_label"] = rl
+        return result
+
+    def _probe_attach_cdp(self, cdp_http_url: str) -> None:
+        """Ensure attach CDP answers /json/version (skipped under mock)."""
+        if self.config.mock:
+            return
+        from slipstream.cdp_http import wait_attach_cdp_ready
+
+        wait_attach_cdp_ready(cdp_http_url, timeout=5.0)
+
+    def _lease_attach(
+        self,
+        agent_id: str,
+        space_id: str,
+        *,
+        ttl_seconds: int | None,
+        meta_override: dict[str, Any] | None,
+        domains_override: list[str] | None,
+        ka: bool,
+        ka_explicit: bool,
+        cdp_http: str,
+        cdp_port: int | None,
+    ) -> dict[str, Any]:
+        """Lease a slot bound to external Chrome CDP — never spawn pool Chromium."""
+        pending_stops: list[LaunchHandle] = []
+        early_result: dict[str, Any] | None = None
+        attach_slot_id: int | None = None
+        bookkeeping_error: Exception | None = None
+
+        with self._lock:
+            now = time.time()
+            for lid, existing in list(self._leases.items()):
+                if existing.agent_id == agent_id and existing.space_id == space_id:
+                    slot = self._find_slot_by_lease(lid)
+                    if slot and slot.status == SlotStatus.LEASED:
+                        if existing.expires_at is not None and now >= existing.expires_at:
+                            h = self._detach_lease_locked(lid, allow_warm=False)
+                            if h is not None:
+                                pending_stops.append(h)
+                            break
+                        if not self._handle_alive(slot):
+                            h = self._detach_lease_locked(lid, allow_warm=False)
+                            if h is not None:
+                                pending_stops.append(h)
+                            break
+                        slot.last_heartbeat = now
+                        if meta_override is not None:
+                            existing.user_metadata_override = meta_override
+                            existing.user_metadata = effective_metadata(
+                                self._space_metadata.get(space_id, {}),
+                                meta_override,
+                            )
+                        else:
+                            existing.user_metadata = effective_metadata(
+                                self._space_metadata.get(space_id, {}),
+                                existing.user_metadata_override,
+                            )
+                        if domains_override is not None:
+                            existing.allowed_domains_override = domains_override
+                        existing.allowed_domains = self._effective_domains_for(
+                            space_id, existing.allowed_domains_override
+                        )
+                        self._sync_lease_signed_in(existing)
+                        if ka_explicit:
+                            existing.keep_alive = ka
+                        # ADV-AC-002: never mark external while still owning a pool tree.
+                        handle = self._handles.get(slot.slot_id)
+                        if handle is not None and not bool(
+                            getattr(handle, "external", False)
+                        ):
+                            owned = self._handles.pop(slot.slot_id, None)
+                            if owned is not None:
+                                pending_stops.append(owned)
+                            self._clear_process_fields(slot)
+                            handle = None
+                        existing.tier = TIER_ATTACH
+                        existing.risk_label = ATTACH_RISK_LABEL
+                        existing.external_attach = True
+                        existing.cdp_http_url = cdp_http
+                        existing.cdp_ws_url = None
+                        slot.cdp_http_url = cdp_http
+                        slot.cdp_port = cdp_port
+                        slot.cdp_ws_url = None
+                        slot.chromium_pid = None
+                        if handle is None:
+                            self._handles[slot.slot_id] = LaunchHandle(
+                                pid=0,
+                                cdp_port=int(cdp_port or 0),
+                                cdp_http_url=cdp_http,
+                                cdp_ws_url=None,
+                                user_data_dir=self.config.space_path(space_id),
+                                process=None,
+                                mocked=bool(self.config.mock),
+                                external=True,
+                            )
+                        else:
+                            handle.external = True
+                            handle.mocked = handle.mocked or self.config.mock
+                            handle.cdp_http_url = cdp_http
+                            handle.process = None
+                            handle.pid = 0
+                            if cdp_port is not None:
+                                handle.cdp_port = cdp_port
+                        early_result = existing.to_dict()
+                        break
+
+            if early_result is None:
+                try:
+                    for s in self._slots:
+                        if s.space_id == space_id and s.status in (
+                            SlotStatus.LEASED,
+                            SlotStatus.STARTING,
+                        ):
+                            raise SpaceInUseError(
+                                f"space_id {space_id!r} already in use "
+                                f"(agent_id={s.agent_id!r}, status={s.status.value})"
+                            )
+                    cold = next(
+                        (s for s in self._slots if s.status == SlotStatus.FREE_COLD),
+                        None,
+                    )
+                    warm = next(
+                        (s for s in self._slots if s.status == SlotStatus.FREE_WARM),
+                        None,
+                    )
+                    slot = cold or warm
+                    if slot is None:
+                        raise PoolFullError(
+                            f"pool at hard K={self.config.K}; all slots leased"
+                        )
+                    if slot.status == SlotStatus.FREE_WARM:
+                        h = self._handles.pop(slot.slot_id, None)
+                        if h is not None:
+                            pending_stops.append(h)
+                        self._clear_process_fields(slot)
+                    self._clear_lease_fields(slot)
+                    slot.status = SlotStatus.STARTING
+                    slot.space_id = space_id
+                    slot.agent_id = agent_id
+                    attach_slot_id = slot.slot_id
+                except (SpaceInUseError, PoolFullError) as exc:
+                    bookkeeping_error = exc
+
+        for h in pending_stops:
+            self.launcher.stop(h)
+
+        if bookkeeping_error is not None:
+            raise bookkeeping_error
+        if early_result is not None:
+            return early_result
+
+        assert attach_slot_id is not None
+        port = int(cdp_port or 0)
+        handle = LaunchHandle(
+            pid=0,
+            cdp_port=port,
+            cdp_http_url=cdp_http,
+            cdp_ws_url=None,
+            user_data_dir=self.config.space_path(space_id),
+            process=None,
+            mocked=bool(self.config.mock),
+            external=True,
+        )
+        with self._lock:
+            slot = self._slots[attach_slot_id]
+            if (
+                slot.status != SlotStatus.STARTING
+                or slot.space_id != space_id
+                or slot.agent_id != agent_id
+            ):
+                self.launcher.stop(handle)
+                raise PoolFullError(
+                    f"slot {attach_slot_id} lost STARTING reservation during attach "
+                    f"for space_id={space_id!r}"
+                )
+            self._handles[slot.slot_id] = handle
+            result = self._attach_lease(
+                slot,
+                agent_id,
+                space_id,
+                ttl_seconds,
+                cdp_http_url=cdp_http,
+                cdp_ws_url=None,
+                user_metadata=meta_override,
+                allowed_domains=domains_override,
+                keep_alive=ka,
+                tier=TIER_ATTACH,
+                external_attach=True,
+            )
+            self._prepare_lease_downloads(result["lease_id"], cdp_http)
+            slot.chromium_pid = None
+            slot.cdp_port = cdp_port
+            slot.cdp_http_url = cdp_http
+            slot.cdp_ws_url = None
+            return result
+
     def lease(
         self,
         agent_id: str,
@@ -525,6 +783,10 @@ class BrowserPool:
         user_metadata: dict[str, Any] | None = None,
         allowed_domains: list[str] | None = None,
         keep_alive: bool | None = None,
+        tier: str | None = None,
+        cdp_url: str | None = None,
+        cdp_port: int | None = None,
+        mode: str | None = None,
     ) -> dict[str, Any]:
         # Validate early (rejects ".", "..", "/", NULs, empty, unsafe)
         space_id = self.config.normalize_space_id(space_id)
@@ -539,6 +801,46 @@ class BrowserPool:
         # On idempotent re-lease, omit leaves existing keep_alive unchanged.
         ka_explicit = keep_alive is not None
         ka = bool(keep_alive) if ka_explicit else False
+
+        # Tier: explicit lease tier/mode, else Space default, else ephemeral.
+        # mode="attach" is an alias for tier=attach (ui-peers attach-my-Chrome).
+        if mode is not None and tier is not None:
+            raise TierError("provide tier or mode, not both")
+        tier_raw = tier if tier is not None else mode
+        with self._lock:
+            space_default = self._space_tiers.get(space_id, TIER_EPHEMERAL)
+        resolved_tier = parse_tier(
+            tier_raw, default=space_default if tier_raw is None else TIER_EPHEMERAL
+        )
+        # When client omits tier/mode, parse_tier(None) returns ephemeral — restore Space default.
+        if tier_raw is None:
+            resolved_tier = space_default if space_default in (TIER_EPHEMERAL, TIER_NAMED, TIER_ATTACH) else TIER_EPHEMERAL
+            resolved_tier = parse_tier(resolved_tier)
+
+        attach_http: str | None = None
+        attach_port: int | None = None
+        if resolved_tier == TIER_ATTACH:
+            if not attach_allowed():
+                raise AttachDisabledError(
+                    "attach tier disabled; set SLIPSTREAM_ALLOW_ATTACH=1 to enable"
+                )
+            attach_http, attach_port = resolve_attach_cdp(
+                cdp_url=cdp_url, cdp_port=cdp_port
+            )
+            self._probe_attach_cdp(attach_http)
+            return self._lease_attach(
+                agent_id,
+                space_id,
+                ttl_seconds=ttl_seconds,
+                meta_override=meta_override,
+                domains_override=domains_override,
+                ka=ka,
+                ka_explicit=ka_explicit,
+                cdp_http=attach_http,
+                cdp_port=attach_port,
+            )
+        elif cdp_url is not None or cdp_port is not None:
+            raise TierError("cdp_url/cdp_port only valid with tier/mode=attach")
 
         # Handles that must be stopped outside the lock (released/replaced trees).
         pending_stops: list[LaunchHandle] = []
@@ -587,6 +889,20 @@ class BrowserPool:
                             space_id, existing.allowed_domains_override
                         )
                         self._sync_lease_signed_in(existing)
+                        # ADV-AC-001: leaving attach must fully detach user CDP
+                        # (never stamp ephemeral/named onto an external handle).
+                        handle_now = self._handles.get(slot.slot_id)
+                        leaving_attach = bool(
+                            getattr(existing, "external_attach", False)
+                        ) or (
+                            handle_now is not None
+                            and bool(getattr(handle_now, "external", False))
+                        )
+                        if leaving_attach:
+                            h = self._detach_lease_locked(lid, allow_warm=False)
+                            if h is not None:
+                                pending_stops.append(h)
+                            break
                         # Idempotent re-lease: only flip keep_alive when body/arg
                         # set it explicitly (omit preserves prior flag).
                         if ka_explicit:
@@ -618,7 +934,18 @@ class BrowserPool:
                         None,
                     )
                     if matching_warm is not None:
-                        if self._handle_alive(matching_warm):
+                        warm_handle = self._handles.get(matching_warm.slot_id)
+                        # ADV-AC-001: never warm-reuse a previously-attached user Chrome.
+                        if warm_handle is not None and bool(
+                            getattr(warm_handle, "external", False)
+                        ):
+                            port, h = self._reserve_starting_locked(
+                                matching_warm, agent_id, space_id
+                            )
+                            if h is not None:
+                                pending_stops.append(h)
+                            launch_job = (matching_warm.slot_id, port)
+                        elif self._handle_alive(matching_warm):
                             early_result = self._attach_lease(
                                 matching_warm,
                                 agent_id,
@@ -683,7 +1010,8 @@ class BrowserPool:
             raise bookkeeping_error
 
         if early_result is not None:
-            return early_result
+            with self._lock:
+                return self._apply_tier_to_lease_dict(early_result, resolved_tier)
 
         assert launch_job is not None
         slot_id, port = launch_job
@@ -706,7 +1034,7 @@ class BrowserPool:
                 # Lost reservation (should be rare); tear down the orphan tree outside.
                 orphan = handle
             else:
-                return self._finish_launch_locked(
+                result = self._finish_launch_locked(
                     slot,
                     agent_id,
                     space_id,
@@ -716,6 +1044,7 @@ class BrowserPool:
                     allowed_domains=domains_override,
                     keep_alive=ka,
                 )
+                return self._apply_tier_to_lease_dict(result, resolved_tier)
 
         self.launcher.stop(orphan)
         raise PoolFullError(
@@ -776,7 +1105,7 @@ class BrowserPool:
             result = {
                 "lease_id": lease_id,
                 "released": True,
-                "reason": reason,
+                _S_REASON: reason,
                 "kept_warm": kept_warm,
             }
             self._activity_feeds.pop(lease_id, None)
@@ -836,7 +1165,7 @@ class BrowserPool:
             space_id = lease.space_id
             cdp_http = slot.cdp_http_url
             if not cdp_http:
-                raise CdpInjectError("lease has no cdp_http_url")
+                raise CdpInjectError(_S_NO_CDP)
             # Fail-closed before vault unlock / CDP — peek only (no burn yet).
             if not self._confirmations.has_allowance(lease_id, "fill"):
                 raise LadderGateError("fill")
@@ -951,7 +1280,7 @@ class BrowserPool:
                     lease_id=lease_id,
                     token=watch_token,
                     expires_at=now + float(parsed["ttl_s"]),
-                    reason=parsed.get("reason"),
+                    reason=parsed.get(_S_REASON),
                     detail=parsed.get("detail") or "",
                     revoked=False,
                     takeover_confirmed=False,
@@ -985,7 +1314,7 @@ class BrowserPool:
                     lease_kept=True,
                     lease_released=False,
                     agent_paused=True,
-                    action="pause",
+                    action=_S_PAUSE,
                     takeover_url=takeover,
                     idempotent=False,
                 )
@@ -994,7 +1323,7 @@ class BrowserPool:
                     _EVT_ALERT,
                     f"need_human:{parsed.get('reason') or 'other'}",
                     outcome="pending",
-                    detail={"event": EVENT_NEED_HUMAN, "reason": parsed.get("reason")},
+                    detail={"event": EVENT_NEED_HUMAN, _S_REASON: parsed.get(_S_REASON)},
                 )
                 return envelope
 
@@ -1007,7 +1336,7 @@ class BrowserPool:
                 lease_kept=False,
                 lease_released=True,
                 agent_paused=False,
-                action="continue",
+                action=_S_CONTINUE,
                 takeover_url=takeover,
                 idempotent=False,
             )
@@ -1263,7 +1592,7 @@ class BrowserPool:
             lease_id,
             {
                 "event": EVENT_NEED_HUMAN,
-                "reason": "captcha",
+                _S_REASON: "captcha",
                 "detail": detail or "CAPTCHA unsolved",
             },
         )
@@ -1309,7 +1638,7 @@ class BrowserPool:
                 state,
                 event=EVENT_FAILED,
                 outcome=REASON_TIMEOUT,
-                extra={"reason": REASON_TIMEOUT},
+                extra={_S_REASON: REASON_TIMEOUT},
             )
             # Re-check immediately before escalate (still under same RLock).
             if not captcha_may_escalate(state):
@@ -1377,7 +1706,7 @@ class BrowserPool:
             ):
                 watch_token = sess.token
                 sess.expires_at = now + float(ttl)
-                sess.reason = "confirmation_required"
+                sess.reason = _S_CONFIRMATION_REQUIRED
                 sess.detail = parsed["summary"]
             else:
                 watch_token = mint_watch_token()
@@ -1385,7 +1714,7 @@ class BrowserPool:
                     lease_id=lease_id,
                     token=watch_token,
                     expires_at=now + float(ttl),
-                    reason="confirmation_required",
+                    reason=_S_CONFIRMATION_REQUIRED,
                     detail=parsed["summary"],
                     revoked=False,
                     takeover_confirmed=False,
@@ -1394,7 +1723,7 @@ class BrowserPool:
                 )
             alert_parsed = {
                 "event": EVENT_NEED_HUMAN,
-                "reason": "confirmation_required",
+                _S_REASON: _S_CONFIRMATION_REQUIRED,
                 "detail": parsed["summary"],
                 "task_id": None,
                 "ttl_s": ttl,
@@ -1420,14 +1749,14 @@ class BrowserPool:
                 lease_kept=True,
                 lease_released=False,
                 agent_paused=True,
-                action="pause",
+                action=_S_PAUSE,
                 takeover_url=takeover,
                 idempotent=False,
             )
             self._alert_log.setdefault(lease_id, []).append(payload)
             self._confirmations.add(pending)
             self._feed_for(lease_id).append(
-                "confirm",
+                _S_CONFIRM,
                 f"confirmation_required:{parsed['category']}",
                 outcome="pending",
                 detail={
@@ -1485,7 +1814,7 @@ class BrowserPool:
             # Resume agent unless another pending confirmation remains.
             self._clear_confirmation_pause_locked(lease_id)
             self._feed_for(lease_id).append(
-                "confirm",
+                _S_CONFIRM,
                 f"confirmation {decision}:{pending.category}",
                 outcome=decision,
                 detail={"confirm_id": confirm_id, "category": pending.category},
@@ -1536,7 +1865,7 @@ class BrowserPool:
             # or no other need_human reasons — for thin MVP: always clear when
             # no pending confirmations remain AND watch reason is confirmation.
             sess = self._lookup_watch(lease_id)
-            if sess is not None and sess.reason == "confirmation_required":
+            if sess is not None and sess.reason == _S_CONFIRMATION_REQUIRED:
                 lease.status = _STATE_LEASED
                 # Do not revoke watch here — TTL sweep / task_done handles it.
                 # Pair-browse input stays disabled (never was enabled).
@@ -1848,23 +2177,23 @@ class BrowserPool:
             reason=reason,
             detail=detail,
             frame_url=frame_path(lease_id, tok),
-            confirm_url=confirm_path(lease_id, tok) if mode == "takeover" else None,
+            confirm_url=confirm_path(lease_id, tok) if mode == _S_TAKEOVER else None,
             mode=mode,
             expires_in_s=expires_in,
             takeover_confirmed=confirmed,
             input_enabled=enabled,
             input_url=input_path(lease_id, tok) if enabled else None,
             cede_url=(
-                cede_path(lease_id, tok) if (mode == "takeover" and enabled) else None
+                cede_path(lease_id, tok) if (mode == _S_TAKEOVER and enabled) else None
             ),
             events_url=events_path(lease_id, tok),
             timeline_url=timeline_path(lease_id, tok),
             evidence_url=evidence_path(lease_id, tok),
-            signed_in=bool(badge.get("signed_in")),
+            signed_in=bool(badge.get(_S_SIGNED_IN)),
             signed_in_host=badge.get(_KEY_SIGNED_IN_HOST),
             mark_signed_in_url=(
                 f"/v1/leases/{lease_id}/watch/mark-signed-in?token={tok}"
-                if mode == "takeover"
+                if mode == _S_TAKEOVER
                 else None
             ),
             captcha_chip=chip_html,
@@ -1894,12 +2223,12 @@ class BrowserPool:
         if not lease:
             raise WatchGoneError(_ERR_LEASE_INACTIVE)
         if lease.slot_id != slot_id:
-            raise WatchGoneError("lease/slot identity changed during capture")
+            raise WatchGoneError(_S_LEASE_SLOT_CHANGED)
         if (lease.cdp_http_url or "") != (cdp_http_url or ""):
-            raise WatchGoneError("lease/slot identity changed during capture")
+            raise WatchGoneError(_S_LEASE_SLOT_CHANGED)
         slot = self._slots[slot_id] if 0 <= slot_id < len(self._slots) else None
         if slot is None or slot.lease_id != lease_id:
-            raise WatchGoneError("lease/slot identity changed during capture")
+            raise WatchGoneError(_S_LEASE_SLOT_CHANGED)
 
     def get_watch_frame(self, lease_id: str, token: str | None) -> bytes:
         """Return JPEG bytes for the leased CDP viewport (mock JPEG under mock).
@@ -1951,10 +2280,10 @@ class BrowserPool:
             sess.takeover_confirmed = True
             sess.input_enabled = True
             self._feed_for(lease_id).append(
-                "confirm",
+                _S_CONFIRM,
                 "takeover confirmed",
                 outcome="ok",
-                detail={"action": "pause"},
+                detail={"action": _S_PAUSE},
             )
             return {
                 "ok": True,
@@ -1964,7 +2293,7 @@ class BrowserPool:
                 "lease_kept": True,
                 "takeover_confirmed": True,
                 "input_enabled": True,
-                "action": "pause",
+                "action": _S_PAUSE,
                 "expires_in_s": max(0, int(sess.expires_at - time.time())),
             }
 
@@ -2026,10 +2355,10 @@ class BrowserPool:
                 raise WatchGoneError("pair-browse invalidated during dispatch")
         # Scrubbed ack only — feed never stores typed text (text_len only).
         kind = result["kind"]
-        if kind == "click":
+        if kind == _S_CLICK:
             self._record_activity(
                 lease_id,
-                "click",
+                _S_CLICK,
                 f"click @ ({int(event.get('x', 0))},{int(event.get('y', 0))})",
                 outcome="ok",
             )
@@ -2056,7 +2385,7 @@ class BrowserPool:
         elif kind == "scroll":
             self._record_activity(
                 lease_id,
-                "click",
+                _S_CLICK,
                 "scroll",
                 outcome="ok",
                 detail={"deltaY": event.get("deltaY")},
@@ -2084,10 +2413,10 @@ class BrowserPool:
             if slot is not None:
                 slot.last_heartbeat = time.time()
             self._feed_for(lease_id).append(
-                "confirm",
+                _S_CONFIRM,
                 "cede — drive returned to agent",
                 outcome="ok",
-                detail={"action": "continue"},
+                detail={"action": _S_CONTINUE},
             )
             return {
                 "ok": True,
@@ -2097,7 +2426,7 @@ class BrowserPool:
                 "lease_kept": True,
                 "input_enabled": False,
                 "takeover_confirmed": False,
-                "action": "continue",
+                "action": _S_CONTINUE,
                 "expires_in_s": max(0, int(sess.expires_at - time.time())),
             }
 
@@ -2123,7 +2452,7 @@ class BrowserPool:
                 raise LeaseNotFoundError(lease_id)
             cdp_http = slot.cdp_http_url
             if not cdp_http:
-                raise CdpInjectError("lease has no cdp_http_url")
+                raise CdpInjectError(_S_NO_CDP)
             self._confirmations.consume_once(lease_id, "eval")
 
         try:
@@ -2134,7 +2463,7 @@ class BrowserPool:
             raise
         self._record_activity(
             lease_id,
-            "confirm",
+            _S_CONFIRM,
             f"eval len={len(expression)}",
             outcome="ok",
             detail={"expression_len": len(expression)},
@@ -2177,7 +2506,7 @@ class BrowserPool:
             if lease_id not in self._leases:
                 raise LeaseNotFoundError(lease_id)
             if not mock and not cdp_http:
-                raise CdpInjectError("lease has no cdp_http_url")
+                raise CdpInjectError(_S_NO_CDP)
             self._confirmations.consume_once(lease_id, _CAT_NAV_IRREVERSIBLE)
 
         try:
@@ -2260,7 +2589,7 @@ class BrowserPool:
                     used_fallback=False,
                     last_reason=last_reason,
                 )
-            last_reason = str(steps[-1].get("reason") or last_reason)
+            last_reason = str(steps[-1].get(_S_REASON) or last_reason)
         for step in parsed["fallback_plan"][: parsed["max_steps"]]:
             used_fallback = True
             attempts += 1
@@ -2268,7 +2597,7 @@ class BrowserPool:
             if out is not None:
                 return out
             if not steps[-1].get("ok"):
-                last_reason = str(steps[-1].get("reason") or last_reason)
+                last_reason = str(steps[-1].get(_S_REASON) or last_reason)
                 break
         return finalize_act_loop(
             primary_ok=bool(steps and steps[-1].get("ok")),
@@ -2308,10 +2637,10 @@ class BrowserPool:
             steps_run.append(self._execute_act_step(lease_id, step))
         except LadderGateError as e:
             return {
-                "status": "confirmation_required",
-                "reason": "ladder_gate",
+                "status": _S_CONFIRMATION_REQUIRED,
+                _S_REASON: "ladder_gate",
                 "category": e.category,
-                "error": "confirmation_required",
+                "error": _S_CONFIRMATION_REQUIRED,
             }
   
     def _execute_act_step(self, lease_id: str, step: dict[str, Any]) -> dict[str, Any]:
@@ -2338,9 +2667,9 @@ class BrowserPool:
             self._record_activity(
                 lease_id, feed, summary, outcome="error", detail={"mock_fail": True}
             )
-            return {"ok": False, "kind": kind, "reason": "mock_primary_fail", "mock": True}
+            return {"ok": False, "kind": kind, _S_REASON: "mock_primary_fail", "mock": True}
 
-        if kind == "click":
+        if kind == _S_CLICK:
             return self._act_click_step(
                 lease_id, step, summary, feed, cdp_http=cdp_http, mock=mock
             )
@@ -2350,7 +2679,7 @@ class BrowserPool:
         return {
             "ok": ok,
             "kind": kind,
-            "reason": None if ok else "navigate_unmatched",
+            _S_REASON: None if ok else "navigate_unmatched",
             # ADV-ACT-001: never echo raw navigate URL (query/fragment) in steps_run.
             "result": self._scrub_act_nav_result(result),
         }
@@ -2400,17 +2729,17 @@ class BrowserPool:
             feed,
             summary,
             outcome="ok" if ok else "error",
-            detail={"kind": _KIND_CLICK_ACT, **({"reason": reason} if reason else {})},
+            detail={"kind": _KIND_CLICK_ACT, **({_S_REASON: reason} if reason else {})},
         )
         out: dict[str, Any] = {"ok": ok, "kind": _KIND_CLICK_ACT, "mock": mock}
         if reason:
-            out["reason"] = reason
+            out[_S_REASON] = reason
         return out
 
     def _sync_lease_signed_in(self, lease: Lease) -> None:
         """Copy Space signed-in badge onto lease (metadata only)."""
         badge = badge_from_registry(self._space_signed_in.get(lease.space_id))
-        lease.signed_in = bool(badge.get("signed_in"))
+        lease.signed_in = bool(badge.get(_S_SIGNED_IN))
         lease.signed_in_host = badge.get(_KEY_SIGNED_IN_HOST)
 
     def _apply_space_signed_in_locked(
@@ -2419,7 +2748,7 @@ class BrowserPool:
         """Mutate registries under lock; refresh active leases for space_id."""
         if signed:
             self._space_signed_in[space_id] = {
-                "signed_in": True,
+                _S_SIGNED_IN: True,
                 "host": host,
                 "marked_at": time.time(),
             }
@@ -2450,6 +2779,7 @@ class BrowserPool:
         *,
         allowed_domains: list[str] | None = None,
         clear_allowed_domains: bool = False,
+        tier: str | None = None,
     ) -> dict[str, Any]:
         """Set/replace Space-level tags and/or allowed_domains.
 
@@ -2467,6 +2797,7 @@ class BrowserPool:
             if allowed_domains is not None
             else None
         )
+        space_tier = parse_tier(tier) if tier is not None else None
         with self._lock:
             if meta is not None:
                 if meta:
@@ -2477,6 +2808,11 @@ class BrowserPool:
                 self._space_allowed_domains.pop(space_id, None)
             elif domains is not None:
                 self._space_allowed_domains[space_id] = domains
+            if space_tier is not None:
+                if space_tier == TIER_EPHEMERAL:
+                    self._space_tiers.pop(space_id, None)
+                else:
+                    self._space_tiers[space_id] = space_tier
             space_meta = dict(self._space_metadata.get(space_id, {}))
             for lease in self._leases.values():
                 if lease.space_id == space_id:
@@ -2496,6 +2832,7 @@ class BrowserPool:
             out: dict[str, Any] = {
                 "space_id": space_id,
                 "user_metadata": dict(self._space_metadata.get(space_id, {})),
+                "tier": self._space_tiers.get(space_id, TIER_EPHEMERAL),
             }
             if space_id in self._space_allowed_domains:
                 out["allowed_domains"] = list(self._space_allowed_domains[space_id])
@@ -2512,6 +2849,7 @@ class BrowserPool:
                 "allowed_domains": list(self._space_allowed_domains[space_id])
                 if space_id in self._space_allowed_domains
                 else None,
+                "tier": self._space_tiers.get(space_id, TIER_EPHEMERAL),
             }
             out.update(badge_from_registry(self._space_signed_in.get(space_id)))
             return out
@@ -2534,7 +2872,7 @@ class BrowserPool:
             self._apply_space_signed_in_locked(space_id, signed=signed, host=host)
             out: dict[str, Any] = {
                 "space_id": space_id,
-                "signed_in": signed,
+                _S_SIGNED_IN: signed,
                 "user_metadata": dict(self._space_metadata.get(space_id, {})),
                 "persist_note": (
                     "session cookies persist in Space profile dir "
@@ -2570,8 +2908,8 @@ class BrowserPool:
             space_id = self._leases[lease_id].space_id
         # set_space_signed_in takes its own lock
         raw = dict(body or {})
-        if "signed_in" not in raw:
-            raw["signed_in"] = True
+        if _S_SIGNED_IN not in raw:
+            raw[_S_SIGNED_IN] = True
         return self.set_space_signed_in(space_id, raw)
 
     def login_once(
@@ -2595,7 +2933,7 @@ class BrowserPool:
         lease = self.lease(agent_id, space_id, ttl_seconds=ttl_seconds)
         alert_body: dict[str, Any] = {
             "event": "need_human",
-            "reason": "login",
+            _S_REASON: "login",
             "detail": detail or "login-once: human Watch/Take-over to sign in",
         }
         if ttl_s is not None:
@@ -2621,7 +2959,7 @@ class BrowserPool:
         with self._lock:
             known: set[str] = set(self._space_metadata.keys()) | set(
                 self._space_allowed_domains.keys()
-            ) | set(self._space_signed_in.keys())
+            ) | set(self._space_signed_in.keys()) | set(self._space_tiers.keys())
             for slot in self._slots:
                 if slot.space_id:
                     known.add(slot.space_id)
@@ -2646,6 +2984,7 @@ class BrowserPool:
                     else None,
                     "leased": leased,
                     "warm": warm,
+                    "tier": self._space_tiers.get(sid, TIER_EPHEMERAL),
                 }
                 item.update(badge_from_registry(self._space_signed_in.get(sid)))
                 items.append(item)
@@ -2719,6 +3058,8 @@ class BrowserPool:
                         signed_in_host=lease.signed_in_host,
                         watch_url=watch.get(_KEY_WATCH_URL),
                         keep_alive=bool(lease.keep_alive),
+                        tier=getattr(lease, "tier", "ephemeral"),
+                        risk_label=getattr(lease, "risk_label", None),
                         now=now,
                     )
                 )

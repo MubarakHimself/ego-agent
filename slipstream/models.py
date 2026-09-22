@@ -82,6 +82,12 @@ class Lease:
     signed_in_host: str | None = None
     # Browserbase-style keepAlive: survive driver disconnect / soft-idle.
     keep_alive: bool = False
+    # ui-peers three-tier: ephemeral | named | attach
+    tier: str = "ephemeral"
+    # Attach-only risk blurb for status/list/sessions (None for other tiers).
+    risk_label: str | None = None
+    # True when lease bound to external Chrome (release must not kill it).
+    external_attach: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         from slipstream.actions import expose_raw_cdp
@@ -98,7 +104,10 @@ class Lease:
             "allowed_domains": list(self.allowed_domains),
             "signed_in": bool(self.signed_in),
             "keep_alive": bool(self.keep_alive),
+            "tier": self.tier,
         }
+        if self.risk_label:
+            out["risk_label"] = self.risk_label
         if expose_raw_cdp():
             out["cdp_http_url"] = self.cdp_http_url
             out["cdp_ws_url"] = self.cdp_ws_url

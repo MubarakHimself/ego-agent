@@ -39,6 +39,8 @@ class LaunchHandle:
     user_data_dir: Path
     process: subprocess.Popen | None = None
     mocked: bool = False
+    # Attach-tier: existing user Chrome — stop() must not kill it.
+    external: bool = False
 
 
 def find_chrome_binary(explicit: str | None = None) -> str | None:
@@ -191,7 +193,7 @@ class ChromiumLauncher:
         """
         if handle is None:
             return
-        if handle.mocked:
+        if handle.mocked or handle.external:
             return
         proc = handle.process
         if proc is None:

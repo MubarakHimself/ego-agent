@@ -35,6 +35,10 @@ class CliError(Exception):
         self.exit_code = exit_code
 
 
+_S_DETAIL = "detail"
+_S_CONFIRMATION_REQUIRED = "confirmation_required"
+_S_CONFIRMATION_REQUIRED_PREFIX = "confirmation_required: "
+
 def _host_is_loopback(host: str) -> bool:
     """True for localhost / 127.0.0.0/8 / ::1 (literal hosts only)."""
     h = host.strip().lower().strip("[]")
@@ -116,7 +120,7 @@ def _request(
         try:
             parsed = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
-            parsed = {"error": "http_error", "detail": raw or e.reason}
+            parsed = {"error": "http_error", _S_DETAIL: raw or e.reason}
         return e.code, parsed
     except urllib.error.URLError as e:
         raise CliError(f"connection failed: {e.reason}", exit_code=1) from e
@@ -131,7 +135,7 @@ def _print_json(payload: dict[str, Any]) -> None:
 
 
 def _fail_http(status: int, payload: dict[str, Any]) -> None:
-    detail = payload.get("detail") or payload.get("error") or payload
+    detail = payload.get(_S_DETAIL) or payload.get("error") or payload
     msg = f"HTTP {status}: {detail if isinstance(detail, str) else json.dumps(detail)}"
     raise CliError(msg, exit_code=1)
 
@@ -167,6 +171,10 @@ def cmd_lease(
     user_metadata: dict[str, Any] | None = None,
     allowed_domains: list[str] | None = None,
     keep_alive: bool | None = None,
+    tier: str | None = None,
+    mode: str | None = None,
+    cdp_url: str | None = None,
+    cdp_port: int | None = None,
 ) -> int:
     base = resolve_base_url(url)
     body: dict[str, Any] = {"agent_id": agent_id, "space_id": space_id}
@@ -178,6 +186,14 @@ def cmd_lease(
         body["allowed_domains"] = allowed_domains
     if keep_alive is not None:
         body["keep_alive"] = bool(keep_alive)
+    if tier is not None:
+        body["tier"] = tier
+    if mode is not None:
+        body["mode"] = mode
+    if cdp_url is not None:
+        body["cdp_url"] = cdp_url
+    if cdp_port is not None:
+        body["cdp_port"] = int(cdp_port)
     status, payload = _request("POST", f"{base}/v1/leases", body)
     if status != 200:
         _fail_http(status, payload)
@@ -238,13 +254,13 @@ def cmd_alert(
         body: dict[str, Any] = {
             "event": event,
             "reason": reason or "other",
-            "detail": detail or "",
+            _S_DETAIL: detail or "",
         }
     elif kind_norm in ("done", "task-done", "task_done"):
         event = "task_done"
         body = {
             "event": event,
-            "detail": detail or "",
+            _S_DETAIL: detail or "",
             "outcome": {
                 "ok": True if ok is None else bool(ok),
                 "summary": summary or "",
@@ -281,7 +297,7 @@ def cmd_captcha(
 ) -> int:
     """POST /v1/leases/{id}/captcha — started|finished|failed chip events."""
     base = resolve_base_url(url)
-    body: dict[str, Any] = {"event": event, "detail": detail or ""}
+    body: dict[str, Any] = {"event": event, _S_DETAIL: detail or ""}
     if provider:
         body["provider"] = provider
     if timeout_s is not None:
@@ -472,7 +488,7 @@ def cmd_act(
     if status not in (200, 202):
         _fail_http(status, payload)
 
-    if payload.get("status") == "confirmation_required" and confirm_interactive:
+    if payload.get("status") == _S_CONFIRMATION_REQUIRED and confirm_interactive:
         confirm_id = payload.get("confirm_id")
         if not confirm_id:
             raise CliError("confirmation_required missing confirm_id", exit_code=1)
@@ -528,10 +544,10 @@ def cmd_try_act(
         "POST", f"{base}{_PATH_LEASES}{lease_id}/act", body
     )
     if status == 403:
-        detail = payload.get("detail") if isinstance(payload, dict) else payload
+        detail = payload.get(_S_DETAIL) if isinstance(payload, dict) else payload
         st = payload.get("status") if isinstance(payload, dict) else None
         err = payload.get("error") if isinstance(payload, dict) else None
-        if err == "confirmation_required" or st == "confirmation_required":
+        if err == _S_CONFIRMATION_REQUIRED or st == _S_CONFIRMATION_REQUIRED:
             raise CliError(f"confirmation_required: {detail}", exit_code=3)
         raise CliError(f"forbidden: {detail}", exit_code=3)
     if status != 200:
@@ -611,8 +627,8 @@ def cmd_navigate(
     )
     if status == 403:
         err = payload.get("error") if isinstance(payload, dict) else None
-        detail = payload.get("detail") if isinstance(payload, dict) else payload
-        if err == "confirmation_required":
+        detail = payload.get(_S_DETAIL) if isinstance(payload, dict) else payload
+        if err == _S_CONFIRMATION_REQUIRED:
             raise CliError(f"confirmation_required: {detail}", exit_code=3)
         raise CliError(f"domain_not_allowed: {detail}", exit_code=3)
     if status != 200:
@@ -643,7 +659,7 @@ def cmd_evaluate(
         {"expression": expression},
     )
     if status == 403:
-        detail = payload.get("detail") if isinstance(payload, dict) else payload
+        detail = payload.get(_S_DETAIL) if isinstance(payload, dict) else payload
         raise CliError(f"confirmation_required: {detail}", exit_code=3)
     if status != 200:
         _fail_http(status, payload)
@@ -795,7 +811,7 @@ def cmd_spaces_login_once(
     base = resolve_base_url(url)
     body: dict[str, Any] = {"agent_id": agent_id}
     if detail:
-        body["detail"] = detail
+        body[_S_DETAIL] = detail
     if host:
         body["host"] = host
     if ttl_s is not None:
@@ -851,7 +867,7 @@ def cmd_downloads_get(
         try:
             payload = json.loads(raw.decode(_UTF8)) if raw else {}
         except json.JSONDecodeError:
-            payload = {"error": "http_error", "detail": raw[:200]}
+            payload = {"error": "http_error", _S_DETAIL: raw[:200]}
         _fail_http(status, payload if isinstance(payload, dict) else {"error": str(payload)})
     if output:
         # Operator-supplied output path: resolve + O_NOFOLLOW create (no symlink follow).

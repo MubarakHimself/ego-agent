@@ -69,12 +69,15 @@ from slipstream.watch import (
     WatchNotFoundError,
 )
 from slipstream.cdp_inject import CdpInjectError
+from slipstream.tiers import AttachDisabledError, TierError
 from slipstream.pool import (
     BrowserPool,
     LeaseExpiredError,
     LeaseNotFoundError,
     PoolFullError,
     SpaceInUseError,
+    AttachDisabledError,
+    TierError,
 )
 from slipstream.downloads import (
     KIND_DOWNLOADS,
@@ -115,6 +118,10 @@ _QS_WATCH_AUTH = "token"  # skylos: ignore[SKY-L014,SKY-L032] query param name, 
 _FIELD_ALLOWED_DOMAINS = "allowed_domains"
 _FIELD_USER_METADATA = "user_metadata"
 _FIELD_KEEP_ALIVE = "keep_alive"
+_FIELD_TIER = "tier"
+_FIELD_MODE = "mode"
+_FIELD_CDP_URL = "cdp_url"
+_FIELD_CDP_PORT = "cdp_port"
 
 
 
@@ -338,6 +345,9 @@ def _parse_keep_alive(raw: Any) -> bool | None:
         return raw
     raise ValueError("keep_alive must be a boolean")
 
+
+_S_DOMAIN_NOT_ALLOWED = "domain_not_allowed"
+_S_CDP_INJECT_FAILED = "cdp_inject_failed"
 
 def make_handler(pool: BrowserPool):
     class PoolHandler(BaseHTTPRequestHandler):
@@ -650,6 +660,10 @@ def make_handler(pool: BrowserPool):
                         {"error": "invalid_keep_alive", "detail": str(e)},
                     )
                     return
+                tier = body.get(_FIELD_TIER)
+                mode = body.get(_FIELD_MODE)
+                cdp_url = body.get(_FIELD_CDP_URL)
+                cdp_port = body.get(_FIELD_CDP_PORT)
                 try:
                     result = pool.lease(
                         agent_id,
@@ -658,6 +672,10 @@ def make_handler(pool: BrowserPool):
                         user_metadata=user_metadata,
                         allowed_domains=allowed_domains,
                         keep_alive=keep_alive,
+                        tier=tier,
+                        mode=mode,
+                        cdp_url=cdp_url,
+                        cdp_port=cdp_port,
                     )
                     _json_response(self, 200, result)
                 except MetadataValidationError as e:
@@ -674,6 +692,12 @@ def make_handler(pool: BrowserPool):
                     _json_response(self, 503, {"error": "pool_full", "detail": str(e)})
                 except SpaceInUseError as e:
                     _json_response(self, 409, {"error": "space_in_use", "detail": str(e)})
+                except AttachDisabledError as e:
+                    _json_response(
+                        self, 403, {"error": "attach_disabled", "detail": str(e)}
+                    )
+                except TierError as e:
+                    _json_response(self, 400, {"error": "invalid_tier", "detail": str(e)})
                 except ValueError as e:
                     _json_response(self, 400, {"error": _ERR_BAD_REQUEST, "detail": str(e)})
                 except (RuntimeError, OSError) as e:
@@ -786,7 +810,7 @@ def make_handler(pool: BrowserPool):
                         self,
                         403,
                         {
-                            "error": "domain_not_allowed",
+                            "error": _S_DOMAIN_NOT_ALLOWED,
                             "detail": str(e),
                             "host": getattr(e, "host", None),
                         },
@@ -794,7 +818,7 @@ def make_handler(pool: BrowserPool):
                 except LadderGateError as e:
                     _ladder_gate_response(self, e)
                 except CdpInjectError as e:
-                    _json_response(self, 502, {"error": "cdp_inject_failed", "detail": str(e)})
+                    _json_response(self, 502, {"error": _S_CDP_INJECT_FAILED, "detail": str(e)})
                 except LeaseNotFoundError:
                     _json_response(
                         self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id}
@@ -812,7 +836,7 @@ def make_handler(pool: BrowserPool):
                         self,
                         403,
                         {
-                            "error": "domain_not_allowed",
+                            "error": _S_DOMAIN_NOT_ALLOWED,
                             "detail": str(e),
                             "host": getattr(e, "host", None),
                         },
@@ -842,7 +866,7 @@ def make_handler(pool: BrowserPool):
                         self,
                         403,
                         {
-                            "error": "domain_not_allowed",
+                            "error": _S_DOMAIN_NOT_ALLOWED,
                             "detail": str(e),
                             "host": getattr(e, "host", None),
                         },
@@ -850,7 +874,7 @@ def make_handler(pool: BrowserPool):
                 except LadderGateError as e:
                     _ladder_gate_response(self, e)
                 except CdpInjectError as e:
-                    _json_response(self, 502, {"error": "cdp_inject_failed", "detail": str(e)})
+                    _json_response(self, 502, {"error": _S_CDP_INJECT_FAILED, "detail": str(e)})
                 except LeaseNotFoundError:
                     _json_response(
                         self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id}
@@ -870,7 +894,7 @@ def make_handler(pool: BrowserPool):
                         self, 400, {"error": _ERR_INVALID_ACTION, "detail": str(e)}
                     )
                 except CdpInjectError as e:
-                    _json_response(self, 502, {"error": "cdp_inject_failed", "detail": str(e)})
+                    _json_response(self, 502, {"error": _S_CDP_INJECT_FAILED, "detail": str(e)})
                 except LeaseNotFoundError:
                     _json_response(
                         self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id}
@@ -1061,7 +1085,7 @@ def make_handler(pool: BrowserPool):
                 except VaultValidationError as e:
                     _json_response(self, 400, {"error": _ERR_INVALID_CREDENTIALS, "detail": str(e)})
                 except CdpInjectError as e:
-                    _json_response(self, 502, {"error": "cdp_inject_failed", "detail": str(e)})
+                    _json_response(self, 502, {"error": _S_CDP_INJECT_FAILED, "detail": str(e)})
                 except VaultUnavailableError as e:
                     _json_response(self, 503, {"error": "vault_unavailable", "detail": str(e)})
                 return
@@ -1090,13 +1114,14 @@ def make_handler(pool: BrowserPool):
                     return
                 has_meta = _FIELD_USER_METADATA in body
                 has_domains = _FIELD_ALLOWED_DOMAINS in body
-                if not has_meta and not has_domains:
+                has_tier = _FIELD_TIER in body
+                if not has_meta and not has_domains and not has_tier:
                     _json_response(
                         self,
                         400,
                         {
                             "error": "space_update_required",
-                            "detail": "body must include user_metadata and/or allowed_domains",
+                            "detail": "body must include user_metadata, allowed_domains, and/or tier",
                         },
                     )
                     return
@@ -1108,6 +1133,7 @@ def make_handler(pool: BrowserPool):
                         clear_allowed_domains=(
                             has_domains and body.get(_FIELD_ALLOWED_DOMAINS) is None
                         ),
+                        tier=body.get(_FIELD_TIER) if has_tier else None,
                     )
                     _json_response(self, 200, result)
                 except MetadataValidationError as e:
@@ -1120,6 +1146,8 @@ def make_handler(pool: BrowserPool):
                         400,
                         {"error": "invalid_allowed_domains", "detail": str(e)},
                     )
+                except TierError as e:
+                    _json_response(self, 400, {"error": "invalid_tier", "detail": str(e)})
                 except ValueError as e:
                     _json_response(self, 400, {"error": _ERR_BAD_REQUEST, "detail": str(e)})
                 return

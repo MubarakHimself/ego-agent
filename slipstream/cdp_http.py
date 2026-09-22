@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
 import urllib.request
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -44,6 +45,69 @@ def wait_cdp_ready(cdp_http_url: str, *, timeout: float = 15.0) -> dict[str, Any
             ) as resp:
                 if resp.status == 200:
                     return json.load(resp)
+        except Exception as e:  # noqa: BLE001 — probe loop
+            last_err = e
+            time.sleep(0.1)
+    raise TimeoutError(f"CDP not ready at {url} within {timeout}s (last={last_err})")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects on attach health probes (SSRF: loopback → metadata)."""
+
+    def redirect_request(self, *args):  # urllib signature; never follow
+        req = args[0] if args else None
+        code = args[2] if len(args) > 2 else 302
+        headers = args[4] if len(args) > 4 else None
+        newurl = args[5] if len(args) > 5 else "?"
+        full = getattr(req, "full_url", "")
+        raise urllib.error.HTTPError(
+            full,
+            code,
+            f"attach CDP probe refused redirect to {newurl}",
+            headers,
+            None,
+        )
+
+
+def _attach_probe_url(cdp_http_url: str) -> tuple[str, str]:
+    """Return (/json/version URL, host) after attach peer policy check."""
+    from slipstream.tiers import TierError, assert_attach_peer_allowed
+
+    base = cdp_http_url.rstrip("/")
+    url = f"{base}/json/version"
+    parsed = urlparse(url)
+    if (parsed.scheme or "").lower() not in ("http", "https"):
+        raise TierError(
+            f"attach probe scheme not allowed (got {parsed.scheme!r})"
+        )
+    host = (parsed.hostname or "").lower().strip("[]")
+    assert_attach_peer_allowed(host)
+    return url, host
+
+
+def wait_attach_cdp_ready(cdp_http_url: str, *, timeout: float = 5.0) -> dict[str, Any]:
+    """Attach-tier CDP probe: no redirects; re-validate host/IP each attempt.
+
+    Does **not** honor ``SLIPSTREAM_ALLOW_REMOTE_URL`` — attach policy is
+    ``tiers.assert_attach_peer_allowed`` (loopback / ATTACH_ALLOW_HOSTS).
+    """
+    from slipstream.tiers import TierError, assert_attach_peer_allowed
+
+    url, host = _attach_probe_url(cdp_http_url)
+    opener = urllib.request.build_opener(_NoRedirectHandler)
+    deadline = time.monotonic() + timeout
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            assert_attach_peer_allowed(host)
+            with opener.open(url, timeout=1.0) as resp:
+                final_host = (urlparse(resp.geturl()).hostname or "").lower().strip("[]")
+                if final_host:
+                    assert_attach_peer_allowed(final_host)
+                if resp.status == 200:
+                    return json.load(resp)
+        except TierError:
+            raise
         except Exception as e:  # noqa: BLE001 — probe loop
             last_err = e
             time.sleep(0.1)

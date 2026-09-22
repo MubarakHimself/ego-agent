@@ -87,6 +87,28 @@ Optional body `keep_alive: true|false` (bool only → else `400 invalid_keep_ali
 
 Reconnect: same `(agent_id, space_id)` while leased returns the same `lease_id` — omit `keep_alive` on reconnect unless flipping the flag (CDP tip still via `SLIPSTREAM_EXPOSE_RAW_CDP=1` when needed).
 
+
+## Space tiers (ui-peers three-tier)
+
+Thin **attach-my-Chrome** Space tiering. Lease create (`POST /v1/leases`) and Space update (`PUT /v1/spaces/{id}`) accept `tier` (or lease `mode: "attach"`).
+
+| Tier | Meaning |
+| --- | --- |
+| `ephemeral` | **Default.** Pool-spawned Chromium; Space dir is a disposable profile label (no attach). |
+| `named` | Durable/named Space profile id (`user-data-dir` under `spaces_root`) — login-once / warm reuse. |
+| `attach` | Attach to **existing** Chrome via user CDP URL/port — **no** pool Chromium spawn. Requires `SLIPSTREAM_ALLOW_ATTACH=1`. |
+
+**Attach requirements:** `cdp_url` (http/https/ws/wss) **or** `cdp_port` (→ `http://127.0.0.1:PORT`). Refuse `file:` / `javascript:` / `data:`. Hosts default to loopback; extend with `SLIPSTREAM_ATTACH_ALLOW_HOSTS`. Gate: **`SLIPSTREAM_ALLOW_ATTACH=1`** (default off → `403 attach_disabled`).
+
+**Attach behavior:** pool leases a slot **without** launching Chromium; health-checks CDP (`/json/version`, skipped under mock). **Release detaches** — does **not** quit the user's Chrome.
+
+**Risk label (attach only, on lease/list/sessions JSON):** `shared-browser; honor-system raw CDP / ladder bypass when driving attached Chrome directly (or with SLIPSTREAM_EXPOSE_RAW_CDP); release detaches — does not quit user Chrome`
+
+Shared cookies/tabs with the human browser; when driving attached Chrome via raw CDP / `SLIPSTREAM_EXPOSE_RAW_CDP`, the permission ladder is **honor-system**. Prefer pool HTTP navigate/act/fill so the ladder stays server-enforced.
+
+Env: `SLIPSTREAM_ALLOW_ATTACH=1`, optional `SLIPSTREAM_ATTACH_ALLOW_HOSTS`.
+
+
 ### `POST /v1/leases/{lease_id}/heartbeat`
 
 Renews soft idle window. Agents should heartbeat every ~15–30s (including during LLM think).
