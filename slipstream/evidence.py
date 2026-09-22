@@ -115,14 +115,20 @@ def _prune_locked(handle: Any, *, keep: int) -> None:
 
 
 def _read_json_sidecar(handle: Any, seq: int) -> dict[str, Any]:
+    """Best-effort scrubbed sidecar. Leaf symlink / open fail → {} (ADV-EV-002)."""
     meta_name = evidence_meta_filename(seq)
     if not handle.name_exists(meta_name):
         return {}
-    fd, st = handle.open_reg(meta_name)
+    try:
+        fd, st = handle.open_reg(meta_name)
+    except (ArtifactNotFoundError, DownloadValidationError, OSError):
+        return {}
     try:
         raw = os.read(  # skylos: ignore[SKY-P401] size-capped sidecar (<=8KiB)
             fd, min(int(st.st_size), 8192)
         )
+    except OSError:
+        return {}
     finally:
         os.close(fd)
     try:
@@ -180,7 +186,12 @@ def list_evidence_markers(
     artifacts_root: Path,
     lease_id: str,
 ) -> dict[str, Any]:
-    """List evidence markers (seq + scrubbed annotation); no absolute paths."""
+    """List evidence markers (seq + scrubbed annotation); no absolute paths.
+
+    ADV-EV-002: bad leaf (sidecar symlink / open fail) is skipped or treated as
+    a marker without annotation — never raises ArtifactNotFoundError for the
+    whole list (API would 404).
+    """
     markers: list[dict[str, Any]] = []
     try:
         with walk_lease_kind_dir(
@@ -191,6 +202,12 @@ def list_evidence_markers(
                 if not m:
                     continue
                 seq_i = int(m.group(1))
+                # Skip non-regular JPEG leaf (symlink / open fail).
+                try:
+                    fd, _st = handle.open_reg(name)
+                    os.close(fd)
+                except (ArtifactNotFoundError, DownloadValidationError, OSError):
+                    continue
                 row: dict[str, Any] = {
                     "seq": seq_i,
                     "id": f"ev_{seq_i:08d}",
@@ -203,7 +220,7 @@ def list_evidence_markers(
                 if ann:
                     row["annotation"] = ann
                 markers.append(row)
-    except DownloadValidationError:
+    except (DownloadValidationError, ArtifactNotFoundError):
         markers = []
     markers.sort(key=lambda r: int(r["seq"]))
     return {"lease_id": lease_id, "markers": markers, "count": len(markers)}

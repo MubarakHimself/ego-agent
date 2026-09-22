@@ -960,6 +960,10 @@ class BrowserPool:
                 detail={"event": EVENT_TASK_DONE},
             )
             stop_handle = self._detach_lease_locked(lease_id, allow_warm=True)
+            # ADV-EV-003: clear evidence on task_done (same as release), not
+            # only on explicit release/shutdown — residual JPEGs after revoke.
+            self._activity_feeds.pop(lease_id, None)
+            clear_lease_evidence(self.config.artifacts_root, lease_id)
 
         if stop_handle is not None:
             self.launcher.stop(stop_handle)
@@ -1643,20 +1647,36 @@ class BrowserPool:
         *,
         seq: int | None = None,
     ):
-        """Token-gated evidence list (dict) or JPEG bytes for seq (same TTL/revoke)."""
+        """Token-gated evidence list (dict) or JPEG bytes for seq (same TTL/revoke).
+
+        ADV-EV-001: auth under lock, FS I/O outside, then revalidate revoked /
+        lease identity under lock before returning (mirror get_watch_frame).
+        """
         with self._lock:
             self._get_watch_session_locked(lease_id, token)
-            if lease_id not in self._leases:
+            lease = self._leases.get(lease_id)
+            if not lease:
                 sess = self._lookup_watch(lease_id)
                 if sess is not None:
                     self._invalidate_pair_browse_locked(sess, revoke=True)
                 raise WatchGoneError(_ERR_LEASE_INACTIVE)
             art_root = self.config.artifacts_root
+            slot_id = lease.slot_id
+            cdp = lease.cdp_http_url or ""
         if seq is None:
             out = list_evidence_markers(art_root, lease_id)
+            with self._lock:
+                self._revalidate_watch_after_capture(
+                    lease_id, slot_id=slot_id, cdp_http_url=cdp
+                )
             out["lease_id"] = lease_id
             return out
-        return read_evidence_jpeg(art_root, lease_id, int(seq))
+        jpeg = read_evidence_jpeg(art_root, lease_id, int(seq))
+        with self._lock:
+            self._revalidate_watch_after_capture(
+                lease_id, slot_id=slot_id, cdp_http_url=cdp
+            )
+        return jpeg
 
     def get_watch_events(
         self,

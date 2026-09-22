@@ -186,3 +186,106 @@ def test_evidence_auto_env_off(monkeypatch):
     assert evidence_auto_kinds() == frozenset()
     monkeypatch.setenv("SLIPSTREAM_EVIDENCE_AUTO", "navigate")
     assert evidence_auto_kinds() == frozenset({"navigate"})
+
+
+def test_list_skips_sidecar_symlink_leaf(tmp_path):
+    """ADV-EV-002: sidecar leaf symlink must not 404 the whole markers list."""
+    root = tmp_path / "art"
+    root.mkdir(parents=True, exist_ok=True)
+    jpeg = bytes((0xFF, 0xD8, 0xFF, 0xD9))
+    store_evidence_jpeg(
+        root,
+        "lease-a",
+        seq=1,
+        jpeg=jpeg,
+        annotation={"kind": "navigate", "summary": "ok"},
+    )
+    store_evidence_jpeg(
+        root,
+        "lease-a",
+        seq=2,
+        jpeg=jpeg,
+        annotation={"kind": "confirm", "summary": "ok2"},
+    )
+    ev_dir = root / "leases" / "lease-a" / "evidence"
+    secret = tmp_path / "vault_secret.bin"
+    secret.write_bytes(b"SECRET")
+    bad = ev_dir / "ev_00000002.json"
+    bad.unlink()
+    bad.symlink_to(secret)
+    listed = list_evidence_markers(root, "lease-a")
+    assert listed["count"] == 2
+    by_seq = {m["seq"]: m for m in listed["markers"]}
+    assert by_seq[1]["kind"] == "navigate"
+    # Bad sidecar → marker kept, annotation empty / no secret leak
+    assert "kind" not in by_seq[2] or by_seq[2].get("kind") is None
+    blob = json.dumps(listed)
+    assert "SECRET" not in blob
+    assert "vault_secret" not in blob
+
+
+def test_list_skips_jpeg_symlink_leaf(tmp_path):
+    """ADV-EV-002: JPEG leaf symlink skipped as missing marker."""
+    root = tmp_path / "art"
+    root.mkdir(parents=True, exist_ok=True)
+    jpeg = bytes((0xFF, 0xD8, 0xFF, 0xD9))
+    store_evidence_jpeg(
+        root,
+        "lease-a",
+        seq=1,
+        jpeg=jpeg,
+        annotation={"kind": "navigate", "summary": "keep"},
+    )
+    store_evidence_jpeg(
+        root,
+        "lease-a",
+        seq=2,
+        jpeg=jpeg,
+        annotation={"kind": "confirm", "summary": "drop"},
+    )
+    ev_dir = root / "leases" / "lease-a" / "evidence"
+    target = tmp_path / "elsewhere.jpg"
+    target.write_bytes(jpeg)
+    bad = ev_dir / "ev_00000002.jpg"
+    bad.unlink()
+    bad.symlink_to(target)
+    listed = list_evidence_markers(root, "lease-a")
+    assert listed["count"] == 1
+    assert listed["markers"][0]["seq"] == 1
+
+
+def test_task_done_clears_evidence_and_inflight_revalidate(api_server: PoolServer):
+    """ADV-EV-001/003: task_done clears files; sticky poll 410 (revalidate path)."""
+    base = api_server.base_url
+    lid = _lease(base, space="ev-clear")
+    token = _watch_token(base, lid)
+    code, nav = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/navigate",
+        {"url": "https://example.com/clear-me"},
+    )
+    assert code == 200, nav
+    code, ev = _req("GET", f"{base}/v1/leases/{lid}/watch/evidence?token={token}")
+    assert code == 200 and ev["count"] >= 1
+    seq = ev["markers"][-1]["seq"]
+    art = Path(api_server.pool.config.artifacts_root)
+    before = list((art / "leases" / lid / "evidence").glob("ev_*"))
+    assert before, "expected evidence files before task_done"
+
+    code, done = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "task_done", "outcome": {"ok": True, "summary": "done"}},
+    )
+    assert code == 200, done
+    after = list((art / "leases" / lid / "evidence").glob("ev_*"))
+    assert after == [], f"ADV-EV-003 expected clear, found {after}"
+
+    code, gone = _req(
+        "GET", f"{base}/v1/leases/{lid}/watch/evidence?token={token}&seq={seq}"
+    )
+    assert code == 410
+    code, gone_list = _req(
+        "GET", f"{base}/v1/leases/{lid}/watch/evidence?token={token}"
+    )
+    assert code == 410
