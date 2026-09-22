@@ -18,7 +18,7 @@ EVENT_NEED_HUMAN = "need_human"
 EVENT_TASK_DONE = "task_done"
 SHIP_EVENTS = frozenset({EVENT_NEED_HUMAN, EVENT_TASK_DONE})
 
-REASONS = frozenset({"captcha", "login", "ambiguous_ui", "stuck", "other"})
+REASONS = frozenset({"captcha", "login", "ambiguous_ui", "stuck", "other", "confirmation_required"})
 
 # Keys that must never appear in alert request/response bodies (case-insensitive).
 # Prefer exact / token-boundary matches over bare substring so benign keys like
@@ -207,6 +207,11 @@ def format_captain_one_liner(
     if event == EVENT_NEED_HUMAN:
         why = reason or "other"
         extra = f" — {detail}" if detail else ""
+        if why == "confirmation_required":
+            return (
+                f"Confirm action required on lease {short}…{extra} — "
+                f"[Watch]({watch_url}) · [Take-over]({takeover_url}) · confirm|deny"
+            )
         return (
             f"Need human ({why}) on lease {short}…{extra} — "
             f"[Watch]({watch_url}) · [Take-over]({takeover_url})"
@@ -315,6 +320,8 @@ def build_alert_payload(
     event_id: str | None = None,
     ts: str | None = None,
     watch_token: str | None = None,
+    kind: str | None = None,
+    confirm_id: str | None = None,
 ) -> dict[str, Any]:
     """Assemble the public alert payload (never includes secrets).
 
@@ -350,6 +357,11 @@ def build_alert_payload(
         "ttl_s": parsed["ttl_s"],
         "outcome": outcome,
     }
+    # Permission-ladder sibling: kind + confirm_id (never secrets).
+    if kind is not None:
+        payload["kind"] = kind
+    if confirm_id is not None:
+        payload["confirm_id"] = confirm_id
     # Drop null task_id for cleaner harness JSON? Spec allows optional — keep key.
     return payload
 

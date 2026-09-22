@@ -8,7 +8,7 @@ description: >
   browser). HTTP + this CLI/skill surface only — there is no MCP server.
   For video watch intents, compose a separate /watch skill (not Slipstream).
 metadata:
-  version: "0.5.0"
+  version: "0.6.0"
   date: "2026-09-22"
 ---
 
@@ -144,6 +144,33 @@ curl -s "$SLIPSTREAM_URL/healthz"
 
 (`SLIPSTREAM_URL` defaults to `http://127.0.0.1:8755` if unset.)
 
+
+## Permission ladder (confirm-actions)
+
+Before irreversible CDP acts, call `slipstream act`. Soft browse (snapshot /
+click / scroll / wait) stays free. Gated categories:
+
+- `eval` — script / `Runtime.evaluate`
+- `download` — file download
+- `upload` — file upload / set file input
+- `nav_irreversible` — destructive navigation / POST forms
+
+```bash
+slipstream act --lease-id "$LEASE_ID" --category eval --summary "probe document.title"
+# → JSON status=confirmation_required + confirm_id; agent pauses
+#   (sibling need_human on alerts bus → Watch / Take-over URL)
+
+slipstream confirm c_…     # allow once; agent resumes
+slipstream deny c_…        # fail closed; agent resumes with error
+```
+
+Pending confirmations **auto-deny after ~60s** (`SLIPSTREAM_CONFIRM_TTL`).
+`--confirm-interactive` prompts on a TTY; **Non-TTY → deny**.
+
+Never put secrets/cookies/passwords in `--summary`. Credential **fill** stays
+vault-gated (not rebuilt here).
+
+Defer: once/always/never policy matrix, domain allowlist, content-boundaries.
 
 ## Compose /watch (video intents — do not reimplement)
 
@@ -326,9 +353,8 @@ Thin in-house helpers (`slipstream.cdp_http`) are for smoke/bench only.
 - On **409** `space_in_use`: wait or pick another Space — never steal.
 - On **503** `pool_full`: backoff or ask the main agent to free a slot.
 - Always **release** on the failure path after you stop retrying.
-- Hermes / Cursor / OpenHands / Claude Code: install this skill + call the
-  `slipstream` CLI via the shell tool. Prefer shell + peer CDP driver over
-  registering a second browser launcher.
+- Install this skill and call the `slipstream` CLI via the shell tool.
+  Prefer shell + peer CDP driver over registering a second browser launcher.
 
 ## Environment
 
@@ -347,6 +373,7 @@ Thin in-house helpers (`slipstream.cdp_http`) are for smoke/bench only.
 | `SLIPSTREAM_K` / `SLIPSTREAM_W` | Override hard cap / warm count |
 | `SLIPSTREAM_PORT` | Server bind port (default 8755) |
 | `SLIPSTREAM_HEADLESS=0` | Headed Chromium |
+| `SLIPSTREAM_CONFIRM_TTL` | Pending confirm-actions TTL seconds (default 60) |
 
 Prefer `SLIPSTREAM_*` names. There is no MCP env or MCP server in this project.
 
@@ -357,6 +384,9 @@ slipstream serve   [--host HOST] [--port PORT] [--mock] [--headed]
 slipstream lease   --agent-id ID --space-id ID [--ttl-seconds N] [--url URL]
 slipstream heartbeat --lease-id ID [--url URL]
 slipstream alert   need-human|done --lease-id ID [options] [--url URL]
+slipstream act     --lease-id ID --category CAT --summary TEXT [--confirm-interactive]
+slipstream confirm CONFIRM_ID [--url URL]
+slipstream deny    CONFIRM_ID [--url URL]
 slipstream release --lease-id ID [--reason REASON] [--url URL]
 slipstream status  [--url URL]
 slipstream doctor  [--url URL] [--json]
@@ -375,7 +405,9 @@ slipstream cred    bind|unbind|list|fill …
 - Simultaneous human+agent drive, pair-browse UI polish, optional stuck/captcha chips
   lock are **later**.
 - Compose `/watch` remains upstream (see **Compose /watch**; doctor WARN if
-  missing). Alerts + credential vault/fill **are** on the CLI/HTTP surface.
+  missing). Alerts, credential vault/fill, and confirm-actions **are** on the
+  CLI/HTTP surface. Domain allowlist / once-always-never / content-boundaries
+  are **later**.
 
 ## Examples
 

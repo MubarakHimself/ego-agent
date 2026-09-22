@@ -47,6 +47,21 @@ from slipstream.vault import (
     parse_fill_body,
 )
 from slipstream.cdp_inject import CdpInjectError, CdpInjector, default_injector
+from slipstream.actions import (
+    KIND_CONFIRMATION_REQUIRED,
+    STATUS_CONFIRMED,
+    STATUS_DENIED,
+    STATUS_EXPIRED,
+    STATUS_PENDING,
+    ConfirmationGoneError,
+    ConfirmationNotFoundError,
+    ConfirmationStore,
+    PendingConfirmation,
+    confirm_ttl_seconds,
+    mint_confirm_id,
+    parse_action_request,
+    parse_confirmation_action,
+)
 
 
 
@@ -100,6 +115,8 @@ class BrowserPool:
         self._cdp_injector: CdpInjector = default_injector(mock=self.config.mock)
         # Pair-browse mock recorder (tests); never returned on the wire.
         self._watch_input_log: list[dict[str, Any]] = []
+        # Permission ladder: pending confirmations (process-lifetime).
+        self._confirmations = ConfirmationStore()
 
     # --- introspection -------------------------------------------------
 
@@ -733,6 +750,189 @@ class BrowserPool:
             self.launcher.stop(stop_handle)
         return envelope
 
+
+    # --- permission ladder (confirm-actions) ---------------------------
+
+    def request_action(self, lease_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Gate a sensitive act: emit confirmation_required + sibling need_human.
+
+        Soft browse is not gated here. Categories: eval|download|upload|nav_irreversible.
+        Lease stays warm on awaiting_human; agent pauses. Auto-deny after TTL (~60s).
+        """
+        parsed = parse_action_request(body)
+        ttl = confirm_ttl_seconds()
+        now = time.time()
+        confirm_id = mint_confirm_id()
+        base = self._api_base_url
+
+        with self._lock:
+            lease = self._leases.get(lease_id)
+            if not lease:
+                raise LeaseNotFoundError(lease_id)
+            slot = self._find_slot_by_lease(lease_id)
+            if not slot or slot.status != SlotStatus.LEASED:
+                raise LeaseNotFoundError(lease_id)
+            if lease_id in self._task_done_envelopes:
+                raise AlertConflictError("lease already completed via task_done")
+
+            # Expire any overdue pending for this lease first.
+            self._expire_confirmations_locked(now)
+
+            pending = PendingConfirmation(
+                confirm_id=confirm_id,
+                lease_id=lease_id,
+                category=parsed["category"],
+                summary=parsed["summary"],
+                created_at=now,
+                expires_at=now + float(ttl),
+                status=STATUS_PENDING,
+            )
+
+            # Sibling need_human on SAME alerts bus (kind + confirm_id).
+            watch_token = mint_watch_token()
+            self._watches[lease_id] = WatchSession(
+                lease_id=lease_id,
+                token=watch_token,
+                expires_at=now + float(ttl),
+                reason="confirmation_required",
+                detail=parsed["summary"],
+                revoked=False,
+                takeover_confirmed=False,
+                input_enabled=False,
+                created_at=now,
+            )
+            alert_parsed = {
+                "event": EVENT_NEED_HUMAN,
+                "reason": "confirmation_required",
+                "detail": parsed["summary"],
+                "task_id": None,
+                "ttl_s": ttl,
+                "outcome": None,
+            }
+            payload = build_alert_payload(
+                lease_id=lease_id,
+                space_id=lease.space_id,
+                parsed=alert_parsed,
+                base_url=base,
+                watch_token=watch_token,
+                kind=KIND_CONFIRMATION_REQUIRED,
+                confirm_id=confirm_id,
+            )
+            pending.alert_event_id = payload["event_id"]
+            takeover = default_takeover_url(
+                lease_id, token=watch_token, base_url=base
+            )
+            lease.status = "awaiting_human"
+            slot.last_heartbeat = now
+            envelope = build_harness_envelope(
+                payload,
+                lease_kept=True,
+                lease_released=False,
+                agent_paused=True,
+                action="pause",
+                takeover_url=takeover,
+                idempotent=False,
+            )
+            self._alert_log.setdefault(lease_id, []).append(payload)
+            self._confirmations.add(pending)
+
+        out = pending.to_public()
+        out["alert"] = envelope["alert"]
+        out["harness"] = envelope["harness"]
+        return out
+
+    def resolve_confirmation(
+        self, lease_id: str, confirm_id: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Confirm (allow once) or deny a pending confirmation.
+
+        Confirm resumes the agent (lease → leased) and grants this confirm_id
+        once. Deny fails closed and resumes with denied status. Expired → gone.
+        """
+        action = parse_confirmation_action(body)
+        now = time.time()
+        with self._lock:
+            self._expire_confirmations_locked(now)
+            pending = self._confirmations.get(confirm_id)
+            if pending is None:
+                raise ConfirmationNotFoundError(confirm_id)
+            if pending.lease_id != lease_id:
+                raise ConfirmationNotFoundError(confirm_id)
+            if pending.status != STATUS_PENDING:
+                raise ConfirmationGoneError(
+                    f"confirmation {confirm_id} already {pending.status}"
+                )
+            if now >= pending.expires_at:
+                pending.status = STATUS_EXPIRED
+                self._clear_confirmation_pause_locked(lease_id)
+                raise ConfirmationGoneError(
+                    f"confirmation {confirm_id} expired"
+                )
+
+            lease = self._leases.get(lease_id)
+            if not lease:
+                raise LeaseNotFoundError(lease_id)
+
+            if action == "confirm":
+                pending.status = STATUS_CONFIRMED
+                decision = "allow"
+            else:
+                pending.status = STATUS_DENIED
+                decision = "deny"
+
+            # Resume agent unless another pending confirmation remains.
+            self._clear_confirmation_pause_locked(lease_id)
+
+            return {
+                "status": pending.status,
+                "confirm_id": confirm_id,
+                "category": pending.category,
+                "summary": pending.summary,
+                "lease_id": lease_id,
+                "decision": decision,
+                "expires_at": pending.to_public()["expires_at"],
+            }
+
+    def resolve_confirmation_by_id(
+        self, confirm_id: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        """CLI helper: resolve by confirm_id alone (looks up lease)."""
+        with self._lock:
+            pending = self._confirmations.get(confirm_id)
+            if pending is None:
+                raise ConfirmationNotFoundError(confirm_id)
+            lease_id = pending.lease_id
+        return self.resolve_confirmation(lease_id, confirm_id, body)
+
+    def _expire_confirmations_locked(self, now: float) -> list[PendingConfirmation]:
+        """Expire overdue confirmations; clear pause when lease has none left."""
+        newly = self._confirmations.expire_due(now)
+        touched: set[str] = set()
+        for p in newly:
+            touched.add(p.lease_id)
+        for lid in touched:
+            self._clear_confirmation_pause_locked(lid)
+        return newly
+
+    def _clear_confirmation_pause_locked(self, lease_id: str) -> None:
+        """If no pending confirmations remain, return lease to leased.
+
+        Leaves Watch session intact for observe until TTL/revoke (pair-browse
+        confirm is separate). Does not enable input.
+        """
+        if self._confirmations.lease_pending(lease_id):
+            return
+        lease = self._leases.get(lease_id)
+        if lease is not None and lease.status == "awaiting_human":
+            # Only clear if the pause was confirmation-driven (watch reason),
+            # or no other need_human reasons — for thin MVP: always clear when
+            # no pending confirmations remain AND watch reason is confirmation.
+            sess = self._lookup_watch(lease_id)
+            if sess is not None and sess.reason == "confirmation_required":
+                lease.status = "leased"
+                # Do not revoke watch here — TTL sweep / task_done handles it.
+                # Pair-browse input stays disabled (never was enabled).
+
     def evict_idle(self, now: float | None = None) -> list[str]:
         """Soft-evict idle leases and hard-TTL-expired leases.
 
@@ -747,6 +947,8 @@ class BrowserPool:
         evicted: list[str] = []
         pending_stops: list[LaunchHandle] = []
         with self._lock:
+            # Permission ladder: auto-deny expired confirmations (~60s).
+            self._expire_confirmations_locked(now)
             # ADV-PAIR-001: Watch TTL sweep returns drive even before next watch hit.
             for sess in list(self._watches.values()):
                 if (not sess.revoked) and now >= sess.expires_at:
