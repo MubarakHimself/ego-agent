@@ -1,4 +1,4 @@
-"""Downloads as session artifacts — ADV-DL-001..005 + baseline path safety."""
+"""Downloads as session artifacts — ADV-DL-001..005 + ADV-DL-010/011 ancestor symlink + baseline path safety."""
 
 from __future__ import annotations
 
@@ -373,3 +373,118 @@ def test_unit_read_path_containment(tmp_path):
     assert data == b"abc"
     with pytest.raises(ArtifactNotFoundError):
         read_artifact(root, "dl_0000000000000000", kind="downloads")
+
+
+def test_adv_dl_010_lease_id_symlink_refused(api_server, tmp_path):
+    """ADV-DL-010: leases/{id} symlink → vault / other lease refused on list/get/put."""
+    server, pool = api_server
+    base = server.base_url
+    lid_a = _lease(base, space="dl-sym-a", agent="agent-a")
+    lid_b = _lease(base, space="dl-sym-b", agent="agent-b")
+    pool.record_mock_download(lid_b, "peer-b.pdf", b"from-b")
+
+    art = pool.config.artifacts_root
+    vault = pool.config.vault_root
+    vault.mkdir(parents=True, exist_ok=True)
+    (vault / "creds.db").write_bytes(b"vault-secret")
+
+    lease_a = art / "leases" / lid_a
+    lease_b = art / "leases" / lid_b
+
+    def _replace_dir_with_symlink(path: Path, target: Path) -> None:
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            for child in list(path.iterdir()):
+                if child.is_symlink() or child.is_file():
+                    child.unlink()
+                elif child.is_dir():
+                    for gc in list(child.iterdir()):
+                        if gc.is_file() or gc.is_symlink():
+                            gc.unlink()
+                        elif gc.is_dir():
+                            os.rmdir(gc)
+                    os.rmdir(child)
+            path.rmdir()
+        path.symlink_to(target)
+
+    # Cross-lease: leases/{a} → leases/{b}
+    _replace_dir_with_symlink(lease_a, lease_b)
+    code, err, _ = _req(
+        "GET", f"{base}/v1/leases/{lid_a}/downloads?agent_id=agent-a"
+    )
+    assert code in (400, 403), err
+
+    # Re-create real lease_a then point at vault
+    if lease_a.is_symlink():
+        lease_a.unlink()
+    # ensure recreates real dirs
+    from slipstream.downloads import ensure_lease_artifact_dirs
+
+    # vault symlink case: plant after ensure
+    ensure_lease_artifact_dirs(art, lid_a)
+    _replace_dir_with_symlink(lease_a, vault)
+    code, err, _ = _req(
+        "GET", f"{base}/v1/leases/{lid_a}/downloads?agent_id=agent-a"
+    )
+    assert code in (400, 403), err
+
+    # get should also refuse
+    code, err, _ = _req(
+        "GET",
+        f"{base}/v1/leases/{lid_a}/downloads/dl_deadbeefdeadbeef?agent_id=agent-a",
+    )
+    assert code in (400, 403, 404), err
+    assert code != 200
+
+    # put must not write into vault via lease_id symlink
+    code, err, _ = _req(
+        "POST",
+        f"{base}/v1/leases/{lid_a}/uploads",
+        {
+            "filename": "pwn.bin",
+            "content_b64": base64.b64encode(b"pwn").decode("ascii"),
+            "agent_id": "agent-a",
+        },
+    )
+    assert code in (400, 403), err
+    assert not (vault / "pwn.bin").exists()
+    assert not (vault / "uploads" / "pwn.bin").exists()
+
+
+def test_adv_dl_011_leases_dir_symlink_refused(api_server, tmp_path):
+    """ADV-DL-011: artifacts/leases → /tmp symlink refused on list/get/put."""
+    server, pool = api_server
+    base = server.base_url
+    lid = _lease(base, space="dl-leases-sym", agent="agent-dl")
+
+    art = pool.config.artifacts_root
+    leases = art / "leases"
+    escape = tmp_path / "outside-leases"
+    escape.mkdir()
+
+    # Move real leases aside and plant symlink to /tmp-ish outside tree
+    real = art / "leases.real"
+    if leases.exists() and not leases.is_symlink():
+        leases.rename(real)
+    elif leases.is_symlink():
+        leases.unlink()
+    leases.symlink_to(escape)
+
+    code, err, _ = _req(
+        "GET", f"{base}/v1/leases/{lid}/downloads?{_aq()}"
+    )
+    assert code in (400, 403), err
+
+    code, err, _ = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/uploads",
+        {
+            "filename": "escape.bin",
+            "content_b64": base64.b64encode(b"nope").decode("ascii"),
+            "agent_id": "agent-dl",
+        },
+    )
+    assert code in (400, 403), err
+    assert not (escape / lid / "uploads" / "escape.bin").exists()
+    assert not list(escape.rglob("escape.bin"))

@@ -11,6 +11,8 @@ when not mock. Mock mode records the call for tests.
 
 from __future__ import annotations
 
+from slipstream.artifact_walk import walk_lease_kind_dir, _dir_flags_nofollow
+
 import hashlib
 import os
 import re
@@ -77,6 +79,7 @@ _DENIED_FILENAME_SUBSTR = (
 DEFAULT_MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB thin drop
 _BEHAVIOR_ALLOW = "allow"
 _ERR_PATH_ESCAPE = "path escape refused"
+_ERR_ARTIFACT_DIR_REQUIRED = "artifact dir required"
 _ERR_SYMLINK = "symlink escape refused"
 _LABEL_ARTIFACT_DIR = "artifact dir"
 _FLAG_O_NOFOLLOW = "O_NOFOLLOW"  # used in messages / feature probes
@@ -85,6 +88,7 @@ KIND_DOWNLOADS = "downloads"
 _HAS_O_NOFOLLOW = hasattr(os, "O_NOFOLLOW")
 _HAS_O_DIRECTORY = hasattr(os, "O_DIRECTORY")
 KIND_UPLOADS = "uploads"
+_LEASES_DIRNAME = "leases"
 _ARTIFACT_KINDS = frozenset({KIND_DOWNLOADS, KIND_UPLOADS})
 
 
@@ -157,21 +161,23 @@ def artifact_id_for_filename(filename: str, *, kind: str = KIND_DOWNLOADS) -> st
     return f"{prefix}_{digest}"
 
 
+
 def lease_artifacts_dir(artifacts_root: Path, lease_id: str, kind: str) -> Path:
     """Return ``{artifacts_root}/leases/{lease_id}/{downloads|uploads}/``.
 
-    ADV-DL-002: resolve *only* ``artifacts_root``; join lease/kind without
-    resolving so a directory symlink at ``kind`` cannot redirect before checks.
+    Resolve *only* ``artifacts_root``; join ``leases`` / lease / kind without
+    ``Path.resolve()`` so intermediate or kind symlinks cannot redirect the
+    joined path before openat validation (ADV-DL-002/010/011).
     """
     safe = validate_id_component("lease_id", lease_id, pattern=_SAFE_LEASE_RE)
     if kind not in _ARTIFACT_KINDS:
         raise DownloadValidationError("invalid artifact kind")
     root = _resolve_policy_path(artifacts_root)
-    return root / "leases" / safe / kind
+    return root / _LEASES_DIRNAME / safe / kind
 
 
 def _refuse_symlink_path(path: Path, *, label: str = "path") -> None:
-    """lstat and refuse S_ISLNK (ADV-DL-002)."""
+    """lstat and refuse S_ISLNK (ADV-DL-002 leaf / final component)."""
     try:
         st = os.lstat(path)
     except FileNotFoundError:
@@ -185,41 +191,22 @@ def _refuse_symlink_path(path: Path, *, label: str = "path") -> None:
 def _open_dir_nofollow(path: Path) -> int:
     """Open directory nofollow; refuse symlink (ADV-DL-002)."""
     _refuse_symlink_path(path, label=_LABEL_ARTIFACT_DIR)
-    flags = os.O_RDONLY
-    if _HAS_O_DIRECTORY:
-        flags |= os.O_DIRECTORY
-    if _HAS_O_NOFOLLOW:
-        flags |= os.O_NOFOLLOW
     try:
-        return os.open(  # skylos: ignore[SKY-D215] O_DIRECTORY|O_NOFOLLOW kind dir
-            os.fspath(path), flags
+        return os.open(  # skylos: ignore[SKY-D215,SKY-D325] O_DIRECTORY|O_NOFOLLOW kind dir
+            os.fspath(path), _dir_flags_nofollow()
         )
     except OSError as e:
         raise DownloadValidationError(f"{_LABEL_ARTIFACT_DIR} open failed") from e
 
 
 def ensure_lease_artifact_dirs(artifacts_root: Path, lease_id: str) -> dict[str, Path]:
-    """Create lease downloads + uploads dirs (mode 0o700); refuse kind symlinks."""
+    """Create lease downloads + uploads dirs via nofollow walk (ADV-DL-010/011)."""
     out: dict[str, Path] = {}
     for kind in (KIND_DOWNLOADS, KIND_UPLOADS):
-        path = lease_artifacts_dir(artifacts_root, lease_id, kind)
-        _refuse_symlink_path(path, label=kind)
-        # Create parents without following a kind symlink (checked above).
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        _refuse_symlink_path(path, label=kind)
-        if not path.exists():
-            path.mkdir(mode=0o700)
-        _refuse_symlink_path(path, label=kind)
-        # Confirm it opens as a real directory (not a raced symlink).
-        fd = _open_dir_nofollow(path)
-        os.close(fd)
-        try:
-            os.chmod(path, 0o700)
-        except OSError:
-            pass
-        out[kind] = path
+        out[kind] = walk_lease_kind_dir(
+            artifacts_root, lease_id, kind, create=True
+        )
     return out
-
 
 def ensure_artifacts_outside(
     artifacts_root: Path,
@@ -282,7 +269,7 @@ def _open_reg_nofollow(path: Path, *, root: Path) -> tuple[int, os.stat_result]:
     if _HAS_O_NOFOLLOW:
         flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(  # skylos: ignore[SKY-D215] O_NOFOLLOW leaf; fstat REG + containment
+        fd = os.open(  # skylos: ignore[SKY-D215,SKY-D325] O_NOFOLLOW leaf; fstat REG + containment
             os.fspath(path), flags
         )
     except OSError as e:
@@ -407,19 +394,57 @@ def _list_one_artifact(
     )
 
 
+
+def _resolve_kind_root(
+    *,
+    kind: str,
+    dir_path: Path | None,
+    artifacts_root: Path | None,
+    lease_id: str | None,
+    create: bool,
+) -> Path:
+    """ADV-DL-010/011 openat walk when root+lease given; else kind-dir prepare."""
+    if artifacts_root is not None and lease_id is not None:
+        return walk_lease_kind_dir(
+            artifacts_root, lease_id, kind, create=create
+        )
+    if dir_path is None:
+        raise DownloadValidationError(_ERR_ARTIFACT_DIR_REQUIRED)
+    if create:
+        _refuse_symlink_path(dir_path, label=_LABEL_ARTIFACT_DIR)
+        if not dir_path.exists():
+            dir_path.mkdir(mode=0o700)
+    return _prepare_kind_dir(dir_path)
+
+
+def _is_symlink_path(path: Path) -> bool:
+    try:
+        return path.is_symlink() or (
+            path.exists() and stat.S_ISLNK(os.lstat(path).st_mode)
+        )
+    except OSError:
+        return False
+
 def list_artifacts(
-    dir_path: Path,
+    dir_path: Path | None = None,
     *,
     kind: str,
     include_rel_path: bool = False,
+    artifacts_root: Path | None = None,
+    lease_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """List regular files under a lease artifact dir (no absolute paths)."""
     try:
-        root = _prepare_kind_dir(dir_path)
+        root = _resolve_kind_root(
+            kind=kind,
+            dir_path=dir_path,
+            artifacts_root=artifacts_root,
+            lease_id=lease_id,
+            create=False,
+        )
     except DownloadValidationError:
-        if dir_path.is_symlink() or (
-            dir_path.exists() and stat.S_ISLNK(os.lstat(dir_path).st_mode)
-        ):
+        walked = artifacts_root is not None and lease_id is not None
+        if walked or (dir_path is not None and _is_symlink_path(dir_path)):
             raise
         return []
     try:
@@ -436,16 +461,32 @@ def list_artifacts(
     return items
 
 
+
+
+
+
+
+
 def read_artifact(
-    dir_path: Path,
-    artifact_id: str,
+    dir_path: Path | None = None,
+    artifact_id: str = "",
     *,
     kind: str,
     include_rel_path: bool = False,
+    artifacts_root: Path | None = None,
+    lease_id: str | None = None,
 ) -> tuple[dict[str, Any], bytes]:
     """Return (public meta, file bytes) for artifact_id under dir."""
-    aid = validate_id_component("artifact_id", artifact_id, pattern=_SAFE_ARTIFACT_RE)
-    root = _prepare_kind_dir(dir_path)
+    aid = validate_id_component(
+        "artifact_id", artifact_id, pattern=_SAFE_ARTIFACT_RE
+    )
+    root = _resolve_kind_root(
+        kind=kind,
+        dir_path=dir_path,
+        artifacts_root=artifacts_root,
+        lease_id=lease_id,
+        create=False,
+    )
     for name in os.listdir(root):
         if is_denied_filename(name) or name.startswith("."):
             continue
@@ -477,6 +518,10 @@ def read_artifact(
     raise ArtifactNotFoundError(aid)
 
 
+
+
+
+
 def _unique_upload_name(root: Path, name: str) -> str:
     """If ``name`` exists, return stem-xxxxxxxx.suffix (ADV-DL-004)."""
     candidate = root / name
@@ -499,7 +544,7 @@ def _excl_create_write(dest: Path, payload: bytes) -> None:
     if _HAS_O_NOFOLLOW:
         flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(  # skylos: ignore[SKY-D215] O_EXCL|O_NOFOLLOW under kind dir
+        fd = os.open(  # skylos: ignore[SKY-D215,SKY-D325] O_EXCL|O_NOFOLLOW under kind dir
             os.fspath(dest), flags, 0o600
         )
     except FileExistsError as e:
@@ -517,17 +562,15 @@ def _excl_create_write(dest: Path, payload: bytes) -> None:
 
 
 def write_upload(
-    dir_path: Path,
+    dir_path: Path | None = None,
     *,
     filename: str,
     data: bytes,
     kind: str = KIND_UPLOADS,
+    artifacts_root: Path | None = None,
+    lease_id: str | None = None,
 ) -> dict[str, Any]:
-    """Write bytes into a lease artifact dir (nofollow|excl create).
-
-    ADV-DL-002: refuse kind-dir symlink; do not resolve kind dir.
-    ADV-DL-004: O_EXCL create; on collision use unique id filename.
-    """
+    """Write bytes into lease artifact dir (nofollow|excl; ADV-DL-002/004/010/011)."""
     if kind not in _ARTIFACT_KINDS:
         raise DownloadValidationError("invalid artifact kind")
     name = sanitize_upload_filename(filename)
@@ -536,15 +579,16 @@ def write_upload(
     payload = bytes(data)
     if len(payload) > max_upload_bytes():
         raise DownloadValidationError("upload too large")
-    _refuse_symlink_path(dir_path, label=_LABEL_ARTIFACT_DIR)
-    dir_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if not dir_path.exists():
-        dir_path.mkdir(mode=0o700)
-    root = _prepare_kind_dir(dir_path)
+    root = _resolve_kind_root(
+        kind=kind,
+        dir_path=dir_path,
+        artifacts_root=artifacts_root,
+        lease_id=lease_id,
+        create=True,
+    )
     name = _unique_upload_name(root, name)
     dest = root / name
     _refuse_symlink_path(dest, label="upload target")
-    # Containment: dest must be direct child of unreolved kind dir.
     if dest.parent != root or dest.name != name:
         raise DownloadValidationError(_ERR_PATH_ESCAPE)
     _excl_create_write(dest, payload)
@@ -557,3 +601,7 @@ def write_upload(
         kind=kind,
         include_rel_path=False,
     )
+
+
+
+

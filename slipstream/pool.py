@@ -1015,8 +1015,13 @@ class BrowserPool:
         self._require_lease_agent(lease_id, agent_id)
         if kind not in (KIND_DOWNLOADS, KIND_UPLOADS):
             raise DownloadValidationError("invalid artifact kind")
-        d = ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)[kind]
-        items = list_artifacts(d, kind=kind, include_rel_path=include_rel_path)
+        d = ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)
+        items = list_artifacts(
+            kind=kind,
+            include_rel_path=include_rel_path,
+            artifacts_root=self.config.artifacts_root,
+            lease_id=lease_id,
+        )
         key = KIND_DOWNLOADS if kind == KIND_DOWNLOADS else KIND_UPLOADS
         return {"lease_id": lease_id, key: items, "total": len(items)}
 
@@ -1032,9 +1037,13 @@ class BrowserPool:
         self._require_lease_agent(lease_id, agent_id)
         if kind not in (KIND_DOWNLOADS, KIND_UPLOADS):
             raise DownloadValidationError("invalid artifact kind")
-        d = ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)[kind]
+        d = ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)
         return read_artifact(
-            d, artifact_id, kind=kind, include_rel_path=include_rel_path
+            artifact_id=artifact_id,
+            kind=kind,
+            include_rel_path=include_rel_path,
+            artifacts_root=self.config.artifacts_root,
+            lease_id=lease_id,
         )
 
     def put_upload(
@@ -1057,8 +1066,13 @@ class BrowserPool:
             data = base64.b64decode(b64, validate=True)
         except Exception as e:
             raise DownloadValidationError("content_b64 invalid") from e
-        d = ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)[KIND_UPLOADS]
-        meta = write_upload(d, filename=body.get("filename"), data=data)
+        d = ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)
+        meta = write_upload(
+            filename=body.get("filename"),
+            data=data,
+            artifacts_root=self.config.artifacts_root,
+            lease_id=lease_id,
+        )
         return {"lease_id": lease_id, "upload": meta}
 
     def record_mock_download(
@@ -1068,8 +1082,14 @@ class BrowserPool:
         if not self.config.mock:
             raise DownloadValidationError("record_mock_download requires mock")
         self._require_leased(lease_id)
-        d = ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)[KIND_DOWNLOADS]
-        return write_upload(d, filename=filename, data=content, kind=KIND_DOWNLOADS)
+        d = ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)
+        return write_upload(
+            filename=filename,
+            data=content,
+            kind=KIND_DOWNLOADS,
+            artifacts_root=self.config.artifacts_root,
+            lease_id=lease_id,
+        )
 
     def report_captcha(self, lease_id: str, body: dict[str, Any]) -> dict[str, Any]:
         """Client/stub CAPTCHA lifecycle → activity feed + optional need_human.
