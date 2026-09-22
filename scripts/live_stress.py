@@ -3,6 +3,8 @@
 
 Requires google-chrome / chromium (or SLIPSTREAM_CHROME).
 Refuses SLIPSTREAM_MOCK=1. Skip only when Chrome binary is missing.
+Sets SLIPSTREAM_EXPOSE_RAW_CDP=1 for the run (operator harness; production
+lease JSON omits cdp_* by default).
 
 Usage:
   python scripts/live_stress.py
@@ -592,6 +594,10 @@ def run_all(*, base_port: int = 19522) -> StressReport:
         )
         return report
 
+    # Operator harness needs raw CDP URLs (same escape hatch as test_live_smoke).
+    # Production lease/status JSON omits cdp_* unless SLIPSTREAM_EXPOSE_RAW_CDP=1.
+    os.environ["SLIPSTREAM_EXPOSE_RAW_CDP"] = "1"
+
     report.environment = {
         "chrome_binary": binary,
         "chrome_version": _chrome_version(binary),
@@ -599,6 +605,7 @@ def run_all(*, base_port: int = 19522) -> StressReport:
         "python": sys.version.split()[0],
         "cdp_base_port": base_port,
         "mock": False,
+        "expose_raw_cdp": True,
         "cwd": str(_ROOT),
     }
 
