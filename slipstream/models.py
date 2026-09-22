@@ -39,7 +39,6 @@ class SlotState:
         out: dict[str, Any] = {
             "slot_id": self.slot_id,
             "status": self.status.value,
-            "chromium_pid": self.chromium_pid,
             "space_id": self.space_id,
             "lease_id": self.lease_id,
             "agent_id": self.agent_id,
@@ -47,9 +46,10 @@ class SlotState:
             "leased_at": self.leased_at,
             "rss_bytes": self.rss_bytes,
         }
-        # ADV-PL-001-BYPASS-RAW-CDP-PORT: cdp_port reconstructs http://127.0.0.1:{port}
-        # the same as cdp_http_url — gate behind the same escape hatch.
+        # ADV-PL-001-BYPASS-RAW-CDP-PORT: cdp_port / chromium_pid are operator tip —
+        # same escape hatch as cdp_* urls (do not leak reconstruct path on public JSON).
         if expose_raw_cdp():
+            out["chromium_pid"] = self.chromium_pid
             out["cdp_port"] = self.cdp_port
             out["cdp_http_url"] = self.cdp_http_url
             out["cdp_ws_url"] = self.cdp_ws_url

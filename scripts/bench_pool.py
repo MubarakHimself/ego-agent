@@ -76,10 +76,9 @@ def _ms(t0: float, t1: float | None = None) -> float:
 
 
 def _slot_pid(pool: BrowserPool, lease_id: str) -> int | None:
-    for s in pool.status().get("slots") or []:
-        if s.get("lease_id") == lease_id:
-            return s.get("chromium_pid")
-    return None
+    # Internal slot handle — public status omits chromium_pid unless EXPOSE_RAW_CDP.
+    slot = pool._find_slot_by_lease(lease_id)
+    return None if slot is None else slot.chromium_pid
 
 
 def _default_example_title(navigate_url: str) -> str | None:

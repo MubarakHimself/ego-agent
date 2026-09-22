@@ -21,10 +21,10 @@ MVP is always **isolated** mode (one process tree per Space). There is no `mode`
 | `spaces_root` | `./data/spaces` | Space = `{spaces_root}/{space_id}/` = Chromium `--user-data-dir` |
 | `vault_root` | `./data/vault` | Credential vault (**must** be outside `spaces_root`; fail-closed at config/pool init) |
 | `artifacts_root` | `./data/artifacts` | Lease downloads/uploads (**must** be outside `spaces_root` + `vault_root`) |
-| `cdp_base_port` | 9222 | Operator-internal Chromium bind; **not** on public status/lease unless `SLIPSTREAM_EXPOSE_RAW_CDP=1` (do not derive ports from `slot_id`) |
+| `cdp_base_port` | 9222 | Operator-internal Chromium bind; **not** on public status/lease unless `SLIPSTREAM_EXPOSE_RAW_CDP=1`. Do **not** derive CDP from public JSON or `slot_id` (no `9222+slot_id` recipe) |
 | `host` / `port` | `127.0.0.1` / `8755` | API bind |
 
-Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_ARTIFACTS_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm + unused grant seconds, default 60), `SLIPSTREAM_EXPOSE_RAW_CDP=1` (include cdp_* URLs **and** `cdp_port`/`cdp_base_port` on lease/status JSON; raw CDP nav/eval honor-system), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted unless Space/lease lockdown applies), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers).
+Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_ARTIFACTS_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm + unused grant seconds, default 60), `SLIPSTREAM_EXPOSE_RAW_CDP=1` (include cdp_* URLs **and** `cdp_port`/`cdp_base_port`/`chromium_pid` on lease/status JSON; raw CDP nav/eval honor-system — do not derive CDP from default public JSON), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted unless Space/lease lockdown applies), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers).
 
 ## Endpoints
 
@@ -52,7 +52,7 @@ Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT
 }
 ```
 
-**Raw CDP tip:** omitted by default (Firstmate B / ADV-PL-001-BYPASS-RAW-CDP-PORT). Set `SLIPSTREAM_EXPOSE_RAW_CDP=1` to include `cdp_http_url` / `cdp_ws_url` / `cdp_port` on lease and status slot JSON, and `cdp_base_port` on pool status. Without the escape hatch, status/lease must not let agents reconstruct `http://127.0.0.1:{port}` (ports gated; do not treat `slot_id` as a CDP address). Prefer pool HTTP `navigate` / `eval` / `credentials/fill` + act/confirm so the ladder is server-enforced. With the escape hatch, raw CDP nav/eval is **honor-system** (vault fill stays pool-only).
+**Raw CDP tip:** omitted by default (Firstmate B / ADV-PL-001-BYPASS-RAW-CDP-PORT). Set `SLIPSTREAM_EXPOSE_RAW_CDP=1` to include `cdp_http_url` / `cdp_ws_url` / `cdp_port` / `chromium_pid` on lease and status slot JSON, and `cdp_base_port` on pool status. Without the escape hatch, **do not derive CDP from public JSON** — status/lease omit ports and pid (no `9222+slot_id` reconstruct path; do not treat `slot_id` as a CDP address). Prefer pool HTTP `navigate` / `eval` / `credentials/fill` + act/confirm so the ladder is server-enforced. With the escape hatch, raw CDP nav/eval is **honor-system** (vault fill stays pool-only).
 
 → `400` for invalid `space_id` (empty / `.` / `..` / path separators `/` `\` / NULs / unsafe) or non-integer `ttl_seconds`. Distinct ids are never rewritten — bad ids are rejected.
 
@@ -255,7 +255,7 @@ CLI convenience (same resolve): `POST /v1/confirmations/{confirm_id}` with `{act
 
 **Server-enforced (ADV-PL-001) on pool HTTP:** `POST /actions` → captain `confirm` grants a **one-shot** allowance for that category on the lease. Pool helpers for **fill / eval / navigate** check preconditions (cdp present, origin for fill, domain allowlist for nav) **before** consuming; they consume that allowance or return **403** `confirmation_required` with **no CDP side-effect**. Post-consume CDP failure **refunds** the grant. A second gated act without a fresh confirm is refused (re-gate). Deny / pending TTL / unused-grant TTL stay fail-closed. Soft browse remains free. Domain allowlist on navigate still applies when set.
 
-**Raw CDP escape hatch:** `SLIPSTREAM_EXPOSE_RAW_CDP=1` puts `cdp_http_url` / `cdp_ws_url` / `cdp_port` (and status `cdp_base_port`) back on wire JSON. On that path, Playwright/`connect_over_cdp` nav/eval are **honor-system** (not consume_once). Vault credential materialization remains pool `credentials/fill` only.
+**Raw CDP escape hatch:** `SLIPSTREAM_EXPOSE_RAW_CDP=1` puts `cdp_http_url` / `cdp_ws_url` / `cdp_port` / `chromium_pid` (and status `cdp_base_port`) back on wire JSON. On that path, Playwright/`connect_over_cdp` nav/eval are **honor-system** (not consume_once). Vault credential materialization remains pool `credentials/fill` only. Default public JSON is not a CDP map — do not reconstruct endpoints from it.
 
 ```http
 POST /v1/leases/{id}/credentials/fill   # needs fill confirm
@@ -554,7 +554,7 @@ Uses stdlib `urllib`. Env: `SLIPSTREAM_URL` for base URL. Non-zero exit + stderr
 ## Driver notes
 
 - **Default:** drive via pool HTTP — `POST …/navigate`, `POST …/eval`, `POST …/credentials/fill`, plus `act` / `confirm` (ladder server-enforced).
-- **Escape hatch:** `SLIPSTREAM_EXPOSE_RAW_CDP=1` restores lease `cdp_http_url` / `cdp_ws_url` / `cdp_port` (and status `cdp_base_port`) for Playwright `connectOverCDP` / agent-browser. Ladder is honor-system for raw CDP nav/eval; vault fill stays pool-only. Default status/lease omit ports so agents cannot reconstruct CDP endpoints.
+- **Escape hatch:** `SLIPSTREAM_EXPOSE_RAW_CDP=1` restores lease `cdp_http_url` / `cdp_ws_url` / `cdp_port` / status `chromium_pid` (and status `cdp_base_port`) for Playwright `connectOverCDP` / agent-browser. Ladder is honor-system for raw CDP nav/eval; vault fill stays pool-only. Default status/lease omit ports and pid — **do not derive CDP from public JSON** (no `9222+slot_id` recipe).
 - Thin in-house `slipstream.cdp_http` helpers remain for smoke/bench when raw CDP is exposed.
 
 ## RSS sampling hook

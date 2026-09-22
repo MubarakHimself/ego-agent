@@ -96,7 +96,8 @@ Heartbeat every ~15–30s (including during LLM think). Always release when done
 ```bash
 # 1) Lease
 slipstream lease --agent-id "$AGENT_ID" --space-id "task-42"
-# → JSON: lease_id, slot_id, expires_at, … (no cdp_* URLs by default)
+# → JSON: lease_id, slot_id, expires_at, … (no cdp_* / chromium_pid by default;
+#    do not derive CDP from public JSON or slot_id)
 
 # 2) Drive via pool HTTP (ladder-enforced) — do NOT spawn Chrome
 #    slipstream act … && slipstream confirm c_…
@@ -182,7 +183,8 @@ navigate without a prior confirm for that category (403
 `confirmation_required`, no CDP side-effect). Confirm is one-shot then re-gate.
 Domain allowlist on navigate still applies when set. Raw CDP
 (`SLIPSTREAM_EXPOSE_RAW_CDP=1`) is honor-system for nav/eval; vault fill stays
-pool-only.
+pool-only. Do not derive CDP endpoints from default public status/lease JSON
+(ports and `chromium_pid` are omitted; no `9222+slot_id` recipe).
 
 Defer: once/always/never policy matrix, Comet UI.
 
@@ -469,7 +471,7 @@ cred fill + act/confirm) so the permission ladder is server-enforced.
 | Path | When |
 |------|------|
 | Pool HTTP | Default — ladder consume_once is real |
-| Raw CDP peers | Only with `SLIPSTREAM_EXPOSE_RAW_CDP=1` (lease/status return cdp_* urls + ports); nav/eval honor-system; vault fill still pool-only |
+| Raw CDP peers | Only with `SLIPSTREAM_EXPOSE_RAW_CDP=1` (lease/status return cdp_* urls + ports + `chromium_pid`); nav/eval honor-system; vault fill still pool-only. Default public JSON is not a CDP map — do not reconstruct from `slot_id` |
 
 Raw CDP peers (escape hatch): Playwright `connect_over_cdp`, Vercel
 `agent-browser --cdp`, Browser Use `BU_CDP_URL`. Thin `slipstream.cdp_http`
