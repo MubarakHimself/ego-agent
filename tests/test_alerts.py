@@ -13,7 +13,9 @@ import pytest
 from slipstream import __main__ as mainmod
 from slipstream.alerts import (
     format_captain_one_liner,
+    parse_alert_request,
     reject_secret_fields,
+    scrub_text,
     AlertValidationError,
 )
 from slipstream.api import PoolServer
@@ -160,6 +162,10 @@ def test_reject_secret_like_fields(api_server: PoolServer):
         {"event": "need_human", "reason": "other", "token": "x"},
         {"event": "need_human", "reason": "other", "authorization": "Bearer x"},
         {"event": "need_human", "reason": "other", "credentials": {}},
+        {"event": "need_human", "reason": "other", "private_key": "x"},
+        {"event": "need_human", "reason": "other", "jwt": "x"},
+        {"event": "need_human", "reason": "other", "bearer": "x"},
+        {"event": "need_human", "reason": "other", "access_key": "x"},
         {
             "event": "task_done",
             "outcome": {"ok": True, "summary": "x", "api_key": "leak"},
@@ -186,7 +192,99 @@ def test_reject_secret_fields_helper():
         reject_secret_fields({"cookie": "x"})
     with pytest.raises(AlertValidationError):
         reject_secret_fields({"meta": {"auth_token": "x"}})
+    with pytest.raises(AlertValidationError):
+        reject_secret_fields({"private_key": "x"})
+    with pytest.raises(AlertValidationError):
+        reject_secret_fields({"access_key": "x"})
+    # Token-boundary: secretary_note must NOT false-positive on "secret"
+    reject_secret_fields(
+        {"event": "need_human", "reason": "captcha", "detail": "ok", "secretary_note": "hi"}
+    )
     reject_secret_fields({"event": "need_human", "reason": "captcha", "detail": "ok"})
+
+
+def test_secretary_note_allowed_via_api(api_server: PoolServer):
+    base = api_server.base_url
+    lid = _lease(base, space="secretary-space")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {
+            "event": "need_human",
+            "reason": "other",
+            "detail": "ask secretary",
+            "secretary_note": "benign",
+        },
+    )
+    assert code == 200, env
+    assert env["alert"]["status"] == "awaiting_human"
+
+
+def test_client_watch_url_and_status_rejected(api_server: PoolServer):
+    base = api_server.base_url
+    lid = _lease(base, space="override-space")
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {
+            "event": "need_human",
+            "reason": "other",
+            "watch_url": "http://evil.example/watch",
+        },
+    )
+    assert code == 400
+    assert body["error"] == "invalid_alert"
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "other", "status": "done"},
+    )
+    assert code == 400
+    assert body["error"] == "invalid_alert"
+
+
+def test_scrub_detail_and_summary(api_server: PoolServer):
+    assert "password=[REDACTED]" in scrub_text("user password=s3cret ok")
+    assert "cookie=[REDACTED]" in scrub_text("cookie=abc; path=/")
+    assert "token=[REDACTED]" in scrub_text("token=xyz")
+    parsed = parse_alert_request(
+        {
+            "event": "need_human",
+            "reason": "other",
+            "detail": "see password=leak here",
+        }
+    )
+    assert "password=[REDACTED]" in parsed["detail"]
+    base = api_server.base_url
+    lid = _lease(base, space="scrub-space")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {
+            "event": "task_done",
+            "outcome": {"ok": True, "summary": "done token=abc123"},
+        },
+    )
+    assert code == 200
+    assert "token=[REDACTED]" in env["alert"]["outcome"]["summary"]
+
+
+def test_need_human_after_task_done_is_404(api_server: PoolServer):
+    base = api_server.base_url
+    lid = _lease(base, space="post-done-space")
+    code, _ = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "task_done", "outcome": {"ok": True, "summary": "bye"}},
+    )
+    assert code == 200
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "other"},
+    )
+    assert code == 404
+    assert body["error"] == "lease_not_found"
 
 
 def test_captain_one_liner_fields():

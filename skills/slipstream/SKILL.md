@@ -147,13 +147,17 @@ curl -s "$SLIPSTREAM_URL/healthz"
 ## Alerts (need_human + task_done)
 
 Ship-now takeover / done signals on the lease HTTP spine. **Never** put cookies,
-passwords, tokens, auth headers, credential dumps, or secret paths in alert
-payloads.
+passwords, tokens, JWTs, bearers, private/access keys, auth headers, credential
+dumps, or secret paths in alert **keys**. Free-text `detail` / `summary` is a
+trust boundary — do not put secrets there (server lightly scrubs
+`password=`/`cookie=`/`token=` only). Do not send `watch_url` or `status`
+(server-derived). Soft-idle eviction is skipped while awaiting human; hard TTL
+still applies.
 
 | Event | Effect |
 |-------|--------|
-| `need_human` | Pause the agent; **lease stays warm** (Chromium kept). Captain gets a one-liner + Watch / Take-over links. |
-| `task_done` | Notify once, then **release** the lease. Double-fire is idempotent/safe. |
+| `need_human` | Pause the agent; **lease stays warm** (Chromium kept; soft-idle skipped). Captain gets a one-liner + Watch / Take-over links. |
+| `task_done` | Notify once, then **release** the lease. Double-fire is idempotent/safe. Later `need_human` on that id is `404`. |
 
 ```bash
 # Agent blocked (CAPTCHA / login / ambiguous UI / …) — pause & keep session
@@ -168,8 +172,8 @@ slipstream alert done --lease-id "$LEASE_ID" --fail --summary "Blocked by paywal
 
 Harness JSON (`alert` + `harness`) tells the caller to `pause` or `continue`.
 Fields include `captain_message`, `watch_url`, `takeover_url`, `lease_kept` /
-`lease_released`. `watch_url` is a short-TTL local placeholder until live
-pair-browse UI ships.
+`lease_released`. Server-derived `watch_url` is a short-TTL local placeholder
+until live pair-browse UI ships (no client override).
 
 curl:
 

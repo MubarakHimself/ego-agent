@@ -16,7 +16,7 @@ MVP is always **isolated** mode (one process tree per Space). There is no `mode`
 |---|---|---|
 | `K` | 5 | Hard max live Chromium process trees |
 | `W` | 1 | Warm idle slots after **explicit client DELETE** only |
-| `idle_ttl_seconds` | 300 | Soft-evict without heartbeat (~5 min); always stops Chromium |
+| `idle_ttl_seconds` | 300 | Soft-evict without heartbeat (~5 min); always stops Chromium; **skipped** while lease is `awaiting_human` |
 | `lease_hard_ttl_seconds` | 1800 | Hard lease ceiling (enforced on heartbeat / idle sweep / re-lease); always stops Chromium |
 | `spaces_root` | `./data/spaces` | Space = `{spaces_root}/{space_id}/` = Chromium `--user-data-dir` |
 | `cdp_base_port` | 9222 | Slot *i* uses port `9222 + i` |
@@ -80,10 +80,11 @@ Raise a lease-scoped alert. Ship-now events: `need_human`, `task_done`.
   "reason": "captcha",
   "detail": "short human-safe string",
   "task_id": "optional",
-  "ttl_s": 300,
-  "watch_url": "optional-override"
+  "ttl_s": 300
 }
 ```
+
+Request must **not** include `watch_url` or `status` — both are server-derived.
 
 → `200` harness envelope:
 
@@ -123,13 +124,17 @@ Raise a lease-scoped alert. Ship-now events: `need_human`, `task_done`.
 
 `task_done` body uses `outcome: {"ok": bool, "summary": "…"}` (no secrets). A second `task_done` for the same `lease_id` returns the prior envelope with `harness.idempotent=true` (safe; no double-release error).
 
-→ `400` `invalid_alert` for unknown event, bad reason, or **secret-like fields** (`cookie`, `password`, `token`, `credential`, `authorization`, … — including nested keys).
+→ `400` `invalid_alert` for unknown event, bad reason, client-supplied `watch_url`/`status`, or **secret-like fields** (`cookie`, `password`, `token`, `private_key`, `jwt`, `bearer`, `access_key`, `credential`, `authorization`, … — including nested keys; token-boundary match so `secretary_note` is allowed).
 
-→ `404` if the lease is unknown (except idempotent `task_done` replay).
+→ `404` if the lease is unknown (except idempotent `task_done` replay). After a completed `task_done` the lease is released, so a later `need_human` for that `lease_id` is **`404`** (not `409`).
 
-→ `409` `alert_conflict` if `need_human` is raised after a completed `task_done`.
+**Refuse in payload keys:** cookies, passwords, tokens, JWTs, bearers, private/access keys, auth headers, credential-store dumps, secret-bearing paths, raw CDP auth. Matching is exact / token-boundary (not bare substring).
 
-**Refuse in payload:** cookies, passwords, tokens, auth headers, credential-store dumps, secret-bearing paths, raw CDP auth. `watch_url` is a short-TTL handoff placeholder until live pair-browse UI exists.
+**Trust boundary (free-text):** `detail` and `outcome.summary` are caller-controlled strings. Callers must not put secrets there. The server lightly scrubs `password=` / `cookie=` / `token=` patterns to `[REDACTED]` but this is defense-in-depth, not a guarantee — treat alert text as untrusted for secret storage.
+
+**Server-derived fields:** `status` (`awaiting_human` / `done` / `failed`) and `watch_url` (short-TTL local handoff placeholder until live pair-browse UI exists). Soft-idle eviction is skipped while `lease.status == awaiting_human` (hard TTL still applies).
+
+**In-memory alert state:** `_alert_log` and `_task_done_envelopes` are **process-lifetime** maps (survive lease release for idempotent `task_done` replay; cleared on pool shutdown / process exit). Bounded LRU eviction is deferred.
 
 ### `DELETE /v1/leases/{lease_id}`
 

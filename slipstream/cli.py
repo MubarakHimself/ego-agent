@@ -165,7 +165,6 @@ def cmd_alert(
     ttl_s: int | None = None,
     ok: bool | None = None,
     summary: str | None = None,
-    watch_url: str | None = None,
     url: str | None = None,
 ) -> int:
     """POST /v1/leases/{id}/alerts — need_human or task_done."""
@@ -200,8 +199,6 @@ def cmd_alert(
         body["task_id"] = task_id
     if ttl_s is not None:
         body["ttl_s"] = ttl_s
-    if watch_url:
-        body["watch_url"] = watch_url
 
     status, payload = _request("POST", f"{base}/v1/leases/{lease_id}/alerts", body)
     if status != 200:

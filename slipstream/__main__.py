@@ -174,11 +174,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Watch URL TTL seconds (default 300)",
     )
     p_alert.add_argument(
-        "--watch-url",
-        default=None,
-        help="Override watch URL (local placeholder ok)",
-    )
-    p_alert.add_argument(
         "--fail",
         action="store_true",
         help="task_done: outcome.ok=false (default is success)",
@@ -246,7 +241,6 @@ def main(argv: list[str] | None = None) -> int:
                 ttl_s=args.ttl_s,
                 ok=ok_flag if args.kind == "done" else None,
                 summary=args.summary,
-                watch_url=args.watch_url,
                 url=args.url,
             )
         if args._handler == "doctor":

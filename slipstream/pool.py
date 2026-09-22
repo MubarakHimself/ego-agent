@@ -56,7 +56,9 @@ class BrowserPool:
         ]
         self._handles: dict[int, LaunchHandle] = {}
         self._leases: dict[str, Lease] = {}
-        # Alerts: per-lease history + task_done idempotency (survives release)
+        # Alerts: per-lease history + task_done idempotency (survives release).
+        # Process-lifetime in-memory only (cleared on pool shutdown / process exit).
+        # Bounded LRU eviction is deferred — document trust: single long-lived process.
         self._alert_log: dict[str, list[dict[str, Any]]] = {}
         self._task_done_envelopes: dict[str, dict[str, Any]] = {}
         self._api_base_url: str = f"http://{self.config.host}:{self.config.port}"
@@ -547,6 +549,9 @@ class BrowserPool:
 
             if event == EVENT_NEED_HUMAN:
                 lease.status = "awaiting_human"
+                # Refresh heartbeat so soft-idle clock does not immediately fire
+                # while the human is being fetched (still honor hard TTL).
+                slot.last_heartbeat = time.time()
                 # Keep Chromium / lease warm — agent pauses
                 envelope = build_harness_envelope(
                     payload,
@@ -581,6 +586,8 @@ class BrowserPool:
     def evict_idle(self, now: float | None = None) -> list[str]:
         """Soft-evict idle leases and hard-TTL-expired leases.
 
+        Soft-idle eviction is skipped while ``lease.status == 'awaiting_human'``
+        (need_human pause keeps Chromium); hard TTL still tears down.
         Re-checks staleness / expiry under the lock immediately before teardown
         so a concurrent heartbeat cannot be raced into an eviction.
         Evictions never keep warm (always stop Chromium).
@@ -610,6 +617,11 @@ class BrowserPool:
                         evicted.append(lid)
                     except LeaseNotFoundError:
                         pass
+                    continue
+
+                # Soft-idle: skip while awaiting human (lease/Chromium kept).
+                # Hard TTL above still applies.
+                if lease.status == "awaiting_human":
                     continue
 
                 # Idle soft-evict: re-check heartbeat freshness under lock

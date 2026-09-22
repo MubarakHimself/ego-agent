@@ -559,3 +559,42 @@ def test_status_readable_during_slow_launch(pool: BrowserPool):
     assert status_result.get("ok") is True
     assert status_result.get("elapsed", 99) < 1.0
     assert status_result.get("starting") == 1
+
+def test_awaiting_human_skips_soft_idle_keeps_chromium(pool: BrowserPool):
+    """need_human then idle past idle_ttl without heartbeat → lease kept."""
+    import time
+
+    lease = pool.lease("agent-human", "await-space")
+    lid = lease["lease_id"]
+    env = pool.raise_alert(
+        lid, {"event": "need_human", "reason": "captcha", "detail": "challenge"}
+    )
+    assert env["harness"]["lease_kept"] is True
+    assert pool._leases[lid].status == "awaiting_human"
+
+    slot = pool._find_slot_by_lease(lid)
+    assert slot is not None
+    # Age heartbeat past soft idle (as if agent stopped heartbeating)
+    slot.last_heartbeat = time.time() - (pool.config.idle_ttl_seconds + 60)
+    evicted = pool.evict_idle()
+    assert lid not in evicted
+    assert lid in pool._leases
+    assert pool.status()["leased"] == 1
+    assert pool._handle_alive(slot)
+
+
+def test_awaiting_human_still_hard_ttl_evicts(pool: BrowserPool):
+    """Hard TTL still tears down even while awaiting_human."""
+    import time
+
+    lease = pool.lease("agent-hard", "await-hard-space", ttl_seconds=30)
+    lid = lease["lease_id"]
+    pool.raise_alert(lid, {"event": "need_human", "reason": "login"})
+    assert pool._leases[lid].status == "awaiting_human"
+    # Force hard expiry
+    pool._leases[lid].expires_at = time.time() - 1
+    evicted = pool.evict_idle()
+    assert lid in evicted
+    assert lid not in pool._leases
+    assert pool.status()["leased"] == 0
+
