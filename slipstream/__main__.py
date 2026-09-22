@@ -6,8 +6,9 @@ Subcommands:
   heartbeat   POST /v1/leases/{id}/heartbeat
   release     DELETE /v1/leases/{id}
   status      GET /v1/pool/status
-  act         POST /v1/leases/{id}/actions — gate eval|download|upload|nav_irreversible
-  navigate    POST /v1/leases/{id}/navigate — top-frame nav (domain allowlist)
+  act         POST /v1/leases/{id}/actions — gate fill|eval|download|upload|nav_irreversible
+  navigate    POST /v1/leases/{id}/navigate — top-frame nav (ladder + domain allowlist)
+  eval        POST /v1/leases/{id}/eval — Runtime.evaluate (ladder-enforced)
   confirm     POST /v1/confirmations/{id} {action: confirm}
   deny        POST /v1/confirmations/{id} {action: deny}
   doctor     Preflight: Chrome, CDP, pool healthz, spaces, skill, watch_compose
@@ -78,6 +79,7 @@ from slipstream.cli import (
     cmd_leases_list,
     cmd_sessions,
     cmd_navigate,
+    cmd_evaluate,
     cmd_spaces_list,
     cmd_spaces_login_once,
     cmd_spaces_set,
@@ -394,14 +396,14 @@ def build_parser() -> argparse.ArgumentParser:
     # --- act (permission ladder) ---
     p_act = sub.add_parser(
         "act",
-        help="Request gated act (eval|download|upload|nav_irreversible); may need confirm",
+        help="Request gated act (fill|eval|download|upload|nav_irreversible); may need confirm",
     )
     _add_url(p_act)
     p_act.add_argument(_OPT_LEASE_ID, required=True)
     p_act.add_argument(
         "--category",
         required=True,
-        choices=["eval", "download", "upload", "nav_irreversible"],
+        choices=["fill", "eval", "download", "upload", "nav_irreversible"],
     )
     p_act.add_argument(
         "--summary",
@@ -444,6 +446,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_nav.add_argument(_OPT_LEASE_ID, required=True)
     p_nav.add_argument("--page-url", required=True, help="http(s) URL to open")
     p_nav.set_defaults(_handler="navigate")
+
+    # --- eval (Runtime.evaluate) ---
+    p_eval = sub.add_parser(
+        "eval",
+        help="Runtime.evaluate on a lease (requires prior act+confirm for eval)",
+    )
+    _add_url(p_eval)
+    p_eval.add_argument(_OPT_LEASE_ID, required=True)
+    p_eval.add_argument(
+        "--expression",
+        required=True,
+        help="JS expression for Runtime.evaluate (no secrets)",
+    )
+    p_eval.set_defaults(_handler="evaluate")
 
     # --- spaces ---
     p_spaces = sub.add_parser("spaces", help="Space registry: list/filter tags, set user_metadata")
@@ -606,6 +622,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_navigate(
                 lease_id=args.lease_id,
                 page_url=args.page_url,
+                url=args.url,
+            )
+        if args._handler == "evaluate":
+            return cmd_evaluate(
+                lease_id=args.lease_id,
+                expression=args.expression,
                 url=args.url,
             )
         if args._handler == "spaces_list":

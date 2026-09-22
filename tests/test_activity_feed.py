@@ -25,6 +25,7 @@ from slipstream.cli import _validate_api_request_url
 from slipstream.config import PoolConfig
 from slipstream.domains import host_matches
 from slipstream.pool import BrowserPool
+from tests.conftest import grant_ladder
 
 
 @pytest.fixture
@@ -139,6 +140,7 @@ def test_activity_feed_on_watch(api_server: PoolServer):
     watch = env["alert"]["watch_url"]
     token = _token_from_watch_url(watch)
 
+    grant_ladder(base, lid, "nav_irreversible", "feed nav")
     code, nav = _req(
         "POST",
         f"{base}/v1/leases/{lid}/navigate",
@@ -304,6 +306,7 @@ def test_watch_timeline_api_auth_and_scrub(api_server: PoolServer):
     watch = env["alert"]["watch_url"]
     token = _token_from_watch_url(watch)
 
+    grant_ladder(base, lid, "nav_irreversible", "feed nav")
     code, nav = _req(
         "POST",
         f"{base}/v1/leases/{lid}/navigate",

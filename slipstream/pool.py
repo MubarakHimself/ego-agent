@@ -42,6 +42,8 @@ from slipstream.captcha import (
 )
 _ERR_BODY_MUST_JSON = "body must be a JSON object"
 
+_CAT_NAV_IRREVERSIBLE = "nav_irreversible"  # ADV-PL-001 enforced CDP category
+
 from slipstream.download_cdp import (
     MockDownloadRecorder,
     configure_chrome_download_behavior,
@@ -151,11 +153,13 @@ from slipstream.actions import (
     ConfirmationGoneError,
     ConfirmationNotFoundError,
     ConfirmationStore,
+    LadderGateError,
     PendingConfirmation,
     confirm_ttl_seconds,
     mint_confirm_id,
     parse_action_request,
     parse_confirmation_action,
+    parse_eval_request,
 )
 
 
@@ -240,7 +244,9 @@ class BrowserPool:
             )
             warm = sum(1 for s in self._slots if s.status == SlotStatus.FREE_WARM)
             leased = sum(1 for s in self._slots if s.status == SlotStatus.LEASED)
-            return {
+            from slipstream.actions import expose_raw_cdp
+
+            out = {
                 "K": self.config.K,
                 "W": self.config.W,
                 "idle_ttl_seconds": self.config.idle_ttl_seconds,
@@ -252,10 +258,13 @@ class BrowserPool:
                 "vault_root": str(self.config.vault_root),
                 # ADV-DL-003: never expose absolute artifacts_root on status.
                 "artifacts_configured": True,
-                "cdp_base_port": self.config.cdp_base_port,
                 "chrome_binary": self.launcher.binary,
                 "slots": [s.to_dict() for s in self._slots],
             }
+            # ADV-PL-001-BYPASS-RAW-CDP-PORT: base+slot_id reconstructs CDP URL.
+            if expose_raw_cdp():
+                out["cdp_base_port"] = self.config.cdp_base_port
+            return out
 
     def _refresh_rss(self) -> None:
         for slot in self._slots:
@@ -418,6 +427,7 @@ class BrowserPool:
         if sess is not None:
             self._invalidate_pair_browse_locked(sess, revoke=True)
         self._captcha.pop(lease_id, None)
+        self._confirmations.clear_lease(lease_id)
 
         keep_warm = allow_warm and self._count_warm() < self.config.W
         del self._leases[lease_id]
@@ -776,8 +786,11 @@ class BrowserPool:
     def fill_credentials(self, lease_id: str, body: dict[str, Any]) -> dict[str, Any]:
         """Unlock vault + CDP-inject into leased browser. Agent sees ok/labels only.
 
-        On login/2FA walls the agent cannot clear, raise need_human(reason=login)
-        via the alerts API — do not ask the LLM for passwords.
+        ADV-PL-001: requires a prior one-shot ``fill`` confirmation on this lease.
+        Preconditions (cdp present, origin match) run before consume; post-consume
+        CDP failure refunds the grant. On login/2FA walls the agent cannot clear,
+        raise need_human(reason=login) via the alerts API — do not ask the LLM
+        for passwords.
         """
         parsed = parse_fill_body(body)
         cred_id = parsed["cred_id"]
@@ -794,12 +807,17 @@ class BrowserPool:
             cdp_http = slot.cdp_http_url
             if not cdp_http:
                 raise CdpInjectError("lease has no cdp_http_url")
+            # Fail-closed before vault unlock / CDP — peek only (no burn yet).
+            if not self._confirmations.has_allowance(lease_id, "fill"):
+                raise LadderGateError("fill")
 
         unlocked = self.vault.unlock_for_fill(space_id, cred_id)
         filled: list[str] = []
         triples: list[tuple[str, str, str]] = []
+        consumed = False
         try:
-            # ADV-010: refuse fill when page origin != bound cred.origin
+            # ADV-010 + ADV-PL-001-CONSUME: origin check BEFORE burning grant
+            # (page_url uses Runtime.evaluate — must not run after consume-on-fail).
             bound_origin = unlocked.get("origin", "")
             try:
                 page_href = self._cdp_injector.page_url(cdp_http)
@@ -811,10 +829,22 @@ class BrowserPool:
                 raise VaultValidationError(
                     f"origin mismatch: cred bound to {bound_origin!r} but page is {page_href!r}"
                 )
+            with self._lock:
+                if lease_id not in self._leases:
+                    raise LeaseNotFoundError(lease_id)
+                self._confirmations.consume_once(lease_id, "fill")
+                consumed = True
             for name, selector in fields.items():
                 value = material_for_field(name, unlocked)
                 triples.append((name, selector, value))
-            filled = self._cdp_injector.fill_fields(cdp_http, triples)
+            try:
+                filled = self._cdp_injector.fill_fields(cdp_http, triples)
+            except Exception:
+                if consumed:
+                    with self._lock:
+                        self._confirmations.refund_once(lease_id, "fill")
+                    consumed = False
+                raise
         finally:
             # ADV-008: overwrite + clear secret triples and unlocked material
             for i, (n, s, v) in enumerate(triples):
@@ -1264,7 +1294,7 @@ class BrowserPool:
     def request_action(self, lease_id: str, body: dict[str, Any]) -> dict[str, Any]:
         """Gate a sensitive act: emit confirmation_required + sibling need_human.
 
-        Soft browse is not gated here. Categories: eval|download|upload|nav_irreversible.
+        Soft browse is not gated here. Categories: fill|eval|download|upload|nav_irreversible.
         Lease stays warm on awaiting_human; agent pauses. Auto-deny after TTL (~60s).
 
         When category is nav_irreversible and body includes ``url``, refuse outside
@@ -1307,18 +1337,31 @@ class BrowserPool:
             )
 
             # Sibling need_human on SAME alerts bus (kind + confirm_id).
-            watch_token = mint_watch_token()
-            self._watches[lease_id] = WatchSession(
-                lease_id=lease_id,
-                token=watch_token,
-                expires_at=now + float(ttl),
-                reason="confirmation_required",
-                detail=parsed["summary"],
-                revoked=False,
-                takeover_confirmed=False,
-                input_enabled=False,
-                created_at=now,
-            )
+            # Reuse a live Watch token so an existing captain URL stays valid
+            # when the ladder pauses for confirm (ADV-PL-001).
+            sess = self._lookup_watch(lease_id)
+            if (
+                sess is not None
+                and not sess.revoked
+                and now < sess.expires_at
+            ):
+                watch_token = sess.token
+                sess.expires_at = now + float(ttl)
+                sess.reason = "confirmation_required"
+                sess.detail = parsed["summary"]
+            else:
+                watch_token = mint_watch_token()
+                self._watches[lease_id] = WatchSession(
+                    lease_id=lease_id,
+                    token=watch_token,
+                    expires_at=now + float(ttl),
+                    reason="confirmation_required",
+                    detail=parsed["summary"],
+                    revoked=False,
+                    takeover_confirmed=False,
+                    input_enabled=False,
+                    created_at=now,
+                )
             alert_parsed = {
                 "event": EVENT_NEED_HUMAN,
                 "reason": "confirmation_required",
@@ -1403,6 +1446,8 @@ class BrowserPool:
             if action == _ACTION_CONFIRM:
                 pending.status = STATUS_CONFIRMED
                 decision = "allow"
+                # One-shot CDP allowance for this category (ADV-PL-001).
+                self._confirmations.grant_once(lease_id, pending.category)
             else:
                 pending.status = STATUS_DENIED
                 decision = "deny"
@@ -2016,12 +2061,55 @@ class BrowserPool:
             }
 
 
+    # --- eval (Runtime.evaluate; ladder-enforced) -----------------------
+
+    def evaluate(self, lease_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Pool-side Runtime.evaluate. Requires one-shot ``eval`` confirmation.
+
+        Soft browse stays free. Expression is never echoed back with secrets;
+        mock records length only. Preconditions (cdp present) before consume;
+        CDP failure after consume refunds the grant.
+        """
+        parsed = parse_eval_request(body)
+        expression = parsed["expression"]
+
+        with self._lock:
+            lease = self._leases.get(lease_id)
+            if not lease:
+                raise LeaseNotFoundError(lease_id)
+            slot = self._find_slot_by_lease(lease_id)
+            if not slot or slot.status != SlotStatus.LEASED:
+                raise LeaseNotFoundError(lease_id)
+            cdp_http = slot.cdp_http_url
+            if not cdp_http:
+                raise CdpInjectError("lease has no cdp_http_url")
+            self._confirmations.consume_once(lease_id, "eval")
+
+        try:
+            value = self._cdp_injector.evaluate(cdp_http, expression)
+        except Exception:
+            with self._lock:
+                self._confirmations.refund_once(lease_id, "eval")
+            raise
+        self._record_activity(
+            lease_id,
+            "confirm",
+            f"eval len={len(expression)}",
+            outcome="ok",
+            detail={"expression_len": len(expression)},
+        )
+        return {"ok": True, "lease_id": lease_id, "result": value}
+
     # --- navigate (domain allowlist gate) ------------------------------
 
     def navigate(self, lease_id: str, body: dict[str, Any]) -> dict[str, Any]:
         """Top-frame navigate via CDP (or mock). Refuse outside allowlist.
 
-        Empty effective allowlist = unrestricted. iframe/subresource not gated (v1).
+        ADV-PL-001: requires one-shot ``nav_irreversible`` confirmation (all pool
+        navigates). Empty effective allowlist = unrestricted domain-wise.
+        iframe/subresource not gated (v1). Soft browse (click/scroll/wait) free.
+        Domain allowlist + cdp presence checked before consume; CDP/mock failure
+        after consume refunds the grant. Soft-fail matched=False also refunds.
         """
         if not isinstance(body, dict):
             raise DomainAllowlistError(_ERR_BODY_MUST_JSON)
@@ -2043,32 +2131,48 @@ class BrowserPool:
 
         check_navigate_url(url, patterns)
 
-        if mock:
-            with self._lock:
-                self._nav_log.append(
-                    {"lease_id": lease_id, "url": url, "allowed_domains": patterns}
+        # ADV-PL-001: preconditions before burn; consume then side-effect.
+        with self._lock:
+            if lease_id not in self._leases:
+                raise LeaseNotFoundError(lease_id)
+            if not mock and not cdp_http:
+                raise CdpInjectError("lease has no cdp_http_url")
+            self._confirmations.consume_once(lease_id, _CAT_NAV_IRREVERSIBLE)
+
+        try:
+            if mock:
+                with self._lock:
+                    self._nav_log.append(
+                        {"lease_id": lease_id, "url": url, "allowed_domains": patterns}
+                    )
+                self._record_activity(
+                    lease_id,
+                    "navigate",
+                    safe_url_summary(url),
+                    outcome="ok",
+                    detail={"mock": True},
                 )
-            self._record_activity(
-                lease_id,
-                "navigate",
-                safe_url_summary(url),
-                outcome="ok",
-                detail={"mock": True},
-            )
-            return {
-                "ok": True,
-                "url": url,
-                "matched": True,
-                "mock": True,
-                "allowed_domains": patterns,
-            }
+                return {
+                    "ok": True,
+                    "url": url,
+                    "matched": True,
+                    "mock": True,
+                    "allowed_domains": patterns,
+                }
 
-        if not cdp_http:
-            raise DomainAllowlistError("lease has no cdp_http_url")
-        from slipstream.cdp_http import navigate_via_json_new
+            from slipstream.cdp_http import navigate_via_json_new
 
-        result = navigate_via_json_new(cdp_http, url, allowed_domains=patterns)
+            result = navigate_via_json_new(cdp_http, url, allowed_domains=patterns)
+        except Exception:
+            with self._lock:
+                self._confirmations.refund_once(lease_id, _CAT_NAV_IRREVERSIBLE)
+            raise
+
         ok = bool(result.get("matched"))
+        # ADV-PL-001-NAV-SOFTFAIL-BURNS: matched=False soft-fail — refund grant.
+        if not ok:
+            with self._lock:
+                self._confirmations.refund_once(lease_id, _CAT_NAV_IRREVERSIBLE)
         self._record_activity(
             lease_id,
             "navigate",

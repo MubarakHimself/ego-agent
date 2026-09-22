@@ -55,9 +55,13 @@ def test_space_id_slash_rejected_not_collapsed(mock_config):
 def test_lease_heartbeat_release(pool: BrowserPool):
     lease = pool.lease("agent-1", "space-a")
     assert lease["status"] == "leased"
-    assert lease["cdp_http_url"].startswith("http://127.0.0.1:")
+    # Firstmate B: raw CDP URLs omitted from lease JSON by default
+    assert "cdp_http_url" not in lease
+    assert "cdp_ws_url" not in lease
     assert lease["space_id"] == "space-a"
     lid = lease["lease_id"]
+    # Internal handle still has CDP for pool-side inject
+    assert pool._leases[lid].cdp_http_url.startswith("http://127.0.0.1:")
 
     hb = pool.heartbeat(lid)
     assert hb["ok"] is True

@@ -31,6 +31,8 @@ def test_live_chrome_lease_navigate_heartbeat_release(tmp_path):
         chrome_binary=binary,
         idle_ttl_seconds=300,
     )
+    # Live smoke needs raw CDP URLs (escape hatch); production default omits them.
+    os.environ["SLIPSTREAM_EXPOSE_RAW_CDP"] = "1"
     pool = BrowserPool(cfg)
     try:
         lease = pool.lease("live-agent", "live-space")

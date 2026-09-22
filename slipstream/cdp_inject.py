@@ -33,6 +33,9 @@ class CdpInjector(Protocol):
     def page_url(self, cdp_http_url: str) -> str:
         """Return current page location.href (for origin check before inject)."""
 
+    def evaluate(self, cdp_http_url: str, expression: str) -> Any:
+        """Runtime.evaluate ``expression``; return JSON-safe result value."""
+
 
 @dataclass
 class MockCdpInjector:
@@ -43,6 +46,15 @@ class MockCdpInjector:
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def page_url(self, cdp_http_url: str) -> str:
+        with self._lock:
+            self.calls.append(
+                {
+                    "cdp_http_url": cdp_http_url,
+                    "method": "Runtime.evaluate",
+                    "expression_len": len("location.href"),
+                    "purpose": "page_url",
+                }
+            )
         return self.current_url
 
     def fill_fields(
@@ -64,6 +76,17 @@ class MockCdpInjector:
                 )
                 filled.append(name)
         return filled
+
+    def evaluate(self, cdp_http_url: str, expression: str) -> Any:
+        with self._lock:
+            self.calls.append(
+                {
+                    "cdp_http_url": cdp_http_url,
+                    "method": "Runtime.evaluate",
+                    "expression_len": len(expression),
+                }
+            )
+        return {"type": "string", "value": "ok"}
 
 
 def _assert_ws_debugger_url(ws_url: str) -> str:
@@ -199,6 +222,24 @@ class RealCdpInjector:
             _ws_cdp_call(ws_url, "Input.insertText", {"text": value})
             filled.append(name)
         return filled
+
+    def evaluate(self, cdp_http_url: str, expression: str) -> Any:
+        host = urlparse(cdp_http_url).hostname
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            raise CdpInjectError(f"refusing non-loopback CDP URL host {host!r}")
+        ws_url = _page_ws_url(cdp_http_url)
+        result = _ws_cdp_call(
+            ws_url,
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "awaitPromise": False,
+                "returnByValue": True,
+            },
+        )
+        if isinstance(result, dict) and "result" in result:
+            return result["result"]
+        return result
 
 
 def default_injector(*, mock: bool) -> CdpInjector:

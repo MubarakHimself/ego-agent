@@ -9,6 +9,7 @@ Endpoints:
   POST   /v1/leases/{id}/captcha
   POST   /v1/leases/{id}/actions
   POST   /v1/leases/{id}/navigate
+  POST   /v1/leases/{id}/eval
   POST   /v1/leases/{id}/confirmations/{confirm_id}
   POST   /v1/leases/{id}/credentials/fill
   POST   /v1/leases/{id}/watch/confirm
@@ -54,6 +55,7 @@ from slipstream.actions import (
     ActionValidationError,
     ConfirmationGoneError,
     ConfirmationNotFoundError,
+    LadderGateError,
 )
 from slipstream.watch import (
     WATCH_CLICKJACK_HEADERS,
@@ -105,11 +107,25 @@ _ERR_INVALID_CREDENTIALS = "invalid_credentials"
 _ERR_INVALID_SIGNED_IN = "invalid_signed_in"
 _ERR_ALERT_CONFLICT = "alert_conflict"
 _ERR_FORBIDDEN = "forbidden"
+_ERR_CONFIRMATION_REQUIRED = "confirmation_required"
 _ERR_LAUNCH_FAILED = "launch_failed"
 _QS_AGENT_ID = "agent_id"
 _QS_WATCH_AUTH = "token"  # skylos: ignore[SKY-L014,SKY-L032] query param name, not a secret
 _FIELD_ALLOWED_DOMAINS = "allowed_domains"
 _FIELD_USER_METADATA = "user_metadata"
+
+
+
+def _ladder_gate_response(handler: BaseHTTPRequestHandler, exc: LadderGateError) -> None:
+    _json_response(
+        handler,
+        403,
+        {
+            "error": _ERR_CONFIRMATION_REQUIRED,
+            "category": exc.category,
+            "detail": str(exc),
+        },
+    )
 
 
 def _v1_resource_tail(parts: list[str], resource: str, *tail: str) -> str | None:
@@ -774,6 +790,30 @@ def make_handler(pool: BrowserPool):
                             "host": getattr(e, "host", None),
                         },
                     )
+                except LadderGateError as e:
+                    _ladder_gate_response(self, e)
+                except CdpInjectError as e:
+                    _json_response(self, 502, {"error": "cdp_inject_failed", "detail": str(e)})
+                except LeaseNotFoundError:
+                    _json_response(
+                        self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id}
+                    )
+                return
+
+            # POST /v1/leases/{lease_id}/eval — Runtime.evaluate (ladder-enforced)
+            lease_id = _v1_lease_tail(parts, "eval")
+            if lease_id is not None:
+                try:
+                    result = pool.evaluate(lease_id, body)
+                    _json_response(self, 200, result)
+                except LadderGateError as e:
+                    _ladder_gate_response(self, e)
+                except ActionValidationError as e:
+                    _json_response(
+                        self, 400, {"error": _ERR_INVALID_ACTION, "detail": str(e)}
+                    )
+                except CdpInjectError as e:
+                    _json_response(self, 502, {"error": "cdp_inject_failed", "detail": str(e)})
                 except LeaseNotFoundError:
                     _json_response(
                         self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id}
@@ -951,6 +991,8 @@ def make_handler(pool: BrowserPool):
                 try:
                     result = pool.fill_credentials(lease_id, body)
                     _json_response(self, 200, result)
+                except LadderGateError as e:
+                    _ladder_gate_response(self, e)
                 except LeaseNotFoundError:
                     _json_response(
                         self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id}

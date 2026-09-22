@@ -87,31 +87,31 @@ SLIPSTREAM_MOCK=1 slipstream serve --port 8755
 Equivalent: `python -m slipstream serve …`. Default base URL:
 `http://127.0.0.1:8755`. Override with env `SLIPSTREAM_URL` or CLI `--url`.
 
-## Lifecycle (lease → drive CDP → heartbeat → release)
+## Lifecycle (lease → pool HTTP drive → heartbeat → release)
 
-Use **one Space** per user goal. Print `lease_id` and CDP URLs; reuse them in
-later rounds. Heartbeat every ~15–30s (including during LLM think). Always
-release when done (or on hard failure after you stop retrying).
+Use **one Space** per user goal. Print `lease_id`; reuse it in later rounds.
+Heartbeat every ~15–30s (including during LLM think). Always release when done
+(or on hard failure after you stop retrying).
 
 ```bash
 # 1) Lease
 slipstream lease --agent-id "$AGENT_ID" --space-id "task-42"
-# → JSON: lease_id, cdp_http_url, cdp_ws_url, slot_id, expires_at, …
+# → JSON: lease_id, slot_id, expires_at, … (no cdp_* URLs by default)
 
-# 2) Drive via CDP — attach a peer driver (do NOT spawn Chrome)
-#    Playwright:
-#      playwright.chromium.connect_over_cdp(cdp_http_url)
-#    Vercel agent-browser:
-#      agent-browser --cdp "$cdp_http_url" open https://example.com
-#    Browser Use:
-#      BU_CDP_URL="$cdp_http_url" browser-use <<'PY'
-#      # … your steps …
-#      PY
+# 2) Drive via pool HTTP (ladder-enforced) — do NOT spawn Chrome
+#    slipstream act … && slipstream confirm c_…
+#    slipstream navigate --lease-id "$LEASE_ID" --url "https://example.com"
+#    slipstream eval --lease-id "$LEASE_ID" --expression "document.title"
+#    slipstream cred fill --lease-id "$LEASE_ID" …
+
+#    Escape hatch (honor-system for raw CDP nav/eval):
+#      SLIPSTREAM_EXPOSE_RAW_CDP=1 slipstream lease …
+#      # then playwright.chromium.connect_over_cdp(cdp_http_url) / agent-browser --cdp
 
 # 3) Heartbeat while working / thinking
 slipstream heartbeat --lease-id "$LEASE_ID"
 
-# 4a) If blocked — raise need_human (keeps lease; pause CDP drive)
+# 4a) If blocked — raise need_human (keeps lease; pause drive)
 # slipstream alert need-human --lease-id "$LEASE_ID" --reason captcha
 
 # 4b) Prefer task_done (notifies + releases once) when the skill finishes
@@ -145,36 +145,46 @@ curl -s "$SLIPSTREAM_URL/healthz"
 (`SLIPSTREAM_URL` defaults to `http://127.0.0.1:8755` if unset.)
 
 
-## Permission ladder (confirm-actions)
+## Permission ladder (confirm-actions — server-enforced)
 
-Before irreversible CDP acts, call `slipstream act`. Soft browse (snapshot /
-click / scroll / wait) stays free. Gated categories:
+Before irreversible CDP acts, call `slipstream act`, wait for captain
+`confirm`, then call the CDP endpoint. Soft browse (snapshot / click /
+scroll / wait) stays free. Gated categories:
 
-- `eval` — script / `Runtime.evaluate`
+- `fill` — credentials fill (`cred fill`)
+- `eval` — script / `Runtime.evaluate` (`slipstream eval`)
 - `download` — file download
 - `upload` — file upload / set file input
-- `nav_irreversible` — destructive navigation / POST forms
+- `nav_irreversible` — all pool navigates (`slipstream navigate`)
 
 ```bash
 slipstream act --lease-id "$LEASE_ID" --category eval --summary "probe document.title"
 # → JSON status=confirmation_required + confirm_id; agent pauses
 #   (sibling need_human on alerts bus → Watch / Take-over URL)
 
-slipstream confirm c_…     # allow once; agent resumes
-slipstream deny c_…        # fail closed; agent resumes with error
+slipstream confirm c_…     # allow once; grants one-shot CDP allowance
+slipstream deny c_…        # fail closed; no allowance
+
+# After confirm, the matching CDP path may run once:
+slipstream eval --lease-id "$LEASE_ID" --expression "document.title"
+# Second eval without a fresh confirm → 403 confirmation_required
 ```
 
 Pending confirmations **auto-deny after ~60s** (`SLIPSTREAM_CONFIRM_TTL`).
-`--confirm-interactive` prompts on a TTY; **Non-TTY → deny**.
+Unused one-shot grants use the **same TTL**. `--confirm-interactive` prompts
+on a TTY; **Non-TTY → deny**.
 
 Never put secrets/cookies/passwords in `--summary` (scrub also redacts
 `jwt=` / `access_key=` / `private_key=` / `api_key=` / `passwd=`).
 
-**Honor-system (ADV-PL-001):** `act` is an advisory pause — CDP fill/eval/nav
-are **not** server-enforced by the ladder yet. Prefer always calling `act`
-before irreversible work. Domain allowlist on `navigate` **is** enforced when set.
+**Server-enforced (ADV-PL-001) on pool HTTP:** pool **refuses** fill / eval /
+navigate without a prior confirm for that category (403
+`confirmation_required`, no CDP side-effect). Confirm is one-shot then re-gate.
+Domain allowlist on navigate still applies when set. Raw CDP
+(`SLIPSTREAM_EXPOSE_RAW_CDP=1`) is honor-system for nav/eval; vault fill stays
+pool-only.
 
-Defer: once/always/never policy matrix, full server-enforced ladder, Comet UI.
+Defer: once/always/never policy matrix, Comet UI.
 
 ## Domain allowlist (top-frame)
 
@@ -453,15 +463,17 @@ slipstream sessions --json           # includes watch_url when need_human minted
 
 ## Driver attach recipes
 
-Slipstream owns **pool lease**. Peers own **page drive**:
+Slipstream owns **pool lease**. **Default drive** is pool HTTP (navigate / eval /
+cred fill + act/confirm) so the permission ladder is server-enforced.
 
-| Driver | Attach |
-|--------|--------|
-| Playwright | `chromium.connect_over_cdp(cdp_http_url)` |
-| Vercel agent-browser | `agent-browser --cdp "$cdp_http_url" …` |
-| Browser Use | `BU_CDP_URL` / `BU_CDP_WS` pointing at lease CDP |
+| Path | When |
+|------|------|
+| Pool HTTP | Default — ladder consume_once is real |
+| Raw CDP peers | Only with `SLIPSTREAM_EXPOSE_RAW_CDP=1` (lease/status return cdp_* urls + ports); nav/eval honor-system; vault fill still pool-only |
 
-Thin in-house helpers (`slipstream.cdp_http`) are for smoke/bench only.
+Raw CDP peers (escape hatch): Playwright `connect_over_cdp`, Vercel
+`agent-browser --cdp`, Browser Use `BU_CDP_URL`. Thin `slipstream.cdp_http`
+helpers are for smoke/bench when raw CDP is exposed.
 
 ## Subagent / harness rules
 
@@ -471,7 +483,7 @@ Thin in-house helpers (`slipstream.cdp_http`) are for smoke/bench only.
 - On **503** `pool_full`: backoff or ask the main agent to free a slot.
 - Always **release** on the failure path after you stop retrying.
 - Install this skill and call the `slipstream` CLI via the shell tool.
-  Prefer shell + peer CDP driver over registering a second browser launcher.
+  Prefer shell + pool HTTP drive (or raw CDP only with EXPOSE_RAW_CDP) over registering a second browser launcher.
 
 
 
@@ -550,7 +562,7 @@ slipstream uploads   list|put …
 - Compose `/watch` remains upstream (see **Compose /watch**; doctor WARN if
   missing). Alerts, credential vault/fill, confirm-actions, domain allowlist
   navigate, and content-boundary helpers **are** on the CLI/HTTP surface.
-  Once-always-never / full server-enforced ladder
+  Once-always-never domain modes
   are **later**.
 
 ## Examples

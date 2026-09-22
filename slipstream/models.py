@@ -34,13 +34,12 @@ class SlotState:
     rss_bytes: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        from slipstream.actions import expose_raw_cdp
+
+        out: dict[str, Any] = {
             "slot_id": self.slot_id,
             "status": self.status.value,
             "chromium_pid": self.chromium_pid,
-            "cdp_port": self.cdp_port,
-            "cdp_http_url": self.cdp_http_url,
-            "cdp_ws_url": self.cdp_ws_url,
             "space_id": self.space_id,
             "lease_id": self.lease_id,
             "agent_id": self.agent_id,
@@ -48,6 +47,13 @@ class SlotState:
             "leased_at": self.leased_at,
             "rss_bytes": self.rss_bytes,
         }
+        # ADV-PL-001-BYPASS-RAW-CDP-PORT: cdp_port reconstructs http://127.0.0.1:{port}
+        # the same as cdp_http_url — gate behind the same escape hatch.
+        if expose_raw_cdp():
+            out["cdp_port"] = self.cdp_port
+            out["cdp_http_url"] = self.cdp_http_url
+            out["cdp_ws_url"] = self.cdp_ws_url
+        return out
 
 
 @dataclass
@@ -76,20 +82,23 @@ class Lease:
     signed_in_host: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        from slipstream.actions import expose_raw_cdp
+
         out: dict[str, Any] = {
             "lease_id": self.lease_id,
             "slot_id": self.slot_id,
             "agent_id": self.agent_id,
             "space_id": self.space_id,
             "status": self.status,
-            "cdp_http_url": self.cdp_http_url,
-            "cdp_ws_url": self.cdp_ws_url,
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "user_metadata": dict(self.user_metadata),
             "allowed_domains": list(self.allowed_domains),
             "signed_in": bool(self.signed_in),
         }
+        if expose_raw_cdp():
+            out["cdp_http_url"] = self.cdp_http_url
+            out["cdp_ws_url"] = self.cdp_ws_url
         if self.signed_in and self.signed_in_host:
             out["signed_in_host"] = self.signed_in_host
         return out

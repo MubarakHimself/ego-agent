@@ -68,7 +68,7 @@ def test_cli_lease_heartbeat_release_status(api_server: PoolServer):
     assert lease["agent_id"] == "a1"
     assert lease["space_id"] == "s1"
     assert "lease_id" in lease
-    assert lease["cdp_http_url"]
+    assert "cdp_http_url" not in lease
     lid = lease["lease_id"]
 
     out = io.StringIO()
