@@ -1,15 +1,23 @@
-"""Space/lease tiers: ephemeral | named | attach (ui-peers three-tier).
+"""Space/lease tiers + cloud-overflow provider stub.
 
-Thin attach-my-Chrome: bind a lease to an existing CDP endpoint without
-spawning pool Chromium. Attach is default-off (``SLIPSTREAM_ALLOW_ATTACH=1``).
+Tiers: ephemeral | named | attach (ui-peers three-tier). Thin attach-my-Chrome
+binds a lease to an existing CDP endpoint without spawning pool Chromium
+(``SLIPSTREAM_ALLOW_ATTACH=1``, default off).
+
+Cloud overflow: Browserbase-class ``RemoteCdpProvider`` shape with **mock only**
+(no paid keys / no real Browserbase HTTP). Enable via ``SLIPSTREAM_CLOUD_OVERFLOW``.
 """
 
 from __future__ import annotations
 
+import abc
 import ipaddress
 import os
 import socket
+import threading
 import urllib.parse
+import uuid
+from dataclasses import dataclass
 from typing import Any
 
 TIER_EPHEMERAL = "ephemeral"
@@ -209,3 +217,121 @@ def tier_blurb_table() -> str:
         "| `attach` | Attach to **existing** Chrome via user CDP URL/port — "
         "**no** pool Chromium spawn. Requires `SLIPSTREAM_ALLOW_ATTACH=1`. |\n"
     )
+
+
+# --- cloud overflow (mock provider) ------------------------------------
+
+_MODE_ON = "1"
+_MODE_ALWAYS = "always"
+_PROVIDER_MOCK = "mock"
+_TRUTHY = frozenset({_MODE_ON, "true", "yes", "on"})
+
+
+class CloudProviderError(RuntimeError):
+    """Unsupported / misconfigured cloud provider (maps to 503 or 400)."""
+
+
+@dataclass(frozen=True)
+class CloudSession:
+    """Remote CDP session handle returned by a provider."""
+
+    session_id: str
+    cdp_http_url: str
+    cdp_ws_url: str | None = None
+    provider: str = _PROVIDER_MOCK
+
+
+class RemoteCdpProvider(abc.ABC):
+    """Browserbase-class shape: create/release remote CDP sessions."""
+
+    name: str
+
+    @abc.abstractmethod
+    def create_session(
+        self, *, agent_id: str, space_id: str, **kwargs: Any
+    ) -> CloudSession:
+        """Allocate a remote CDP session; return http/ws endpoints + id."""
+
+    @abc.abstractmethod
+    def release_session(self, session_id: str) -> None:
+        """Release a previously created remote session (idempotent preferred)."""
+
+
+def cloud_overflow_mode() -> str:
+    """Return '', '1', or 'always' from SLIPSTREAM_CLOUD_OVERFLOW (default off)."""
+    raw = os.environ.get("SLIPSTREAM_CLOUD_OVERFLOW", "").strip().lower()
+    if raw in _TRUTHY:
+        return _MODE_ON
+    if raw == _MODE_ALWAYS:
+        return _MODE_ALWAYS
+    return ""
+
+
+def cloud_overflow_enabled() -> bool:
+    """True when overflow is on (pool_full and/or always)."""
+    return cloud_overflow_mode() in (_MODE_ON, _MODE_ALWAYS)
+
+
+def cloud_overflow_always() -> bool:
+    """True when every non-attach lease should use the cloud provider."""
+    return cloud_overflow_mode() == _MODE_ALWAYS
+
+
+def cloud_provider_name() -> str:
+    """SLIPSTREAM_CLOUD_PROVIDER (default mock). Only mock supported this PR."""
+    return (
+        os.environ.get("SLIPSTREAM_CLOUD_PROVIDER", _PROVIDER_MOCK).strip().lower()
+        or _PROVIDER_MOCK
+    )
+
+
+class MockCloudProvider(RemoteCdpProvider):
+    """In-process stub — fabricates fake CDP endpoints; records create/release."""
+
+    name = _PROVIDER_MOCK
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._n = 0
+        self.created: list[CloudSession] = []
+        self.released: list[str] = []
+        self._alive: set[str] = set()
+
+    def create_session(
+        self, *, agent_id: str, space_id: str, **kwargs: Any
+    ) -> CloudSession:
+        del agent_id, space_id, kwargs  # shape-compatible; unused by mock
+        with self._lock:
+            self._n += 1
+            n = self._n
+            sid = f"mock-{uuid.uuid4().hex[:12]}"
+            # High ephemeral ports — not bound; mock CDP only (no Chrome spawn).
+            port = 19000 + (n % 1000)
+            http = f"http://127.0.0.1:{port}"
+            ws = f"ws://127.0.0.1:{port}/devtools/browser/{sid}"
+            sess = CloudSession(
+                session_id=sid,
+                cdp_http_url=http,
+                cdp_ws_url=ws,
+                provider=self.name,
+            )
+            self.created.append(sess)
+            self._alive.add(sid)
+            return sess
+
+    def release_session(self, session_id: str) -> None:
+        with self._lock:
+            self.released.append(session_id)
+            self._alive.discard(session_id)
+
+
+def build_cloud_provider(name: str | None = None) -> RemoteCdpProvider:
+    """Factory — only ``mock`` supported (no paid keys / real HTTP)."""
+    resolved = (name or cloud_provider_name()).strip().lower() or _PROVIDER_MOCK
+    if resolved != _PROVIDER_MOCK:
+        raise CloudProviderError(
+            f"unsupported SLIPSTREAM_CLOUD_PROVIDER={resolved!r}; "
+            "only 'mock' is available in this release (real providers later)"
+        )
+    return MockCloudProvider()
+

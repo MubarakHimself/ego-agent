@@ -58,6 +58,8 @@ def session_row(
     keep_alive: bool = False,
     tier: str = "ephemeral",
     risk_label: str | None = None,
+    overflow: bool = False,
+    provider: str | None = None,
     now: float | None = None,
 ) -> dict[str, Any]:
     """One ops session row (safe for JSON; omit watch_url when absent)."""
@@ -71,6 +73,10 @@ def session_row(
         "keep_alive": bool(keep_alive),
         "tier": tier,
     }
+    if overflow:
+        row["overflow"] = True
+        if provider:
+            row["provider"] = provider
     if risk_label:
         row["risk_label"] = risk_label
     if lease_id:

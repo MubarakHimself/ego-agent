@@ -498,8 +498,12 @@ slipstream sessions --json           # includes watch_url when need_human minted
   `space_id` reuses the live process (no relaunch) when the warm handle is
   healthy. Idle eviction and hard-TTL expiry **always** stop Chromium — no
   stale CDP handoff.
-- **Pool full:** hard K=5 → HTTP **503** `pool_full`. Wait/retry or release
-  another lease; do not spawn your own browser.
+- **Pool full:** hard K=5 → HTTP **503** `pool_full` when cloud overflow is **off**
+  (default). Wait/retry or release another lease; do not spawn your own browser.
+- **Cloud overflow (optional):** `SLIPSTREAM_CLOUD_OVERFLOW=1` → on pool full,
+  lease a **mock** remote CDP session behind the **same** `/v1/leases` API
+  (`overflow=true`, `provider=mock`). `=always` skips local Chromium. **No paid
+  keys / no real Browserbase** in this release — real providers later.
 - **Agents never own a permanent browser PID** — only leases.
 
 
@@ -541,7 +545,8 @@ helpers are for smoke/bench when raw CDP is exposed.
 - Use a **unique `agent_id`** per agent/subagent instance.
 - Use a **stable `space_id`** per user goal (reuse after release for warm).
 - On **409** `space_in_use`: wait or pick another Space — never steal.
-- On **503** `pool_full`: backoff or ask the main agent to free a slot.
+- On **503** `pool_full`: backoff or ask the main agent to free a slot
+  (or enable `SLIPSTREAM_CLOUD_OVERFLOW=1` for mock remote overflow).
 - Always **release** on the failure path after you stop retrying.
 - Install this skill and call the `slipstream` CLI via the shell tool.
   Prefer shell + pool HTTP drive (or raw CDP only with EXPOSE_RAW_CDP) over registering a second browser launcher.

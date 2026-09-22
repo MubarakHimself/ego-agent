@@ -10,6 +10,8 @@ Login / 2FA / CAPTCHA that the agent cannot complete must raise
 
 from __future__ import annotations
 
+_K_RESULT = "result"
+
 import json
 import threading
 from dataclasses import dataclass, field
@@ -184,7 +186,7 @@ def _ws_cdp_call(ws_url: str, method: str, params: dict[str, Any] | None = None)
             if msg.get("id") == 1:
                 if "error" in msg:
                     raise CdpInjectError(f"CDP {method} error: {msg['error']}")
-                return msg.get("result")
+                return msg.get(_K_RESULT)
         raise CdpInjectError(f"CDP {method} timed out waiting for result")
     finally:
         try:
@@ -209,8 +211,8 @@ class RealCdpInjector:
                 "returnByValue": True,
             },
         )
-        if isinstance(result, dict) and "result" in result:
-            val = result["result"].get("value")
+        if isinstance(result, dict) and _K_RESULT in result:
+            val = result[_K_RESULT].get("value")
             if isinstance(val, str) and val:
                 return val
         raise CdpInjectError("could not read location.href from page")
@@ -262,8 +264,8 @@ class RealCdpInjector:
                 "returnByValue": True,
             },
         )
-        if isinstance(result, dict) and "result" in result:
-            return result["result"]
+        if isinstance(result, dict) and _K_RESULT in result:
+            return result[_K_RESULT]
         return result
 
     def click_selector(self, cdp_http_url: str, selector: str) -> None:

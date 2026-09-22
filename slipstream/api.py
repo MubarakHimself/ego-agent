@@ -69,7 +69,7 @@ from slipstream.watch import (
     WatchNotFoundError,
 )
 from slipstream.cdp_inject import CdpInjectError
-from slipstream.tiers import AttachDisabledError, TierError
+from slipstream.tiers import AttachDisabledError, CloudProviderError, TierError
 from slipstream.pool import (
     BrowserPool,
     LeaseExpiredError,
@@ -690,6 +690,10 @@ def make_handler(pool: BrowserPool):
                     )
                 except PoolFullError as e:
                     _json_response(self, 503, {"error": "pool_full", "detail": str(e)})
+                except CloudProviderError as e:
+                    _json_response(
+                        self, 503, {"error": "cloud_provider_error", "detail": str(e)}
+                    )
                 except SpaceInUseError as e:
                     _json_response(self, 409, {"error": "space_in_use", "detail": str(e)})
                 except AttachDisabledError as e:
@@ -1019,6 +1023,10 @@ def make_handler(pool: BrowserPool):
                     )
                 except PoolFullError as e:
                     _json_response(self, 503, {"error": "pool_full", "detail": str(e)})
+                except CloudProviderError as e:
+                    _json_response(
+                        self, 503, {"error": "cloud_provider_error", "detail": str(e)}
+                    )
                 except SpaceInUseError as e:
                     _json_response(self, 409, {"error": "space_in_use", "detail": str(e)})
                 except (RuntimeError, OSError) as e:

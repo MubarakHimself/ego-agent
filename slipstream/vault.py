@@ -15,6 +15,10 @@ There is **no** free-read secret API and **no** cookie dump.
 
 from __future__ import annotations
 
+_K_FIELDS = "fields"
+
+_BACKEND_MEMORY = "memory"
+
 import json
 import re
 import os
@@ -315,12 +319,12 @@ def build_secret_backend(
 ) -> tuple[SecretBackend, str]:
     """Pick backend. Returns (backend, name)."""
     if force_memory:
-        return MemorySecretBackend(), "memory"
+        return MemorySecretBackend(), _BACKEND_MEMORY
     if os.environ.get("SLIPSTREAM_VAULT_KEY", "").strip():
         assert_vault_key_allowed(mock=mock)
     if mock and not os.environ.get("SLIPSTREAM_VAULT_KEY"):
         # Mock default: memory (deterministic tests; no OS keyring required)
-        return MemorySecretBackend(), "memory"
+        return MemorySecretBackend(), _BACKEND_MEMORY
 
     kr = _try_import_keyring()
     if kr is not None:
@@ -343,7 +347,7 @@ def build_secret_backend(
                 raise VaultUnavailableError(f"fernet backend failed: {e}") from e
 
     if mock:
-        return MemorySecretBackend(), "memory"
+        return MemorySecretBackend(), _BACKEND_MEMORY
 
     raise VaultUnavailableError(
         "credential vault unavailable: install keyring (preferred) or set "
@@ -549,18 +553,18 @@ def parse_fill_body(body: dict[str, Any]) -> dict[str, Any]:
                 f"refused: fill must not include {bad!r}; pass cred_id + selectors only"
             )
     # Recursive reject on non-fields keys (nested secret dumps)
-    body_for_reject = {k: v for k, v in body.items() if k != "fields"}
+    body_for_reject = {k: v for k, v in body.items() if k != _K_FIELDS}
     try:
         reject_secret_fields(body_for_reject)
     except AlertValidationError as e:
         raise VaultValidationError(str(e)) from e
     # fields values must be strings (selectors), not nested secret objects
-    fields = body.get("fields")
+    fields = body.get(_K_FIELDS)
     if isinstance(fields, dict):
         for _fname, fval in fields.items():
             if isinstance(fval, (dict, list)):
                 try:
-                    reject_secret_fields(fval, path="fields")
+                    reject_secret_fields(fval, path=_K_FIELDS)
                 except AlertValidationError as e:
                     raise VaultValidationError(str(e)) from e
     cred_id = body.get("cred_id")
@@ -577,7 +581,7 @@ def parse_fill_body(body: dict[str, Any]) -> dict[str, Any]:
         if len(selector) > 300:
             raise VaultValidationError(f"selector for {name!r} too long")
         cleaned[name.strip()] = selector.strip()
-    out: dict[str, Any] = {"cred_id": cred_id.strip(), "fields": cleaned}
+    out: dict[str, Any] = {"cred_id": cred_id.strip(), _K_FIELDS: cleaned}
     # Optional post-inject mode (ADV-001): scrub_memory is always applied in pool;
     # pause_cdp is documented / deferred.
     mode = body.get("post_inject")

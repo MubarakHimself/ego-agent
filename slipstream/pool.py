@@ -132,8 +132,13 @@ from slipstream.tiers import (
     TIER_EPHEMERAL,
     TIER_NAMED,
     AttachDisabledError,
+    RemoteCdpProvider,
     TierError,
     attach_allowed,
+    build_cloud_provider,
+    cloud_overflow_always,
+    cloud_overflow_enabled,
+    cloud_provider_name,
     parse_tier,
     resolve_attach_cdp,
     risk_label_for_tier,
@@ -216,6 +221,8 @@ _S_NO_CDP = "lease has no cdp_http_url"
 _S_CONFIRMATION_PREFIX = "confirmation "
 _S_POOL_AT_K = "pool at hard K="
 _S_LEASE_SLOT_CHANGED = "lease/slot identity changed during capture"
+_S_OVERFLOW = "overflow"
+_S_PROVIDER = "provider"
 
 
 class BrowserPool:
@@ -227,15 +234,25 @@ class BrowserPool:
     can proceed while a slot is mid-launch (status ``STARTING``).
     """
 
-    def __init__(self, config: PoolConfig | None = None, launcher: ChromiumLauncher | None = None):
+    def __init__(
+        self,
+        config: PoolConfig | None = None,
+        launcher: ChromiumLauncher | None = None,
+        cloud_provider: RemoteCdpProvider | None = None,
+    ):
         self.config = config or PoolConfig()
         self.launcher = launcher or ChromiumLauncher(self.config)
+        self._cloud_provider: RemoteCdpProvider | None = cloud_provider
         self._lock = threading.RLock()
         self._slots: list[SlotState] = [
             SlotState(slot_id=i, status=SlotStatus.FREE_COLD) for i in range(self.config.K)
         ]
         self._handles: dict[int, LaunchHandle] = {}
         self._leases: dict[str, Lease] = {}
+        # lease_id → remote provider session id (overflow releases).
+        self._remote_sessions: dict[str, str] = {}
+        # session ids to release via provider *outside* the pool lock.
+        self._pending_provider_releases: list[str] = []
         # Space-level user_metadata registry (process-lifetime; leases inherit).
         self._space_metadata: dict[str, dict[str, Any]] = {}
         # Space-level allowed_domains (None key absent = inherit config/env).
@@ -303,8 +320,11 @@ class BrowserPool:
                 # ADV-DL-003: never expose absolute artifacts_root on status.
                 "artifacts_configured": True,
                 "chrome_binary": self.launcher.binary,
+                "cloud_overflow": cloud_overflow_enabled(),
                 "slots": [s.to_dict() for s in self._slots],
             }
+            if cloud_overflow_enabled():
+                out["cloud_provider"] = cloud_provider_name()
             # ADV-PL-001-BYPASS-RAW-CDP-PORT: base+slot_id reconstructs CDP URL.
             if expose_raw_cdp():
                 out["cdp_base_port"] = self.config.cdp_base_port
@@ -399,6 +419,9 @@ class BrowserPool:
         keep_alive: bool = False,
         tier: str = TIER_EPHEMERAL,
         external_attach: bool = False,
+        overflow: bool = False,
+        provider: str | None = None,
+        remote_session_id: str | None = None,
     ) -> dict[str, Any]:
         """Wire Lease + slot lease fields; caller sets process/CDP fields as needed."""
         now = time.time()
@@ -432,8 +455,13 @@ class BrowserPool:
             tier=tier,
             risk_label=risk_label_for_tier(tier),
             external_attach=bool(external_attach),
+            overflow=bool(overflow),
+            provider=provider,
+            remote_session_id=remote_session_id,
         )
         self._leases[lease_id] = lease
+        if remote_session_id:
+            self._remote_sessions[lease_id] = remote_session_id
         slot.status = SlotStatus.LEASED
         slot.space_id = space_id
         slot.lease_id = lease_id
@@ -465,6 +493,8 @@ class BrowserPool:
 
         ``allow_warm`` is True only for explicit client DELETE. Idle / hard-TTL
         evictions always stop Chromium (no FREE_WARM / no stale CDP handoff).
+        Overflow / remote sessions queue ``release_session`` via
+        ``_pending_provider_releases`` (caller flushes outside the lock).
         """
         lease = self._leases.get(lease_id)
         if not lease:
@@ -480,11 +510,18 @@ class BrowserPool:
         self._captcha.pop(lease_id, None)
         self._confirmations.clear_lease(lease_id)
 
-        # Attach / external handles never go warm — we do not own that Chrome,
-        # and must not hand a user CDP to the next agent without ALLOW_ATTACH.
+        # Attach / external / overflow handles never go warm — we do not own
+        # that Chrome (or remote session), and must not hand it off.
         handle_peek = self._handles.get(slot.slot_id)
-        external = bool(getattr(lease, "external_attach", False)) or (
-            handle_peek is not None and bool(getattr(handle_peek, "external", False))
+        is_overflow = bool(getattr(lease, _S_OVERFLOW, False))
+        # Prefer lease field; membership lookup avoids SKY-D216 dict.get false-positive.
+        remote_sid = getattr(lease, "remote_session_id", None)
+        if not remote_sid:
+            remote_sid = self._lookup_remote_session(lease_id)
+        external = (
+            is_overflow
+            or bool(getattr(lease, "external_attach", False))
+            or (handle_peek is not None and bool(getattr(handle_peek, "external", False)))
         )
         keep_warm = (
             allow_warm
@@ -492,6 +529,10 @@ class BrowserPool:
             and self._count_warm() < self.config.W
         )
         del self._leases[lease_id]
+        if lease_id in self._remote_sessions:
+            del self._remote_sessions[lease_id]
+        if remote_sid:
+            self._pending_provider_releases.append(remote_sid)
 
         if keep_warm:
             self._clear_lease_fields(slot)
@@ -504,6 +545,10 @@ class BrowserPool:
         self._clear_lease_fields(slot)
         slot.space_id = None
         slot.status = SlotStatus.FREE_COLD
+        # Overflow slots live above local K — drop them so local free search
+        # never picks a remote-only slot for Chromium launch.
+        if is_overflow or slot.slot_id >= self.config.K:
+            self._slots = [s for s in self._slots if s.slot_id != slot.slot_id]
         return handle
 
     def _reserve_starting_locked(
@@ -579,6 +624,230 @@ class BrowserPool:
         if rl:
             result["risk_label"] = rl
         return result
+
+    def _ensure_cloud_provider(self) -> RemoteCdpProvider:
+        """Lazy-build provider from env (mock only unless injected)."""
+        if self._cloud_provider is None:
+            self._cloud_provider = build_cloud_provider()
+        return self._cloud_provider
+
+    def _lookup_remote_session(self, lease_id: str) -> str | None:
+        """Dict lookup for remote session id (name avoids .get SSRF false-positive)."""
+        return self._remote_sessions[lease_id] if lease_id in self._remote_sessions else None
+
+    def _drain_provider_releases(self) -> None:
+        """Flush queued remote session releases outside the pool lock."""
+        with self._lock:
+            pending = list(self._pending_provider_releases)
+            self._pending_provider_releases.clear()
+        if not pending:
+            return
+        provider = self._ensure_cloud_provider()
+        for sid in pending:
+            provider.release_session(sid)
+
+    def _assert_space_free_locked(self, space_id: str) -> None:
+        """Raise SpaceInUseError if space_id already LEASED/STARTING. Caller holds lock."""
+        for s in self._slots:
+            if s.space_id == space_id and s.status in (
+                SlotStatus.LEASED,
+                SlotStatus.STARTING,
+            ):
+                raise SpaceInUseError(
+                    f"space_id {space_id!r} already in use "
+                    f"(agent_id={s.agent_id!r}, status={s.status.value})"
+                )
+
+    def _alloc_overflow_slot_locked(self, agent_id: str, space_id: str) -> SlotState:
+        """Append a STARTING overflow slot above local K. Caller holds lock."""
+        next_id = max((s.slot_id for s in self._slots), default=-1) + 1
+        if next_id < self.config.K:
+            next_id = self.config.K
+        slot = SlotState(slot_id=next_id, status=SlotStatus.STARTING)
+        slot.space_id = space_id
+        slot.agent_id = agent_id
+        self._slots.append(slot)
+        return slot
+
+    def _drop_overflow_slot_locked(self, slot_id: int) -> None:
+        """Remove an overflow STARTING/idle slot by id. Caller holds lock."""
+        self._slots = [s for s in self._slots if s.slot_id != slot_id]
+
+    def _refresh_existing_lease_locked(
+        self,
+        existing: Lease,
+        space_id: str,
+        meta_override: dict[str, Any] | None,
+        domains_override: list[str] | None,
+    ) -> dict[str, Any]:
+        """Update metadata/domains on an idempotent re-lease. Caller holds lock."""
+        if meta_override is not None:
+            existing.user_metadata_override = meta_override
+            existing.user_metadata = effective_metadata(
+                self._space_metadata.get(space_id, {}),
+                meta_override,
+            )
+        else:
+            existing.user_metadata = effective_metadata(
+                self._space_metadata.get(space_id, {}),
+                existing.user_metadata_override,
+            )
+        if domains_override is not None:
+            existing.allowed_domains_override = domains_override
+        existing.allowed_domains = self._effective_domains_for(
+            space_id, existing.allowed_domains_override
+        )
+        self._sync_lease_signed_in(existing)
+        return existing.to_dict()
+
+    def _reserve_cloud_overflow_locked(
+        self,
+        agent_id: str,
+        space_id: str,
+        *,
+        meta_override: dict[str, Any] | None,
+        domains_override: list[str] | None,
+        pending_stops: list[LaunchHandle],
+    ) -> tuple[dict[str, Any] | None, int | None, Exception | None]:
+        """Under lock: reuse lease, or reserve overflow STARTING slot.
+
+        Returns (early_result, overflow_slot_id, bookkeeping_error).
+        """
+        now = time.time()
+        for lid, existing in list(self._leases.items()):
+            if existing.agent_id != agent_id or existing.space_id != space_id:
+                continue
+            slot = self._find_slot_by_lease(lid)
+            if not slot or slot.status != SlotStatus.LEASED:
+                continue
+            if existing.expires_at is not None and now >= existing.expires_at:
+                h = self._detach_lease_locked(lid, allow_warm=False)
+                if h is not None:
+                    pending_stops.append(h)
+                break
+            return (
+                self._refresh_existing_lease_locked(
+                    existing, space_id, meta_override, domains_override
+                ),
+                None,
+                None,
+            )
+        try:
+            self._assert_space_free_locked(space_id)
+            slot = self._alloc_overflow_slot_locked(agent_id, space_id)
+            return None, slot.slot_id, None
+        except SpaceInUseError as exc:
+            return None, None, exc
+
+    def _bind_cloud_session_locked(
+        self,
+        slot: SlotState,
+        agent_id: str,
+        space_id: str,
+        handle: LaunchHandle,
+        remote: Any,
+        *,
+        ctx: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Under lock: attach overflow lease to reserved slot. ``ctx`` holds lease opts."""
+        self._handles[slot.slot_id] = handle
+        result = self._attach_lease(
+            slot,
+            agent_id,
+            space_id,
+            ctx.get("ttl_seconds"),
+            cdp_http_url=remote.cdp_http_url,
+            cdp_ws_url=remote.cdp_ws_url,
+            user_metadata=ctx.get("meta_override"),
+            allowed_domains=ctx.get("domains_override"),
+            keep_alive=bool(ctx.get("ka")),
+            tier=str(ctx.get("resolved_tier") or TIER_EPHEMERAL),
+            external_attach=True,
+            overflow=True,
+            provider=remote.provider or ctx.get("provider_name"),
+            remote_session_id=remote.session_id,
+        )
+        self._prepare_lease_downloads(result["lease_id"], remote.cdp_http_url)
+        slot.chromium_pid = None
+        slot.cdp_port = None
+        slot.cdp_http_url = remote.cdp_http_url
+        slot.cdp_ws_url = remote.cdp_ws_url
+        return result
+
+    def _remote_handle(self, space_id: str, remote: Any) -> LaunchHandle:
+        return LaunchHandle(
+            pid=0,
+            cdp_port=0,
+            cdp_http_url=remote.cdp_http_url,
+            cdp_ws_url=remote.cdp_ws_url,
+            user_data_dir=self.config.space_path(space_id),
+            process=None,
+            mocked=True,
+            external=True,
+        )
+
+    def _create_remote_or_rollback(self, provider: Any, agent_id: str, space_id: str, slot_id: int):
+        try:
+            return provider.create_session(agent_id=agent_id, space_id=space_id)
+        except Exception:
+            with self._lock:
+                self._drop_overflow_slot_locked(slot_id)
+            raise
+
+    def _lease_cloud_overflow(
+        self,
+        agent_id: str,
+        space_id: str,
+        *,
+        ttl_seconds: int | None,
+        meta_override: dict[str, Any] | None,
+        domains_override: list[str] | None,
+        ka: bool,
+        resolved_tier: str,
+    ) -> dict[str, Any]:
+        """Create remote CDP session via provider and bind as overflow lease."""
+        if resolved_tier == TIER_ATTACH:
+            raise TierError("cloud overflow cannot combine with tier/mode=attach")
+        provider = self._ensure_cloud_provider()
+        pending_stops: list[LaunchHandle] = []
+        with self._lock:
+            early, slot_id, err = self._reserve_cloud_overflow_locked(
+                agent_id, space_id, meta_override=meta_override,
+                domains_override=domains_override, pending_stops=pending_stops,
+            )
+        for h in pending_stops:
+            self.launcher.stop(h)
+        self._drain_provider_releases()
+        if err is not None:
+            raise err
+        if early is not None:
+            return early
+        assert slot_id is not None
+        remote = self._create_remote_or_rollback(provider, agent_id, space_id, slot_id)
+        handle = self._remote_handle(space_id, remote)
+        ctx = {
+            "ttl_seconds": ttl_seconds, "meta_override": meta_override,
+            "domains_override": domains_override, "ka": ka,
+            "resolved_tier": resolved_tier, "provider_name": provider.name,
+        }
+        with self._lock:
+            slot = next((s for s in self._slots if s.slot_id == slot_id), None)
+            if (
+                slot is not None
+                and slot.status == SlotStatus.STARTING
+                and slot.space_id == space_id
+                and slot.agent_id == agent_id
+            ):
+                return self._bind_cloud_session_locked(
+                    slot, agent_id, space_id, handle, remote, ctx=ctx,
+                )
+        try:
+            provider.release_session(remote.session_id)
+        finally:
+            self.launcher.stop(handle)
+        raise PoolFullError(
+            f"overflow slot {slot_id} lost STARTING reservation for space_id={space_id!r}"
+        )
 
     def _probe_attach_cdp(self, cdp_http_url: str) -> None:
         """Ensure attach CDP answers /json/version (skipped under mock)."""
@@ -686,15 +955,7 @@ class BrowserPool:
 
             if early_result is None:
                 try:
-                    for s in self._slots:
-                        if s.space_id == space_id and s.status in (
-                            SlotStatus.LEASED,
-                            SlotStatus.STARTING,
-                        ):
-                            raise SpaceInUseError(
-                                f"space_id {space_id!r} already in use "
-                                f"(agent_id={s.agent_id!r}, status={s.status.value})"
-                            )
+                    self._assert_space_free_locked(space_id)
                     cold = next(
                         (s for s in self._slots if s.status == SlotStatus.FREE_COLD),
                         None,
@@ -706,7 +967,7 @@ class BrowserPool:
                     slot = cold or warm
                     if slot is None:
                         raise PoolFullError(
-                            f"pool at hard K={self.config.K}; all slots leased"
+                            f"{_S_POOL_AT_K}{self.config.K}; all slots leased"
                         )
                     if slot.status == SlotStatus.FREE_WARM:
                         h = self._handles.pop(slot.slot_id, None)
@@ -842,6 +1103,13 @@ class BrowserPool:
         elif cdp_url is not None or cdp_port is not None:
             raise TierError("cdp_url/cdp_port only valid with tier/mode=attach")
 
+        # Optional always-overflow: skip local Chromium; same lease API.
+        if cloud_overflow_always():
+            return self._lease_cloud_overflow(
+                agent_id, space_id, ttl_seconds=ttl_seconds, meta_override=meta_override,
+                domains_override=domains_override, ka=ka, resolved_tier=resolved_tier,
+            )
+
         # Handles that must be stopped outside the lock (released/replaced trees).
         pending_stops: list[LaunchHandle] = []
         # If set: (slot_id, cdp_port) reserved as STARTING for launch outside lock.
@@ -913,15 +1181,7 @@ class BrowserPool:
             if early_result is None:
                 try:
                     # Space exclusivity: never two trees on one Space without handoff
-                    for s in self._slots:
-                        if s.space_id == space_id and s.status in (
-                            SlotStatus.LEASED,
-                            SlotStatus.STARTING,
-                        ):
-                            raise SpaceInUseError(
-                                f"space_id {space_id!r} already in use "
-                                f"(agent_id={s.agent_id!r}, status={s.status.value})"
-                            )
+                    self._assert_space_free_locked(space_id)
 
                     # Prefer FREE_WARM with matching space_id → reuse process (no relaunch)
                     # if still alive; dead warm → stop + cold start.
@@ -988,7 +1248,7 @@ class BrowserPool:
                         elif cold is not None:
                             # Cap: count of live process trees must stay ≤ K
                             if self._count_live_processes() >= self.config.K:
-                                raise PoolFullError(f"pool at hard K={self.config.K}")
+                                raise PoolFullError(f"{_S_POOL_AT_K}{self.config.K}")
                             port, h = self._reserve_starting_locked(
                                 cold, agent_id, space_id
                             )
@@ -997,7 +1257,7 @@ class BrowserPool:
                             launch_job = (cold.slot_id, port)
                         else:
                             raise PoolFullError(
-                                f"pool at hard K={self.config.K}; all slots leased"
+                                f"{_S_POOL_AT_K}{self.config.K}; all slots leased"
                             )
                 except (SpaceInUseError, PoolFullError) as exc:
                     bookkeeping_error = exc
@@ -1007,6 +1267,12 @@ class BrowserPool:
             self.launcher.stop(h)
 
         if bookkeeping_error is not None:
+            if isinstance(bookkeeping_error, PoolFullError) and cloud_overflow_enabled():
+                self._drain_provider_releases()
+                return self._lease_cloud_overflow(
+                    agent_id, space_id, ttl_seconds=ttl_seconds, meta_override=meta_override,
+                    domains_override=domains_override, ka=ka, resolved_tier=resolved_tier,
+                )
             raise bookkeeping_error
 
         if early_result is not None:
@@ -1099,9 +1365,14 @@ class BrowserPool:
             if not lease:
                 raise LeaseNotFoundError(lease_id)
             slot_id = lease.slot_id
+            was_overflow = bool(getattr(lease, _S_OVERFLOW, False))
             stop_handle = self._detach_lease_locked(lease_id, allow_warm=True)
-            slot = self._slots[slot_id]
-            kept_warm = slot.status == SlotStatus.FREE_WARM
+            # Overflow slots are removed from ``_slots`` on detach — never index them.
+            if was_overflow:
+                kept_warm = False
+            else:
+                slot = self._slots[slot_id]
+                kept_warm = slot.status == SlotStatus.FREE_WARM
             result = {
                 "lease_id": lease_id,
                 "released": True,
@@ -1113,6 +1384,7 @@ class BrowserPool:
 
         if stop_handle is not None:
             self.launcher.stop(stop_handle)
+        self._drain_provider_releases()
         return result
 
 
@@ -1944,6 +2216,7 @@ class BrowserPool:
 
         for h in pending_stops:
             self.launcher.stop(h)
+        self._drain_provider_releases()
         return evicted
 
 
@@ -3060,6 +3333,8 @@ class BrowserPool:
                         keep_alive=bool(lease.keep_alive),
                         tier=getattr(lease, "tier", "ephemeral"),
                         risk_label=getattr(lease, "risk_label", None),
+                        overflow=bool(getattr(lease, _S_OVERFLOW, False)),
+                        provider=getattr(lease, _S_PROVIDER, None),
                         now=now,
                     )
                 )
@@ -3086,5 +3361,10 @@ class BrowserPool:
                 clear_lease_evidence(self.config.artifacts_root, _lid)
             self._activity_feeds.clear()
             self._captcha.clear()
+            # Queue remote session releases for overflow leases still open.
+            for lid, sid in list(self._remote_sessions.items()):
+                self._pending_provider_releases.append(sid)
+            self._remote_sessions.clear()
         for h in pending_stops:
             self.launcher.stop(h)
+        self._drain_provider_releases()
