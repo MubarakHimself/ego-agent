@@ -142,7 +142,7 @@ Request must **not** include `watch_url` or `status` — both are server-derived
 Lease-scoped append-only event log beside the Watch JPEG (CTO cut `activity-feed-007` / EgoRuntime `activity-feed-001`).
 
 - `GET /v1/leases/{id}/watch/events?token=…&after_seq=0` — JSON `{lease_id, events:[{seq,ts,kind,summary,outcome,detail}]}`
-- Kinds: `navigate`, `click`, `type`, `fill`, `alert`, `confirm` (timestamp + safe summary + outcome)
+- Kinds: `navigate`, `click`, `type`, `fill`, `alert`, `confirm`, `captcha` (timestamp + safe summary + outcome)
 - Same watch token TTL/revoke as Watch HTML/frame — stale/revoked → `410`; bad token → `401`
 - Secrets redacted: no cookies/passwords/tokens/vault/CDP auth; `type`/`fill` expose lengths/labels only
 - Bounded ring buffer (no replay/edit). Soft browse stays free; feed is observe opacity for captain
@@ -368,6 +368,44 @@ slipstream cred unbind --space-id "$S" --cred-id "$C"
 
 Env: `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_VAULT_KEY` (mock/tests; or `SLIPSTREAM_ALLOW_VAULT_KEY=1`), `SLIPSTREAM_ALLOW_SECRET_ARGV=1`, optional extras `pip install 'slipstream[vault]'` / `'slipstream[cdp]'`.
 
+
+### CAPTCHA chips (ui-peers §5.11)
+
+Thin solve-status chips on the alerts/activity bus (Browserbase-style
+`captcha_solving_started|finished|failed`). **No paid captcha-solve SaaS** —
+optional client stub / detect hook reports events. Unsolved (explicit `failed`
+or timeout) escalates to **`need_human`** (`reason=captcha`) with Watch /
+Take-over via the existing alerts spine.
+
+```
+POST /v1/leases/{lease_id}/captcha
+{
+  "event": "started" | "finished" | "failed",
+  // aliases: captcha_solving_started|finished|failed
+  "detail": "optional non-secret note",
+  "provider": "optional stub label",
+  "timeout_s": 60
+}
+→ 200 {
+  "lease_id",
+  "captcha": { "state": "solving|solved|failed|escalated", "event", "detail",
+               "timeout_s", "escalated", "started_at?", "timeout_remaining_s?" },
+  "alert"?:   { …need_human payload… },   // only on fail / timeout escalate
+  "harness"?: { …pause + watch_url + takeover_url… }
+}
+```
+
+| Event | State | need_human? |
+|-------|-------|-------------|
+| `started` / `captcha_solving_started` | `solving` | No — chip on Watch/activity |
+| `finished` / `captcha_solving_finished` | `solved` | **No** |
+| `failed` / `captcha_solving_failed` | `failed` → `escalated` | **Yes** (`reason=captcha`) |
+| timeout while `solving` (`SLIPSTREAM_CAPTCHA_TIMEOUT`, default 60s; checked on heartbeat / Watch) | `escalated` | **Yes** |
+
+Secrets refused (same denylist as alerts). Watch HTML shows a high-salience
+chip/banner when state is solving or failed/escalated. Activity feed kind
+`captcha`. CLI: `slipstream captcha started|finished|failed --lease-id …`.
+
 ### Ops session list (thin)
 
 Browserbase-style **fleet / ops list** (ui-peers steal #7). Joins active leases with status, duration, tags, signed-in badge, and **watch_url only when a valid tokenized Watch already exists** (need_human / awaiting_human). Treat `watch_url` as a screen-share secret — never log it; do not invent long-lived public URLs.
@@ -388,7 +426,7 @@ GET /v1/ops/
 
 CLI: `slipstream sessions` (table; watch presence only) · `slipstream sessions --json` (includes tokenized URLs).
 
-**Not included:** CAPTCHA chips, downloads product, full dashboard WS, Monid, Electron, MCP.
+**Not included here:** downloads product, full dashboard WS, Monid, Electron, MCP. CAPTCHA chips: see below.
 
 ### `DELETE /v1/leases/{lease_id}`
 

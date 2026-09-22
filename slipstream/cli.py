@@ -243,6 +243,31 @@ def cmd_alert(
     return 0
 
 
+def cmd_captcha(
+    *,
+    event: str,
+    lease_id: str,
+    detail: str | None = None,
+    provider: str | None = None,
+    timeout_s: int | None = None,
+    url: str | None = None,
+) -> int:
+    """POST /v1/leases/{id}/captcha — started|finished|failed chip events."""
+    base = resolve_base_url(url)
+    body: dict[str, Any] = {"event": event, "detail": detail or ""}
+    if provider:
+        body["provider"] = provider
+    if timeout_s is not None:
+        body["timeout_s"] = timeout_s
+    status, payload = _request(
+        "POST", f"{base}{_PATH_LEASES}{lease_id}/captcha", body
+    )
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0
+
+
 def resolve_secret(
     *,
     secret: str | None = None,

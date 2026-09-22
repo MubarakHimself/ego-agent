@@ -17,6 +17,18 @@ from slipstream.alerts import (
     parse_alert_request,
 )
 from slipstream.activity_feed import LeaseActivityFeed, safe_url_summary
+from slipstream.captcha import (
+    EVENT_FAILED,
+    REASON_TIMEOUT,
+    STATE_FAILED,
+    CaptchaState,
+    apply_captcha_event,
+    captcha_banner_html,
+    captcha_chip_html,
+    feed_outcome_for_event,
+    mark_escalated,
+    parse_captcha_request,
+)
 
 # ADV-FEED-001: key names safe to echo in feed summary (non-printable secret path).
 _FEED_SAFE_KEY_NAMES = frozenset(
@@ -47,6 +59,7 @@ _KEY_SIGNED_IN_HOST = "signed_in_host"
 _KEY_WATCH_URL = "watch_url"
 _KEY_DURATION_S = "duration_s"
 _EVT_ALERT = "alert"
+_EVT_CAPTCHA = "captcha"
 from slipstream.watch import (
     WatchAuthError,
     WatchCaptureError,
@@ -168,6 +181,8 @@ class BrowserPool:
         self._watches: dict[str, WatchSession] = {}
         # Lease-scoped Watch activity feed (CTO-007); bounded + scrubbed.
         self._activity_feeds: dict[str, LeaseActivityFeed] = {}
+        # CAPTCHA chip state (ui-peers §5.11); cleared on lease detach.
+        self._captcha: dict[str, CaptchaState] = {}
         self._api_base_url: str = f"http://{self.config.host}:{self.config.port}"
         # Ensure spaces root exists
         self.config.spaces_root.mkdir(parents=True, exist_ok=True)
@@ -367,6 +382,7 @@ class BrowserPool:
         sess = self._lookup_watch(lease_id)
         if sess is not None:
             self._invalidate_pair_browse_locked(sess, revoke=True)
+        self._captcha.pop(lease_id, None)
 
         keep_warm = allow_warm and self._count_warm() < self.config.W
         del self._leases[lease_id]
@@ -659,6 +675,13 @@ class BrowserPool:
         if expired:
             raise LeaseExpiredError(lease_id)
         assert result is not None
+        # Unsolved CAPTCHA timeout → need_human (alerts spine); best-effort.
+        try:
+            esc = self._escalate_captcha_timeout_if_needed(lease_id)
+            if esc is not None:
+                result["captcha_escalated"] = True
+        except (LeaseNotFoundError, AlertConflictError):
+            pass
         return result
 
     def release(self, lease_id: str, reason: str = "client_release") -> dict[str, Any]:
@@ -901,6 +924,170 @@ class BrowserPool:
             self.launcher.stop(stop_handle)
         return envelope
 
+
+    # --- CAPTCHA chips (ui-peers §5.11) ---------------------------------
+
+
+    def _watch_captcha_ui_locked(
+        self, lease_id: str
+    ) -> tuple[str, str, bool]:
+        """Caller holds lock. Return (chip_html, banner_html, needs_timeout_esc)."""
+        cap_state = self._captcha.get(lease_id)
+        needs = bool(
+            cap_state is not None
+            and not cap_state.escalated
+            and cap_state.is_timed_out()
+        )
+        return captcha_chip_html(cap_state), captcha_banner_html(cap_state), needs
+
+    def _maybe_escalate_captcha_timeout(
+        self, lease_id: str, needs: bool
+    ) -> None:
+        if not needs:
+            return
+        try:
+            self._escalate_captcha_timeout_if_needed(lease_id)
+        except (LeaseNotFoundError, AlertConflictError):
+            pass
+
+    def report_captcha(self, lease_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Client/stub CAPTCHA lifecycle → activity feed + optional need_human."""
+        parsed = parse_captcha_request(body)
+        event = parsed["event"]
+        escalate = False
+        escalate_detail = ""
+
+        with self._lock:
+            self._require_leased(lease_id)
+            state = self._captcha_state_locked(lease_id)
+            apply_captcha_event(
+                state,
+                event=event,
+                detail=parsed["detail"],
+                provider=parsed.get("provider"),
+                timeout_s=parsed["timeout_s"],
+            )
+            self._record_captcha_bus_locked(lease_id, state, event=event)
+            if event == EVENT_FAILED and not state.escalated:
+                escalate = True
+                escalate_detail = parsed["detail"] or "CAPTCHA solve failed"
+            public = state.to_public()
+
+        return self._captcha_response(
+            lease_id,
+            public,
+            escalate=escalate,
+            escalate_detail=escalate_detail,
+        )
+
+    def _require_leased(self, lease_id: str) -> Lease:
+        """Caller holds lock. Raise LeaseNotFoundError if lease/slot not LEASED."""
+        lease = self._leases.get(lease_id)
+        slot = self._find_slot_by_lease(lease_id) if lease else None
+        if not lease or not slot or slot.status != SlotStatus.LEASED:
+            raise LeaseNotFoundError(lease_id)
+        return lease
+
+    def _captcha_state_locked(self, lease_id: str) -> CaptchaState:
+        state = self._captcha.get(lease_id)
+        if state is None:
+            state = CaptchaState()
+            self._captcha[lease_id] = state
+        return state
+
+    def _record_captcha_bus_locked(
+        self,
+        lease_id: str,
+        state: CaptchaState,
+        *,
+        event: str,
+        outcome: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        lease = self._leases[lease_id]
+        detail = {"event": event, "state": state.state}
+        if state.provider:
+            detail["provider"] = state.provider
+        if extra:
+            detail.update(extra)
+        self._feed_for(lease_id).append(
+            _EVT_CAPTCHA,
+            event,
+            outcome=outcome or feed_outcome_for_event(event),
+            detail=detail,
+        )
+        row: dict[str, Any] = {
+            "event": event,
+            "lease_id": lease_id,
+            "space_id": lease.space_id,
+            "detail": state.detail,
+            "state": state.state,
+            "ts": time.time(),
+        }
+        if extra:
+            row.update(extra)
+        self._alert_log.setdefault(lease_id, []).append(row)
+
+    def _captcha_response(
+        self,
+        lease_id: str,
+        public: dict[str, Any],
+        *,
+        escalate: bool,
+        escalate_detail: str,
+    ) -> dict[str, Any]:
+        out: dict[str, Any] = {"lease_id": lease_id, "captcha": public}
+        if not escalate:
+            return out
+        envelope = self.raise_alert(
+            lease_id,
+            {
+                "event": EVENT_NEED_HUMAN,
+                "reason": "captcha",
+                "detail": escalate_detail or "CAPTCHA unsolved",
+            },
+        )
+        with self._lock:
+            st = self._captcha.get(lease_id)
+            if st is not None:
+                mark_escalated(st)
+                out["captcha"] = st.to_public()
+        out["alert"] = envelope["alert"]
+        out["harness"] = envelope["harness"]
+        return out
+
+    def _escalate_captcha_timeout_if_needed(
+        self, lease_id: str
+    ) -> dict[str, Any] | None:
+        """If solving past timeout, raise need_human once. Returns envelope or None."""
+        detail = "CAPTCHA solve timed out"
+        with self._lock:
+            state = self._captcha.get(lease_id)
+            if state is None or state.escalated or not state.is_timed_out():
+                return None
+            state.state = STATE_FAILED
+            detail = state.detail or detail
+            self._record_captcha_bus_locked(
+                lease_id,
+                state,
+                event=EVENT_FAILED,
+                outcome=REASON_TIMEOUT,
+                extra={"reason": REASON_TIMEOUT},
+            )
+
+        envelope = self.raise_alert(
+            lease_id,
+            {
+                "event": EVENT_NEED_HUMAN,
+                "reason": "captcha",
+                "detail": detail,
+            },
+        )
+        with self._lock:
+            st = self._captcha.get(lease_id)
+            if st is not None:
+                mark_escalated(st)
+        return envelope
 
     # --- permission ladder (confirm-actions) ---------------------------
 
@@ -1291,32 +1478,34 @@ class BrowserPool:
             badge = badge_from_registry(
                 self._space_signed_in.get(space_id) if space_id else None
             )
-        frame = frame_path(lease_id, tok)
-        confirm = confirm_path(lease_id, tok) if mode == "takeover" else None
-        in_url = input_path(lease_id, tok) if enabled else None
-        cede = cede_path(lease_id, tok) if (mode == "takeover" and enabled) else None
-        events = events_path(lease_id, tok)
-        mark_url = (
-            f"/v1/leases/{lease_id}/watch/mark-signed-in?token={tok}"
-            if mode == "takeover"
-            else None
-        )
+            chip_html, banner_html, needs_timeout_esc = self._watch_captcha_ui_locked(
+                lease_id
+            )
+        self._maybe_escalate_captcha_timeout(lease_id, needs_timeout_esc)
         body = render_watch_html(
             lease_id=lease_id,
             reason=reason,
             detail=detail,
-            frame_url=frame,
-            confirm_url=confirm,
+            frame_url=frame_path(lease_id, tok),
+            confirm_url=confirm_path(lease_id, tok) if mode == "takeover" else None,
             mode=mode,
             expires_in_s=expires_in,
             takeover_confirmed=confirmed,
             input_enabled=enabled,
-            input_url=in_url,
-            cede_url=cede,
-            events_url=events,
+            input_url=input_path(lease_id, tok) if enabled else None,
+            cede_url=(
+                cede_path(lease_id, tok) if (mode == "takeover" and enabled) else None
+            ),
+            events_url=events_path(lease_id, tok),
             signed_in=bool(badge.get("signed_in")),
             signed_in_host=badge.get(_KEY_SIGNED_IN_HOST),
-            mark_signed_in_url=mark_url,
+            mark_signed_in_url=(
+                f"/v1/leases/{lease_id}/watch/mark-signed-in?token={tok}"
+                if mode == "takeover"
+                else None
+            ),
+            captcha_chip=chip_html,
+            captcha_banner=banner_html,
         )
         return "text/html; charset=utf-8", body
 
@@ -1954,5 +2143,6 @@ class BrowserPool:
             self._watches.clear()
             self._watch_input_log.clear()
             self._activity_feeds.clear()
+            self._captcha.clear()
         for h in pending_stops:
             self.launcher.stop(h)

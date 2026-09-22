@@ -225,7 +225,7 @@ Keep **interactive web** (forms, QA, login, CDP automation) on a Slipstream
 **Space lease**. Live human observe of a leased page is Slipstream’s tokenized
 Watch JPEG/HTML (`need_human`) — that is **not** the Claude `/watch` skill.
 
-**Activity feed (Watch dock):** the Watch page shows a chronological lease-scoped action feed beside the live JPEG (`navigate` / `click` / `type` / `fill` / `alert` / `confirm`). Poll `GET …/watch/events?token=…` (same token TTL/revoke as Watch → 410). Entries are scrubbed — never cookies, passwords, typed text, vault, or CDP auth (`type`/`fill` → length/labels only). Soft browse remains free; feed is captain observe opacity. Reuses the alerts bus for `need_human` / `task_done` (no second notification path).
+**Activity feed (Watch dock):** the Watch page shows a chronological lease-scoped action feed beside the live JPEG (`navigate` / `click` / `type` / `fill` / `alert` / `confirm` / `captcha`). Poll `GET …/watch/events?token=…` (same token TTL/revoke as Watch → 410). Entries are scrubbed — never cookies, passwords, typed text, vault, or CDP auth (`type`/`fill` → length/labels only). Soft browse remains free; feed is captain observe opacity. Reuses the alerts bus for `need_human` / `task_done` (no second notification path).
 
 
 ### Install upstream `/watch`
@@ -264,6 +264,28 @@ slipstream watch-status --json
 - Do **not** copy `watch.py` / `download.py` / `frames.py` into this repo
 - Do **not** call Monid or paid tool marketplaces for video
 - Do **not** treat Slipstream pool HTTP as a video API
+
+
+## CAPTCHA chips (§5.11)
+
+Report solve lifecycle (no paid SaaS). Unsolved → `need_human` + Watch.
+
+```bash
+# Detect / stub started — high-salience chip on activity + Watch (when open)
+slipstream captcha started --lease-id "$LEASE_ID" --detail "challenge visible"
+# Solved locally / by human — does NOT raise need_human
+slipstream captcha finished --lease-id "$LEASE_ID"
+# Explicit fail — escalates need_human(reason=captcha) with Watch/Take-over
+slipstream captcha failed --lease-id "$LEASE_ID" --detail "unsolved"
+
+# HTTP
+curl -sS -X POST "$SLIPSTREAM_URL/v1/leases/$LEASE_ID/captcha" \
+  -H 'content-type: application/json' \
+  -d '{"event":"started","detail":"recaptcha"}'
+```
+
+Timeout: `SLIPSTREAM_CAPTCHA_TIMEOUT` (default 60s) while `solving` → escalate on
+heartbeat / Watch. Secrets refused. No Monid / 2captcha / anti-captcha wiring.
 
 ## Alerts (need_human + task_done)
 
@@ -500,7 +522,7 @@ slipstream cred    bind|unbind|list|fill …
 - No Monid / paid marketplace.
 - No MCP server (skill+CLI+HTTP only).
 - No free-read of Space cookies / credential dumps.
-- Simultaneous human+agent drive, pair-browse UI polish, optional stuck/captcha chips
+- Simultaneous human+agent drive, pair-browse UI polish, downloads-as-session-artifacts
   lock are **later**.
 - Compose `/watch` remains upstream (see **Compose /watch**; doctor WARN if
   missing). Alerts, credential vault/fill, confirm-actions, domain allowlist

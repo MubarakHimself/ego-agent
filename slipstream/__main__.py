@@ -26,6 +26,9 @@ _OPT_TAG = "--tag"
 _OPT_JSON = "--json"
 _DEST_AS_JSON = "as_json"
 _HANDLER_SESSIONS = "sessions"
+_HANDLER_CAPTCHA = "captcha"
+_OPT_DETAIL = "--detail"
+_HELP_DETAIL = "Short non-secret detail"
 
 import argparse
 import signal
@@ -37,6 +40,7 @@ from slipstream.cli import (
     DEFAULT_URL,
     cmd_act,
     cmd_alert,
+    cmd_captcha,
     cmd_confirm,
     cmd_cred_bind,
     cmd_cred_fill,
@@ -198,6 +202,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Raise need_human (pause, keep lease) or task_done (notify + release)",
     )
     _add_url(p_alert)
+
     p_alert.add_argument(
         "kind",
         choices=["need-human", "done"],
@@ -209,7 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="need_human reason: captcha|login|ambiguous_ui|stuck|other",
     )
-    p_alert.add_argument("--detail", default=None, help="Short human-safe detail")
+    p_alert.add_argument(_OPT_DETAIL, default=None, help=_HELP_DETAIL)
     p_alert.add_argument("--task-id", default=None, help="Optional harness task id")
     p_alert.add_argument(
         "--ttl-s",
@@ -228,6 +233,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="task_done: short outcome summary (no secrets)",
     )
     p_alert.set_defaults(_handler="alert")
+
+    p_cap = sub.add_parser(
+        _HANDLER_CAPTCHA,
+        help="CAPTCHA chip: started|finished|failed (escalate unsolved → need_human)",
+    )
+    p_cap.add_argument(
+        "event",
+        choices=["started", "finished", "failed"],
+        help="solving lifecycle (aliases: captcha_solving_*)",
+    )
+    p_cap.add_argument(_OPT_LEASE_ID, required=True, help="Lease id from lease JSON")
+    p_cap.add_argument(_OPT_DETAIL, default=None, help=_HELP_DETAIL)
+    p_cap.add_argument(
+        "--provider",
+        default=None,
+        help="Optional stub/detect label (not a paid SaaS integration)",
+    )
+    p_cap.add_argument(
+        "--timeout-s",
+        type=int,
+        default=None,
+        help="Unsolved escalate timeout (default SLIPSTREAM_CAPTCHA_TIMEOUT=60)",
+    )
+    _add_url(p_cap)
+    p_cap.set_defaults(_handler=_HANDLER_CAPTCHA)
 
 
     # --- cred (bind/unbind/list/fill) ---
@@ -401,7 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_url(p_sp_lo)
     p_sp_lo.add_argument(_OPT_SPACE_ID, required=True, help="Space id")
     p_sp_lo.add_argument("--agent-id", required=True, help="Agent id for the lease")
-    p_sp_lo.add_argument("--detail", default=None, help="Human-safe detail string")
+    p_sp_lo.add_argument(_OPT_DETAIL, default=None, help="Human-safe detail string")
     p_sp_lo.add_argument("--host", default=None, help="Optional host hint for later badge")
     p_sp_lo.add_argument("--ttl-s", type=int, default=None, help="Watch TTL seconds")
     p_sp_lo.set_defaults(_handler="spaces_login_once")
@@ -566,6 +596,15 @@ def main(argv: list[str] | None = None) -> int:
                 ttl_s=args.ttl_s,
                 ok=ok_flag if args.kind == "done" else None,
                 summary=args.summary,
+                url=args.url,
+            )
+        if args._handler == _HANDLER_CAPTCHA:
+            return cmd_captcha(
+                event=args.event,
+                lease_id=args.lease_id,
+                detail=args.detail,
+                provider=args.provider,
+                timeout_s=args.timeout_s,
                 url=args.url,
             )
         if args._handler == "cred_bind":
