@@ -20,6 +20,15 @@ from slipstream.config import PoolConfig
 from slipstream.launcher import ChromiumLauncher, LaunchHandle
 from slipstream.models import Lease, SlotState, SlotStatus, new_lease_id
 from slipstream.rss import sample_tree_rss
+from slipstream.vault import (
+    CredNotFoundError,
+    CredVault,
+    VaultValidationError,
+    material_for_field,
+    parse_fill_body,
+)
+from slipstream.cdp_inject import CdpInjectError, CdpInjector, default_injector
+
 
 
 class PoolFullError(Exception):
@@ -64,6 +73,10 @@ class BrowserPool:
         self._api_base_url: str = f"http://{self.config.host}:{self.config.port}"
         # Ensure spaces root exists
         self.config.spaces_root.mkdir(parents=True, exist_ok=True)
+        # Cred vault lives OUTSIDE spaces_root (never inside user-data-dir)
+        self.config.vault_root.mkdir(parents=True, exist_ok=True)
+        self.vault = CredVault(self.config.vault_root, mock=self.config.mock)
+        self._cdp_injector: CdpInjector = default_injector(mock=self.config.mock)
 
     # --- introspection -------------------------------------------------
 
@@ -86,6 +99,7 @@ class BrowserPool:
                 "leased": leased,
                 "mock": self.config.mock,
                 "spaces_root": str(self.config.spaces_root),
+                "vault_root": str(self.config.vault_root),
                 "cdp_base_port": self.config.cdp_base_port,
                 "chrome_binary": self.launcher.binary,
                 "slots": [s.to_dict() for s in self._slots],
@@ -491,6 +505,68 @@ class BrowserPool:
             self.launcher.stop(stop_handle)
         return result
 
+
+
+    # --- credentials (vault outside Space; fill via pool CDP) -------------
+
+    def bind_credential(self, space_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Bind a secret to space_id. Response never echoes secret."""
+        safe = PoolConfig.normalize_space_id(space_id)
+        if not isinstance(body, dict):
+            raise VaultValidationError("body must be a JSON object")
+        return self.vault.bind(
+            safe,
+            label=body.get("label"),
+            origin=body.get("origin"),
+            username=body.get("username"),
+            secret=body.get("secret"),
+            cred_id=body.get("cred_id"),
+        )
+
+    def unbind_credential(self, space_id: str, cred_id: str) -> dict[str, Any]:
+        safe = PoolConfig.normalize_space_id(space_id)
+        return self.vault.unbind(safe, cred_id)
+
+    def list_credentials(self, space_id: str) -> dict[str, Any]:
+        """Metadata only — never secrets, never cookies."""
+        safe = PoolConfig.normalize_space_id(space_id)
+        return self.vault.list_metadata(safe)
+
+    def fill_credentials(self, lease_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Unlock vault + CDP-inject into leased browser. Agent sees ok/labels only.
+
+        On login/2FA walls the agent cannot clear, raise need_human(reason=login)
+        via the alerts API — do not ask the LLM for passwords.
+        """
+        parsed = parse_fill_body(body)
+        cred_id = parsed["cred_id"]
+        fields = parsed["fields"]
+
+        with self._lock:
+            lease = self._leases.get(lease_id)
+            if not lease:
+                raise LeaseNotFoundError(lease_id)
+            slot = self._find_slot_by_lease(lease_id)
+            if not slot or slot.status != SlotStatus.LEASED:
+                raise LeaseNotFoundError(lease_id)
+            space_id = lease.space_id
+            cdp_http = slot.cdp_http_url
+            if not cdp_http:
+                raise CdpInjectError("lease has no cdp_http_url")
+
+        unlocked = self.vault.unlock_for_fill(space_id, cred_id)
+        filled: list[str] = []
+        try:
+            triples: list[tuple[str, str, str]] = []
+            for name, selector in fields.items():
+                value = material_for_field(name, unlocked)
+                triples.append((name, selector, value))
+            filled = self._cdp_injector.fill_fields(cdp_http, triples)
+        finally:
+            # Best-effort zero unlocked material
+            unlocked.clear()
+
+        return {"ok": True, "filled": filled, "cred_id": cred_id, "lease_id": lease_id}
 
     def set_api_base_url(self, base_url: str) -> None:
         """Bind public base URL for watch/takeover placeholders (called by PoolServer)."""

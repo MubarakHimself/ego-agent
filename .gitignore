@@ -17,6 +17,7 @@ venv/
 # Pool runtime data (Spaces / Chrome profiles)
 data/
 data/spaces/
+data/vault/
 # Chrome / Chromium profiles & debugging
 *.log
 chrome_debug/

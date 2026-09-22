@@ -6,6 +6,10 @@ Endpoints:
   POST   /v1/leases
   POST   /v1/leases/{id}/heartbeat
   POST   /v1/leases/{id}/alerts
+  POST   /v1/leases/{id}/credentials/fill
+  POST   /v1/spaces/{space_id}/credentials/bind
+  POST   /v1/spaces/{space_id}/credentials/{cred_id}/unbind
+  GET    /v1/spaces/{space_id}/credentials
   DELETE /v1/leases/{id}
   GET    /v1/pool/status
   GET    /healthz
@@ -20,6 +24,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from slipstream.alerts import AlertConflictError, AlertValidationError
+from slipstream.cdp_inject import CdpInjectError
 from slipstream.pool import (
     BrowserPool,
     LeaseExpiredError,
@@ -27,6 +32,7 @@ from slipstream.pool import (
     PoolFullError,
     SpaceInUseError,
 )
+from slipstream.vault import CredNotFoundError, VaultUnavailableError, VaultValidationError
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, body: dict[str, Any]) -> None:
@@ -76,6 +82,23 @@ def make_handler(pool: BrowserPool):
                 return
             if path == "/v1/pool/status":
                 _json_response(self, 200, pool.status())
+                return
+            # GET /v1/spaces/{space_id}/credentials — metadata only
+            parts = path.strip("/").split("/")
+            if (
+                len(parts) == 4
+                and parts[0] == "v1"
+                and parts[1] == "spaces"
+                and parts[3] == "credentials"
+            ):
+                space_id = parts[2]
+                try:
+                    result = pool.list_credentials(space_id)
+                    _json_response(self, 200, result)
+                except VaultValidationError as e:
+                    _json_response(self, 400, {"error": "invalid_credentials", "detail": str(e)})
+                except ValueError as e:
+                    _json_response(self, 400, {"error": "bad_request", "detail": str(e)})
                 return
             _json_response(self, 404, {"error": "not_found", "path": path})
 
@@ -168,6 +191,97 @@ def make_handler(pool: BrowserPool):
                         404,
                         {"error": "lease_not_found", "lease_id": lease_id},
                     )
+                return
+
+            # POST /v1/spaces/{space_id}/credentials/bind
+            if (
+                len(parts) == 5
+                and parts[0] == "v1"
+                and parts[1] == "spaces"
+                and parts[3] == "credentials"
+                and parts[4] == "bind"
+            ):
+                space_id = parts[2]
+                try:
+                    result = pool.bind_credential(space_id, body)
+                    _json_response(self, 200, result)
+                except VaultValidationError as e:
+                    _json_response(self, 400, {"error": "invalid_credentials", "detail": str(e)})
+                except VaultUnavailableError as e:
+                    _json_response(self, 503, {"error": "vault_unavailable", "detail": str(e)})
+                except ValueError as e:
+                    _json_response(self, 400, {"error": "bad_request", "detail": str(e)})
+                return
+
+            # POST /v1/spaces/{space_id}/credentials/{cred_id}/unbind
+            if (
+                len(parts) == 6
+                and parts[0] == "v1"
+                and parts[1] == "spaces"
+                and parts[3] == "credentials"
+                and parts[5] == "unbind"
+            ):
+                space_id = parts[2]
+                cred_id = parts[4]
+                try:
+                    result = pool.unbind_credential(space_id, cred_id)
+                    _json_response(self, 200, result)
+                except CredNotFoundError:
+                    _json_response(
+                        self,
+                        404,
+                        {"error": "cred_not_found", "cred_id": cred_id, "space_id": space_id},
+                    )
+                except VaultValidationError as e:
+                    _json_response(self, 400, {"error": "invalid_credentials", "detail": str(e)})
+                except ValueError as e:
+                    _json_response(self, 400, {"error": "bad_request", "detail": str(e)})
+                return
+
+            # POST /v1/leases/{lease_id}/credentials/fill
+            if (
+                len(parts) == 5
+                and parts[0] == "v1"
+                and parts[1] == "leases"
+                and parts[3] == "credentials"
+                and parts[4] == "fill"
+            ):
+                lease_id = parts[2]
+                try:
+                    result = pool.fill_credentials(lease_id, body)
+                    _json_response(self, 200, result)
+                except LeaseNotFoundError:
+                    _json_response(
+                        self, 404, {"error": "lease_not_found", "lease_id": lease_id}
+                    )
+                except CredNotFoundError as e:
+                    _json_response(
+                        self, 404, {"error": "cred_not_found", "detail": str(e)}
+                    )
+                except VaultValidationError as e:
+                    _json_response(self, 400, {"error": "invalid_credentials", "detail": str(e)})
+                except CdpInjectError as e:
+                    _json_response(self, 502, {"error": "cdp_inject_failed", "detail": str(e)})
+                except VaultUnavailableError as e:
+                    _json_response(self, 503, {"error": "vault_unavailable", "detail": str(e)})
+                return
+
+            # Refuse free-read secret / cookie dump paths
+            if len(parts) >= 4 and "credentials" in parts and parts[-1] in (
+                "secret",
+                "secrets",
+                "cookies",
+                "storage_state",
+                "dump",
+            ):
+                _json_response(
+                    self,
+                    404,
+                    {
+                        "error": "refused",
+                        "detail": "free-read of secrets/cookies is not available; use fill",
+                    },
+                )
                 return
 
             _json_response(self, 404, {"error": "not_found", "path": path})

@@ -23,6 +23,10 @@ from slipstream.cli import (
     CliError,
     DEFAULT_URL,
     cmd_alert,
+    cmd_cred_bind,
+    cmd_cred_fill,
+    cmd_cred_list,
+    cmd_cred_unbind,
     cmd_heartbeat,
     cmd_lease,
     cmd_release,
@@ -62,7 +66,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     )
     print(
         "Endpoints: POST /v1/leases  POST /v1/leases/{id}/heartbeat  "
-        "POST /v1/leases/{id}/alerts  DELETE /v1/leases/{id}  GET /v1/pool/status",
+        "POST /v1/leases/{id}/alerts  POST …/credentials/*  DELETE /v1/leases/{id}  GET /v1/pool/status",
         flush=True,
     )
     print(
@@ -185,6 +189,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_alert.set_defaults(_handler="alert")
 
+
+    # --- cred (bind/unbind/list/fill) ---
+    p_cred = sub.add_parser(
+        "cred",
+        help="Space credential vault: bind/unbind/list/fill (secrets never to agent)",
+    )
+    cred_sub = p_cred.add_subparsers(dest="cred_cmd", metavar="CRED_CMD")
+
+    p_bind = cred_sub.add_parser("bind", help="Bind secret to a Space (captain/local)")
+    _add_url(p_bind)
+    p_bind.add_argument("--space-id", required=True)
+    p_bind.add_argument("--label", required=True)
+    p_bind.add_argument("--origin", required=True)
+    p_bind.add_argument("--username", required=True)
+    p_bind.add_argument(
+        "--secret", required=True, help="Secret (not logged; local/captain only)"
+    )
+    p_bind.set_defaults(_handler="cred_bind")
+
+    p_unbind = cred_sub.add_parser("unbind", help="Unbind a credential from a Space")
+    _add_url(p_unbind)
+    p_unbind.add_argument("--space-id", required=True)
+    p_unbind.add_argument("--cred-id", required=True)
+    p_unbind.set_defaults(_handler="cred_unbind")
+
+    p_clist = cred_sub.add_parser("list", help="List credential metadata (no secrets)")
+    _add_url(p_clist)
+    p_clist.add_argument("--space-id", required=True)
+    p_clist.set_defaults(_handler="cred_list")
+
+    p_fill = cred_sub.add_parser(
+        "fill",
+        help="Pool-side CDP fill (cred_id + selectors only; agent never sees secret)",
+    )
+    _add_url(p_fill)
+    p_fill.add_argument("--lease-id", required=True)
+    p_fill.add_argument("--cred-id", required=True)
+    p_fill.add_argument(
+        "--fields",
+        required=True,
+        help='JSON object name→CSS selector, e.g. \'{"username":"#user","password":"#pass"}\'',
+    )
+    p_fill.set_defaults(_handler="cred_fill")
+
     # --- doctor ---
     p_doc = sub.add_parser(
         "doctor",
@@ -241,6 +289,30 @@ def main(argv: list[str] | None = None) -> int:
                 ttl_s=args.ttl_s,
                 ok=ok_flag if args.kind == "done" else None,
                 summary=args.summary,
+                url=args.url,
+            )
+        if args._handler == "cred_bind":
+            return cmd_cred_bind(
+                space_id=args.space_id,
+                label=args.label,
+                origin=args.origin,
+                username=args.username,
+                secret=args.secret,
+                url=args.url,
+            )
+        if args._handler == "cred_unbind":
+            return cmd_cred_unbind(
+                space_id=args.space_id,
+                cred_id=args.cred_id,
+                url=args.url,
+            )
+        if args._handler == "cred_list":
+            return cmd_cred_list(space_id=args.space_id, url=args.url)
+        if args._handler == "cred_fill":
+            return cmd_cred_fill(
+                lease_id=args.lease_id,
+                cred_id=args.cred_id,
+                fields_json=args.fields,
                 url=args.url,
             )
         if args._handler == "doctor":
