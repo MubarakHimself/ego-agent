@@ -18,7 +18,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
-from ego_pool.pool import BrowserPool, LeaseNotFoundError, PoolFullError
+from ego_pool.pool import (
+    BrowserPool,
+    LeaseExpiredError,
+    LeaseNotFoundError,
+    PoolFullError,
+    SpaceInUseError,
+)
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, body: dict[str, Any]) -> None:
@@ -28,6 +34,23 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, body: dict[str,
     handler.send_header("Content-Length", str(len(raw)))
     handler.end_headers()
     handler.wfile.write(raw)
+
+
+def _parse_ttl_seconds(raw: Any) -> int | None:
+    """Require int (strict coerce of whole-number float); raise ValueError if bad."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        raise ValueError("ttl_seconds must be an integer")
+    if isinstance(raw, int):
+        ttl = raw
+    elif isinstance(raw, float) and raw.is_integer():
+        ttl = int(raw)
+    else:
+        raise ValueError("ttl_seconds must be an integer")
+    if ttl <= 0:
+        raise ValueError("ttl_seconds must be positive")
+    return ttl
 
 
 def make_handler(pool: BrowserPool):
@@ -66,17 +89,29 @@ def make_handler(pool: BrowserPool):
                 agent_id = body.get("agent_id")
                 space_id = body.get("space_id")
                 mode = body.get("mode", "isolated")
-                ttl = body.get("ttl_seconds")
                 if not agent_id or not space_id:
                     _json_response(self, 400, {"error": "agent_id and space_id required"})
+                    return
+                try:
+                    ttl = _parse_ttl_seconds(body.get("ttl_seconds"))
+                except ValueError as e:
+                    _json_response(
+                        self,
+                        400,
+                        {"error": "invalid_ttl_seconds", "detail": str(e)},
+                    )
                     return
                 try:
                     result = pool.lease(agent_id, space_id, mode=mode, ttl_seconds=ttl)
                     _json_response(self, 200, result)
                 except PoolFullError as e:
                     _json_response(self, 503, {"error": "pool_full", "detail": str(e)})
+                except SpaceInUseError as e:
+                    _json_response(self, 409, {"error": "space_in_use", "detail": str(e)})
                 except ValueError as e:
                     _json_response(self, 400, {"error": "bad_request", "detail": str(e)})
+                except RuntimeError as e:
+                    _json_response(self, 503, {"error": "launch_failed", "detail": str(e)})
                 return
 
             # /v1/leases/{id}/heartbeat
@@ -91,22 +126,12 @@ def make_handler(pool: BrowserPool):
                 try:
                     result = pool.heartbeat(lease_id)
                     _json_response(self, 200, result)
-                except LeaseNotFoundError:
-                    _json_response(self, 404, {"error": "lease_not_found", "lease_id": lease_id})
-                return
-
-            # Optional POST release alias
-            if (
-                len(parts) == 4
-                and parts[0] == "v1"
-                and parts[1] == "leases"
-                and parts[3] == "release"
-            ):
-                lease_id = parts[2]
-                reason = body.get("reason", "client_release")
-                try:
-                    result = pool.release(lease_id, reason=reason)
-                    _json_response(self, 200, result)
+                except LeaseExpiredError:
+                    _json_response(
+                        self,
+                        410,
+                        {"error": "lease_expired", "lease_id": lease_id},
+                    )
                 except LeaseNotFoundError:
                     _json_response(self, 404, {"error": "lease_not_found", "lease_id": lease_id})
                 return

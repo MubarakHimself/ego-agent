@@ -79,11 +79,3 @@ def sample_tree_rss(pid: int | None) -> int | None:
                 queue.append(child)
 
     return total_kb * 1024  # bytes
-
-
-def sample_tree_rss_mb(pid: int | None) -> float | None:
-    """Convenience: tree RSS in MiB, or None."""
-    raw = sample_tree_rss(pid)
-    if raw is None:
-        return None
-    return raw / (1024 * 1024)

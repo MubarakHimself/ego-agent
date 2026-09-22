@@ -79,3 +79,70 @@ def test_pool_full_returns_503(api_server: PoolServer):
     code, body = _req("POST", f"{base}/v1/leases", {"agent_id": "overflow", "space_id": "sx"})
     assert code == 503
     assert body["error"] == "pool_full"
+
+
+def test_space_in_use_returns_409(api_server: PoolServer):
+    base = api_server.base_url
+    code, _ = _req("POST", f"{base}/v1/leases", {"agent_id": "a1", "space_id": "shared"})
+    assert code == 200
+    code, body = _req("POST", f"{base}/v1/leases", {"agent_id": "a2", "space_id": "shared"})
+    assert code == 409
+    assert body["error"] == "space_in_use"
+
+
+def test_bad_space_id_returns_400(api_server: PoolServer):
+    base = api_server.base_url
+    for bad in (".", "..", ""):
+        code, body = _req(
+            "POST",
+            f"{base}/v1/leases",
+            {"agent_id": "a1", "space_id": bad},
+        )
+        # empty space_id hits "required" check; "." / ".." hit validation
+        assert code == 400
+        assert "error" in body
+
+
+def test_bad_ttl_seconds_returns_400(api_server: PoolServer):
+    base = api_server.base_url
+    for bad_ttl in ("not-a-number", True, 1.5, 0, -5, []):
+        code, body = _req(
+            "POST",
+            f"{base}/v1/leases",
+            {"agent_id": "a1", "space_id": "s1", "ttl_seconds": bad_ttl},
+        )
+        assert code == 400, f"ttl={bad_ttl!r} expected 400 got {code}"
+        assert body["error"] in ("invalid_ttl_seconds", "bad_request")
+
+
+def test_post_release_alias_removed(api_server: PoolServer):
+    base = api_server.base_url
+    code, lease = _req("POST", f"{base}/v1/leases", {"agent_id": "a1", "space_id": "s1"})
+    assert code == 200
+    lid = lease["lease_id"]
+    code, body = _req("POST", f"{base}/v1/leases/{lid}/release", {"reason": "done"})
+    assert code == 404
+    # DELETE still works
+    code, rel = _req("DELETE", f"{base}/v1/leases/{lid}")
+    assert code == 200 and rel["released"] is True
+
+
+def test_launch_failure_returns_503(api_server: PoolServer, monkeypatch):
+    base = api_server.base_url
+
+    def boom(*_a, **_k):
+        raise RuntimeError("chrome missing")
+
+    monkeypatch.setattr(api_server.pool.launcher, "launch", boom)
+    code, body = _req("POST", f"{base}/v1/leases", {"agent_id": "a1", "space_id": "s1"})
+    assert code == 503
+    assert body["error"] == "launch_failed"
+    # Slot freed — subsequent lease (with mock restored) works
+    monkeypatch.undo()
+    # Re-bind a working launch by creating a fresh mock launcher behavior
+    from ego_pool.launcher import ChromiumLauncher
+
+    api_server.pool.launcher = ChromiumLauncher(api_server.pool.config)
+    code, lease = _req("POST", f"{base}/v1/leases", {"agent_id": "a1", "space_id": "s1"})
+    assert code == 200
+    assert lease["status"] == "leased"

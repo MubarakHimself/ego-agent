@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import time
+from unittest.mock import patch
 
 import pytest
 
 from ego_pool.config import PoolConfig
 from ego_pool.models import SlotStatus
-from ego_pool.pool import BrowserPool, LeaseNotFoundError, PoolFullError
+from ego_pool.pool import (
+    BrowserPool,
+    LeaseExpiredError,
+    LeaseNotFoundError,
+    PoolFullError,
+    SpaceInUseError,
+)
 from ego_pool.rss import sample_tree_rss
 
 
@@ -18,12 +25,21 @@ def test_config_defaults():
     assert cfg.W == 1
     assert cfg.idle_ttl_seconds == 300
     assert cfg.cdp_base_port == 9222
+    assert not hasattr(cfg, "heartbeat_interval_hint_seconds")
 
 
 def test_space_path_convention(mock_config):
     path = mock_config.space_path("task-42")
     assert path == mock_config.spaces_root / "task-42"
     assert path.name == "task-42"
+
+
+@pytest.mark.parametrize("bad", [".", "..", "", "   "])
+def test_space_id_rejects_unsafe(mock_config, bad):
+    with pytest.raises(ValueError):
+        mock_config.space_path(bad)
+    with pytest.raises(ValueError):
+        PoolConfig.normalize_space_id(bad)
 
 
 def test_lease_heartbeat_release(pool: BrowserPool):
@@ -53,6 +69,12 @@ def test_idempotent_lease_same_agent_space(pool: BrowserPool):
     assert a["lease_id"] == b["lease_id"]
 
 
+def test_space_exclusivity_different_agent(pool: BrowserPool):
+    pool.lease("agent-1", "space-a")
+    with pytest.raises(SpaceInUseError):
+        pool.lease("agent-2", "space-a")
+
+
 def test_hard_k_cap(pool: BrowserPool):
     leases = []
     for i in range(5):
@@ -72,6 +94,36 @@ def test_warm_slot_on_release(pool: BrowserPool):
     assert st["warm"] == 1  # W=1
     warm_slots = [s for s in st["slots"] if s["status"] == SlotStatus.FREE_WARM.value]
     assert len(warm_slots) == 1
+    # Space binding retained for warm reuse
+    assert warm_slots[0]["space_id"] == "space-a"
+
+
+def test_warm_reuse_same_space_no_relaunch(pool: BrowserPool):
+    lease = pool.lease("agent-1", "space-a")
+    pid_before = pool._find_slot_by_lease(lease["lease_id"]).chromium_pid
+    port_before = pool._find_slot_by_lease(lease["lease_id"]).cdp_port
+    pool.release(lease["lease_id"])
+    assert pool.status()["warm"] == 1
+
+    with patch.object(pool.launcher, "launch", wraps=pool.launcher.launch) as launch_spy:
+        lease2 = pool.lease("agent-2", "space-a")
+        assert launch_spy.call_count == 0
+
+    slot = pool._find_slot_by_lease(lease2["lease_id"])
+    assert slot is not None
+    assert slot.chromium_pid == pid_before
+    assert slot.cdp_port == port_before
+    assert lease2["space_id"] == "space-a"
+    assert lease2["lease_id"] != lease["lease_id"]
+
+
+def test_warm_different_space_relaunches(pool: BrowserPool):
+    lease = pool.lease("agent-1", "space-a")
+    pool.release(lease["lease_id"])
+    with patch.object(pool.launcher, "launch", wraps=pool.launcher.launch) as launch_spy:
+        lease2 = pool.lease("agent-2", "space-b")
+        assert launch_spy.call_count == 1
+    assert lease2["space_id"] == "space-b"
 
 
 def test_second_release_goes_cold_when_warm_full(pool: BrowserPool):
@@ -103,6 +155,62 @@ def test_idle_evict(pool: BrowserPool):
     assert pool.status()["leased"] == 0
 
 
+def test_evict_skips_freshly_heartbeated_lease(pool: BrowserPool):
+    """Race: stale snapshot must not kill a lease heartbeated before teardown."""
+    lease = pool.lease("agent-1", "space-a")
+    lid = lease["lease_id"]
+    slot = pool._find_slot_by_lease(lid)
+    assert slot is not None
+    # Make it look stale, then heartbeat (as a concurrent agent would)
+    slot.last_heartbeat = time.time() - (pool.config.idle_ttl_seconds + 10)
+    pool.heartbeat(lid)
+    # Eviction at "now" should see the fresh heartbeat and skip
+    evicted = pool.evict_idle(now=time.time())
+    assert lid not in evicted
+    assert pool.status()["leased"] == 1
+    # Still heartbeatable
+    assert pool.heartbeat(lid)["ok"] is True
+
+
+def test_hard_ttl_expires_on_heartbeat(pool: BrowserPool):
+    lease = pool.lease("agent-1", "space-a", ttl_seconds=1)
+    lid = lease["lease_id"]
+    # Force expires_at into the past
+    pool._leases[lid].expires_at = time.time() - 1
+    with pytest.raises(LeaseExpiredError):
+        pool.heartbeat(lid)
+    assert pool.status()["leased"] == 0
+    with pytest.raises(LeaseNotFoundError):
+        pool.heartbeat(lid)
+
+
+def test_hard_ttl_expires_via_evict_idle(pool: BrowserPool):
+    lease = pool.lease("agent-1", "space-a", ttl_seconds=60)
+    lid = lease["lease_id"]
+    pool._leases[lid].expires_at = time.time() - 1
+    # Keep heartbeat fresh so only hard TTL triggers
+    slot = pool._find_slot_by_lease(lid)
+    slot.last_heartbeat = time.time()
+    evicted = pool.evict_idle()
+    assert lid in evicted
+    assert pool.status()["leased"] == 0
+
+
+def test_launch_failure_frees_slot(pool: BrowserPool):
+    with patch.object(pool.launcher, "launch", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError, match="boom"):
+            pool.lease("agent-1", "space-a")
+    st = pool.status()
+    assert st["leased"] == 0
+    starting = [s for s in st["slots"] if s["status"] == SlotStatus.STARTING.value]
+    assert starting == []
+    cold = [s for s in st["slots"] if s["status"] == SlotStatus.FREE_COLD.value]
+    assert len(cold) == pool.config.K
+    # Slot is reusable after failure
+    lease = pool.lease("agent-1", "space-a")
+    assert lease["status"] == "leased"
+
+
 def test_rss_hook_stub_none_for_missing_pid():
     assert sample_tree_rss(None) is None
     # Unlikely pid — should return None without crashing
@@ -115,6 +223,17 @@ def test_rss_hook_self_process():
     rss = sample_tree_rss(os.getpid())
     # On Linux box this should return a positive int
     assert rss is None or (isinstance(rss, int) and rss > 0)
+
+
+def test_sample_tree_rss_mb_removed():
+    import ego_pool.rss as rss_mod
+
+    assert not hasattr(rss_mod, "sample_tree_rss_mb")
+
+
+def test_slot_status_no_evicting_dead():
+    assert not hasattr(SlotStatus, "EVICTING")
+    assert not hasattr(SlotStatus, "DEAD")
 
 
 def test_space_dir_created_on_lease(pool: BrowserPool, mock_config):

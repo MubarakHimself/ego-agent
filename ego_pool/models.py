@@ -15,8 +15,6 @@ class SlotStatus(str, enum.Enum):
     STARTING = "starting"
     LEASED = "leased"
     RELEASING = "releasing"
-    EVICTING = "evicting"
-    DEAD = "dead"
 
 
 @dataclass
