@@ -37,6 +37,11 @@ from slipstream.watch import (
 from slipstream.config import PoolConfig
 from slipstream.launcher import ChromiumLauncher, LaunchHandle
 from slipstream.models import Lease, SlotState, SlotStatus, new_lease_id
+from slipstream.metadata import (
+    effective_metadata,
+    metadata_matches,
+    validate_user_metadata,
+)
 from slipstream.rss import sample_tree_rss
 from slipstream.vault import (
     CredNotFoundError,
@@ -99,6 +104,8 @@ class BrowserPool:
         ]
         self._handles: dict[int, LaunchHandle] = {}
         self._leases: dict[str, Lease] = {}
+        # Space-level user_metadata registry (process-lifetime; leases inherit).
+        self._space_metadata: dict[str, dict[str, Any]] = {}
         # Alerts: per-lease history + task_done idempotency (survives release).
         # Process-lifetime in-memory only (cleared on pool shutdown / process exit).
         # Bounded LRU eviction is deferred — document trust: single long-lived process.
@@ -211,6 +218,7 @@ class BrowserPool:
         *,
         cdp_http_url: str | None,
         cdp_ws_url: str | None,
+        user_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Wire Lease + slot lease fields; caller sets process/CDP fields as needed."""
         now = time.time()
@@ -218,6 +226,8 @@ class BrowserPool:
         # Client may request shorter TTLs; never exceed config ceiling (docs align).
         requested = ttl_seconds if ttl_seconds is not None else self.config.lease_hard_ttl_seconds
         hard_ttl = min(requested, self.config.lease_hard_ttl_seconds)
+        override = validate_user_metadata(user_metadata) if user_metadata else {}
+        space_meta = dict(self._space_metadata.get(space_id, {}))
         lease = Lease(
             lease_id=lease_id,
             slot_id=slot.slot_id,
@@ -228,6 +238,8 @@ class BrowserPool:
             cdp_ws_url=cdp_ws_url,
             created_at=now,
             expires_at=now + hard_ttl,
+            user_metadata_override=override,
+            user_metadata=effective_metadata(space_meta, override),
         )
         self._leases[lease_id] = lease
         slot.status = SlotStatus.LEASED
@@ -316,6 +328,8 @@ class BrowserPool:
         space_id: str,
         ttl_seconds: int | None,
         handle: LaunchHandle,
+        *,
+        user_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Under lock: attach lease after a successful launch outside the lock."""
         self._handles[slot.slot_id] = handle
@@ -326,6 +340,7 @@ class BrowserPool:
             ttl_seconds,
             cdp_http_url=handle.cdp_http_url,
             cdp_ws_url=handle.cdp_ws_url,
+            user_metadata=user_metadata,
         )
         slot.chromium_pid = handle.pid
         slot.cdp_port = handle.cdp_port
@@ -343,9 +358,12 @@ class BrowserPool:
         space_id: str,
         *,
         ttl_seconds: int | None = None,
+        user_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         # Validate early (rejects ".", "..", "/", NULs, empty, unsafe)
         space_id = self.config.normalize_space_id(space_id)
+        # Validate metadata before taking the lock (raises MetadataValidationError).
+        meta_override = validate_user_metadata(user_metadata) if user_metadata else None
 
         # Handles that must be stopped outside the lock (released/replaced trees).
         pending_stops: list[LaunchHandle] = []
@@ -377,6 +395,17 @@ class BrowserPool:
                                 pending_stops.append(h)
                             break
                         slot.last_heartbeat = now
+                        if meta_override is not None:
+                            existing.user_metadata_override = meta_override
+                            existing.user_metadata = effective_metadata(
+                                self._space_metadata.get(space_id, {}),
+                                meta_override,
+                            )
+                        else:
+                            existing.user_metadata = effective_metadata(
+                                self._space_metadata.get(space_id, {}),
+                                existing.user_metadata_override,
+                            )
                         early_result = existing.to_dict()
                         break
 
@@ -412,6 +441,7 @@ class BrowserPool:
                                 ttl_seconds,
                                 cdp_http_url=matching_warm.cdp_http_url,
                                 cdp_ws_url=matching_warm.cdp_ws_url,
+                                user_metadata=meta_override,
                             )
                         else:
                             port, h = self._reserve_starting_locked(
@@ -487,7 +517,12 @@ class BrowserPool:
                 orphan = handle
             else:
                 return self._finish_launch_locked(
-                    slot, agent_id, space_id, ttl_seconds, handle
+                    slot,
+                    agent_id,
+                    space_id,
+                    ttl_seconds,
+                    handle,
+                    user_metadata=meta_override,
                 )
 
         self.launcher.stop(orphan)
@@ -1264,6 +1299,80 @@ class BrowserPool:
                 "expires_in_s": max(0, int(sess.expires_at - time.time())),
             }
 
+
+    # --- user_metadata / list ------------------------------------------
+
+    def set_space_metadata(
+        self, space_id: str, user_metadata: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Set/replace Space-level tags. Leases inherit; lease overrides win."""
+        space_id = self.config.normalize_space_id(space_id)
+        meta = validate_user_metadata(user_metadata) if user_metadata else {}
+        with self._lock:
+            if meta:
+                self._space_metadata[space_id] = meta
+            else:
+                self._space_metadata.pop(space_id, None)
+            for lease in self._leases.values():
+                if lease.space_id == space_id:
+                    lease.user_metadata = effective_metadata(
+                        meta, lease.user_metadata_override
+                    )
+            return {"space_id": space_id, "user_metadata": dict(meta)}
+
+    def get_space_metadata(self, space_id: str) -> dict[str, Any]:
+        space_id = self.config.normalize_space_id(space_id)
+        with self._lock:
+            return {
+                "space_id": space_id,
+                "user_metadata": dict(self._space_metadata.get(space_id, {})),
+            }
+
+    def list_spaces(self, *, q: str | None = None) -> dict[str, Any]:
+        """List known Spaces (tagged and/or currently slotted) filtered by q=."""
+        with self._lock:
+            known: set[str] = set(self._space_metadata.keys())
+            for slot in self._slots:
+                if slot.space_id:
+                    known.add(slot.space_id)
+            items: list[dict[str, Any]] = []
+            for sid in sorted(known):
+                meta = dict(self._space_metadata.get(sid, {}))
+                if not metadata_matches(meta, q):
+                    continue
+                leased = any(
+                    s.space_id == sid and s.status == SlotStatus.LEASED
+                    for s in self._slots
+                )
+                warm = any(
+                    s.space_id == sid and s.status == SlotStatus.FREE_WARM
+                    for s in self._slots
+                )
+                items.append(
+                    {
+                        "space_id": sid,
+                        "user_metadata": meta,
+                        "leased": leased,
+                        "warm": warm,
+                    }
+                )
+            return {"spaces": items, "q": q}
+
+    def list_leases(self, *, q: str | None = None) -> dict[str, Any]:
+        """List active leases filtered by effective user_metadata q=."""
+        with self._lock:
+            items: list[dict[str, Any]] = []
+            for lease in self._leases.values():
+                lease.user_metadata = effective_metadata(
+                    self._space_metadata.get(lease.space_id, {}),
+                    lease.user_metadata_override,
+                )
+                if not metadata_matches(lease.user_metadata, q):
+                    continue
+                items.append(lease.to_dict())
+            items.sort(key=lambda x: x.get("created_at") or 0)
+            return {"leases": items, "q": q}
+
     def shutdown(self) -> None:
         pending_stops: list[LaunchHandle] = []
         with self._lock:
@@ -1276,6 +1385,7 @@ class BrowserPool:
                 slot.space_id = None
                 slot.status = SlotStatus.FREE_COLD
             self._leases.clear()
+            self._space_metadata.clear()
             self._watches.clear()
             self._watch_input_log.clear()
         for h in pending_stops:

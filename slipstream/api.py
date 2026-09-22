@@ -15,6 +15,9 @@ Endpoints:
   POST   /v1/spaces/{space_id}/credentials/bind
   POST   /v1/spaces/{space_id}/credentials/{cred_id}/unbind
   GET    /v1/spaces/{space_id}/credentials
+  PUT    /v1/spaces/{space_id}
+  GET    /v1/spaces?q=…
+  GET    /v1/leases?q=…
   GET    /v1/leases/{id}/watch
   GET    /v1/leases/{id}/watch/frame
   DELETE /v1/leases/{id}
@@ -54,6 +57,7 @@ from slipstream.pool import (
     SpaceInUseError,
 )
 from slipstream.vault import CredNotFoundError, VaultUnavailableError, VaultValidationError
+from slipstream.metadata import MetadataValidationError
 
 # ADV-003: shared refuse matcher for free-read secret / cookie dump paths (GET+POST)
 _REFUSED_CRED_TAILS = frozenset(
@@ -191,6 +195,18 @@ def make_handler(pool: BrowserPool):
                 return
             if path == "/v1/pool/status":
                 _json_response(self, 200, pool.status())
+                return
+            # GET /v1/spaces?q=… — list Spaces by user_metadata
+            if path == "/v1/spaces":
+                qs = parse_qs(urlparse(self.path).query)
+                q = (qs.get("q") or [None])[0]
+                _json_response(self, 200, pool.list_spaces(q=q))
+                return
+            # GET /v1/leases?q=… — list active leases by effective user_metadata
+            if path == "/v1/leases":
+                qs = parse_qs(urlparse(self.path).query)
+                q = (qs.get("q") or [None])[0]
+                _json_response(self, 200, pool.list_leases(q=q))
                 return
             # GET /v1/spaces/{space_id}/credentials — metadata only
             parts = path.strip("/").split("/")
@@ -397,9 +413,19 @@ def make_handler(pool: BrowserPool):
                         {"error": "invalid_ttl_seconds", "detail": str(e)},
                     )
                     return
+                user_metadata = body.get("user_metadata")
                 try:
-                    result = pool.lease(agent_id, space_id, ttl_seconds=ttl)
+                    result = pool.lease(
+                        agent_id,
+                        space_id,
+                        ttl_seconds=ttl,
+                        user_metadata=user_metadata,
+                    )
                     _json_response(self, 200, result)
+                except MetadataValidationError as e:
+                    _json_response(
+                        self, 400, {"error": "invalid_user_metadata", "detail": str(e)}
+                    )
                 except PoolFullError as e:
                     _json_response(self, 503, {"error": "pool_full", "detail": str(e)})
                 except SpaceInUseError as e:
@@ -642,6 +668,40 @@ def make_handler(pool: BrowserPool):
                 _json_response(self, 404, _refused_credentials_body())
                 return
 
+            _json_response(self, 404, {"error": "not_found", "path": path})
+
+
+        def do_PUT(self) -> None:  # noqa: N802
+            path = urlparse(self.path).path.rstrip("/") or "/"
+            parts = path.strip("/").split("/")
+            # PUT /v1/spaces/{space_id}  { "user_metadata": {…} }
+            if len(parts) == 3 and parts[0] == "v1" and parts[1] == "spaces":
+                space_id = parts[2]
+                try:
+                    body = self._read_json()
+                except json.JSONDecodeError:
+                    _json_response(self, 400, {"error": "invalid_json"})
+                    return
+                if not isinstance(body, dict):
+                    _json_response(self, 400, {"error": "invalid_json"})
+                    return
+                if "user_metadata" not in body:
+                    _json_response(
+                        self,
+                        400,
+                        {"error": "user_metadata_required", "detail": "body must include user_metadata"},
+                    )
+                    return
+                try:
+                    result = pool.set_space_metadata(space_id, body.get("user_metadata"))
+                    _json_response(self, 200, result)
+                except MetadataValidationError as e:
+                    _json_response(
+                        self, 400, {"error": "invalid_user_metadata", "detail": str(e)}
+                    )
+                except ValueError as e:
+                    _json_response(self, 400, {"error": "bad_request", "detail": str(e)})
+                return
             _json_response(self, 404, {"error": "not_found", "path": path})
 
         def do_DELETE(self) -> None:  # noqa: N802

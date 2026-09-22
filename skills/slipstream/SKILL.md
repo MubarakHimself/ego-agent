@@ -356,6 +356,28 @@ Thin in-house helpers (`slipstream.cdp_http`) are for smoke/bench only.
 - Install this skill and call the `slipstream` CLI via the shell tool.
   Prefer shell + peer CDP driver over registering a second browser launcher.
 
+
+
+## Session tags (`user_metadata`)
+
+Ops labels for fleets (Browserbase-style). Attach on a **Space** (inherited by
+leases) and/or override on **lease**. String leaves only; nested objects OK;
+≤512 chars serialized. **Never** put secrets in metadata — keys like
+`password` / `cookie` / `token` / `jwt` / `bearer` are refused.
+
+```bash
+# Tag a Space, then filter
+slipstream spaces set --space-id task-42 --tag env=staging --tag team=fleet
+slipstream spaces list --q 'env=staging'
+
+# Lease override + list active leases
+slipstream lease --agent-id "$AGENT_ID" --space-id task-42 --tag env=canary
+slipstream leases list --tag env=canary
+```
+
+`q=` tokens (AND): `key=value` / dotted `run.id=r1` / Browserbase
+`user_metadata['env']:'staging'` / bare substring. See `docs/POOL_API.md`.
+
 ## Environment
 
 | Var | Purpose |
