@@ -373,3 +373,189 @@ def test_slot_status_no_evicting_dead_releasing():
 def test_space_dir_created_on_lease(pool: BrowserPool, mock_config):
     pool.lease("agent-1", "my-space")
     assert (mock_config.spaces_root / "my-space").is_dir()
+
+
+# --- concurrent lock-drop (RLock must not span Chromium IO) -----------------
+
+
+def test_heartbeat_during_slow_launch_does_not_block(pool: BrowserPool):
+    """A slow launch must not hold the pool lock across launcher.launch.
+
+    Concurrent heartbeat on an existing lease must succeed before the slow
+    launch finishes (proves lock is dropped during launch IO).
+    """
+    import threading
+
+    existing = pool.lease("agent-hold", "space-hold")
+    lid = existing["lease_id"]
+
+    launch_entered = threading.Event()
+    release_launch = threading.Event()
+    heartbeat_done = threading.Event()
+    heartbeat_result: dict = {}
+    errors: list[BaseException] = []
+
+    real_launch = pool.launcher.launch
+
+    def slow_launch(space_id: str, cdp_port: int):
+        launch_entered.set()
+        if not release_launch.wait(timeout=5.0):
+            raise TimeoutError("release_launch never set — heartbeat blocked?")
+        return real_launch(space_id, cdp_port)
+
+    pool.launcher.launch = slow_launch  # type: ignore[method-assign]
+
+    def lease_worker():
+        try:
+            pool.lease("agent-slow", "space-slow")
+        except BaseException as exc:  # noqa: BLE001 — collect for main thread
+            errors.append(exc)
+
+    def heartbeat_worker():
+        try:
+            assert launch_entered.wait(timeout=5.0), "slow launch never entered"
+            t0 = time.perf_counter()
+            heartbeat_result.update(pool.heartbeat(lid))
+            heartbeat_result["elapsed"] = time.perf_counter() - t0
+            heartbeat_done.set()
+            release_launch.set()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+            release_launch.set()
+            heartbeat_done.set()
+
+    try:
+        t_lease = threading.Thread(target=lease_worker, name="slow-lease")
+        t_hb = threading.Thread(target=heartbeat_worker, name="heartbeat")
+        t_lease.start()
+        t_hb.start()
+        t_hb.join(timeout=10.0)
+        t_lease.join(timeout=10.0)
+    finally:
+        pool.launcher.launch = real_launch  # type: ignore[method-assign]
+
+    assert not errors, f"worker errors: {errors}"
+    assert heartbeat_done.is_set()
+    assert heartbeat_result.get("ok") is True
+    # Heartbeat must not wait for the slow launch.
+    assert heartbeat_result.get("elapsed", 99) < 1.0
+    assert pool.status()["leased"] == 2
+
+
+def test_concurrent_lease_different_spaces_while_slow_launch(pool: BrowserPool):
+    """Second lease on a different space proceeds while another launch is slow."""
+    import threading
+
+    launch_entered = threading.Event()
+    release_launch = threading.Event()
+    second_done = threading.Event()
+    second_result: dict = {}
+    errors: list[BaseException] = []
+    call_lock = threading.Lock()
+    launch_calls = {"n": 0}
+
+    real_launch = pool.launcher.launch
+
+    def gated_launch(space_id: str, cdp_port: int):
+        with call_lock:
+            launch_calls["n"] += 1
+            n = launch_calls["n"]
+        if n == 1:
+            launch_entered.set()
+            if not release_launch.wait(timeout=5.0):
+                raise TimeoutError("release_launch never set")
+        return real_launch(space_id, cdp_port)
+
+    pool.launcher.launch = gated_launch  # type: ignore[method-assign]
+
+    def slow_worker():
+        try:
+            pool.lease("agent-a", "space-a")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def fast_worker():
+        try:
+            assert launch_entered.wait(timeout=5.0), "slow launch never entered"
+            t0 = time.perf_counter()
+            second_result.update(pool.lease("agent-b", "space-b"))
+            second_result["elapsed"] = time.perf_counter() - t0
+            second_done.set()
+            release_launch.set()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+            release_launch.set()
+            second_done.set()
+
+    try:
+        t1 = threading.Thread(target=slow_worker, name="slow-lease")
+        t2 = threading.Thread(target=fast_worker, name="fast-lease")
+        t1.start()
+        t2.start()
+        t2.join(timeout=10.0)
+        t1.join(timeout=10.0)
+    finally:
+        pool.launcher.launch = real_launch  # type: ignore[method-assign]
+
+    assert not errors, f"worker errors: {errors}"
+    assert second_done.is_set()
+    assert second_result.get("status") == "leased"
+    assert second_result.get("space_id") == "space-b"
+    assert second_result.get("elapsed", 99) < 1.0
+    assert pool.status()["leased"] == 2
+
+
+def test_status_readable_during_slow_launch(pool: BrowserPool):
+    """status() must not block behind a slow launcher.launch."""
+    import threading
+
+    launch_entered = threading.Event()
+    release_launch = threading.Event()
+    status_result: dict = {}
+    errors: list[BaseException] = []
+
+    real_launch = pool.launcher.launch
+
+    def slow_launch(space_id: str, cdp_port: int):
+        launch_entered.set()
+        if not release_launch.wait(timeout=5.0):
+            raise TimeoutError("release_launch never set")
+        return real_launch(space_id, cdp_port)
+
+    pool.launcher.launch = slow_launch  # type: ignore[method-assign]
+
+    def lease_worker():
+        try:
+            pool.lease("agent-1", "space-a")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def status_worker():
+        try:
+            assert launch_entered.wait(timeout=5.0)
+            t0 = time.perf_counter()
+            st = pool.status()
+            status_result["elapsed"] = time.perf_counter() - t0
+            status_result["starting"] = sum(
+                1 for s in st["slots"] if s["status"] == SlotStatus.STARTING.value
+            )
+            status_result["ok"] = True
+            release_launch.set()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+            release_launch.set()
+
+    try:
+        t1 = threading.Thread(target=lease_worker)
+        t2 = threading.Thread(target=status_worker)
+        t1.start()
+        t2.start()
+        t2.join(timeout=10.0)
+        t1.join(timeout=10.0)
+    finally:
+        pool.launcher.launch = real_launch  # type: ignore[method-assign]
+
+    assert not errors, f"worker errors: {errors}"
+    assert status_result.get("ok") is True
+    assert status_result.get("elapsed", 99) < 1.0
+    assert status_result.get("starting") == 1

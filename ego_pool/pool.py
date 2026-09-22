@@ -30,7 +30,13 @@ class SpaceInUseError(Exception):
 
 
 class BrowserPool:
-    """Owns ≤K Chromium process trees; agents lease slots, never own PIDs."""
+    """Owns ≤K Chromium process trees; agents lease slots, never own PIDs.
+
+    Locking: the pool RLock protects slot / lease bookkeeping only. Chromium
+    ``launcher.stop`` / ``launcher.launch`` (and any CDP wait/sleep) run
+    *outside* the lock so concurrent heartbeats, status, and other leases
+    can proceed while a slot is mid-launch (status ``STARTING``).
+    """
 
     def __init__(self, config: PoolConfig | None = None, launcher: ChromiumLauncher | None = None):
         self.config = config or PoolConfig()
@@ -163,123 +169,81 @@ class BrowserPool:
         slot.leased_at = now
         return lease.to_dict()
 
-    # --- lease API -----------------------------------------------------
+    def _clear_lease_fields(self, slot: SlotState) -> None:
+        slot.lease_id = None
+        slot.agent_id = None
+        slot.last_heartbeat = None
+        slot.leased_at = None
 
-    def lease(
+    def _clear_process_fields(self, slot: SlotState) -> None:
+        slot.chromium_pid = None
+        slot.cdp_port = None
+        slot.cdp_http_url = None
+        slot.cdp_ws_url = None
+        slot.rss_bytes = None
+
+    def _detach_lease_locked(
         self,
-        agent_id: str,
-        space_id: str,
+        lease_id: str,
         *,
-        ttl_seconds: int | None = None,
-    ) -> dict[str, Any]:
-        # Validate early (rejects ".", "..", "/", NULs, empty, unsafe)
-        space_id = self.config.normalize_space_id(space_id)
+        allow_warm: bool,
+    ) -> LaunchHandle | None:
+        """Under lock: detach lease bookkeeping; return handle to stop *outside* lock.
 
-        with self._lock:
-            now = time.time()
-            # Idempotent: same agent+space already leased → return existing
-            # unless hard TTL has expired (then release and fall through).
-            for lid, existing in list(self._leases.items()):
-                if existing.agent_id == agent_id and existing.space_id == space_id:
-                    slot = self._find_slot_by_lease(lid)
-                    if slot and slot.status == SlotStatus.LEASED:
-                        if existing.expires_at is not None and now >= existing.expires_at:
-                            self._release_locked(
-                                lid, reason="hard_ttl_expired", allow_warm=False
-                            )
-                            break
-                        # Dead Chromium under an active lease → stop + fall through
-                        # to cold start (mirror dead-warm path); never hand off a
-                        # stale CDP endpoint.
-                        if not self._handle_alive(slot):
-                            self._release_locked(
-                                lid, reason="dead_process", allow_warm=False
-                            )
-                            break
-                        slot.last_heartbeat = now
-                        return existing.to_dict()
+        ``allow_warm`` is True only for explicit client DELETE. Idle / hard-TTL
+        evictions always stop Chromium (no FREE_WARM / no stale CDP handoff).
+        """
+        lease = self._leases.get(lease_id)
+        if not lease:
+            raise LeaseNotFoundError(lease_id)
+        slot = self._find_slot_by_lease(lease_id)
+        if not slot:
+            raise LeaseNotFoundError(lease_id)
 
-            # Space exclusivity: never two trees on one Space without handoff
-            for s in self._slots:
-                if s.space_id == space_id and s.status in (
-                    SlotStatus.LEASED,
-                    SlotStatus.STARTING,
-                ):
-                    raise SpaceInUseError(
-                        f"space_id {space_id!r} already in use "
-                        f"(agent_id={s.agent_id!r}, status={s.status.value})"
-                    )
+        keep_warm = allow_warm and self._count_warm() < self.config.W
+        del self._leases[lease_id]
 
-            # Prefer FREE_WARM with matching space_id → reuse process (no relaunch)
-            # if still alive; dead warm → stop + cold start.
-            matching_warm = next(
-                (
-                    s
-                    for s in self._slots
-                    if s.status == SlotStatus.FREE_WARM and s.space_id == space_id
-                ),
-                None,
-            )
-            if matching_warm is not None:
-                if self._handle_alive(matching_warm):
-                    return self._reuse_warm_and_lease(
-                        matching_warm, agent_id, space_id, ttl_seconds
-                    )
-                self._stop_slot(matching_warm)
-                matching_warm.status = SlotStatus.FREE_COLD
-                return self._start_and_lease(matching_warm, agent_id, space_id, ttl_seconds)
+        if keep_warm:
+            self._clear_lease_fields(slot)
+            slot.status = SlotStatus.FREE_WARM
+            # Keep space_id so a later lease for the same Space can reuse the process
+            return None
 
-            # Prefer any FREE_WARM (different Space → stop + relaunch)
-            warm = next((s for s in self._slots if s.status == SlotStatus.FREE_WARM), None)
-            cold = next((s for s in self._slots if s.status == SlotStatus.FREE_COLD), None)
+        handle = self._handles.pop(slot.slot_id, None)
+        self._clear_process_fields(slot)
+        self._clear_lease_fields(slot)
+        slot.space_id = None
+        slot.status = SlotStatus.FREE_COLD
+        return handle
 
-            if warm is not None:
-                self._stop_slot(warm)
-                return self._start_and_lease(warm, agent_id, space_id, ttl_seconds)
-
-            if cold is not None:
-                # Cap: count of live process trees must stay ≤ K (cold start adds one)
-                if self._count_live_processes() >= self.config.K:
-                    raise PoolFullError(f"pool at hard K={self.config.K}")
-                return self._start_and_lease(cold, agent_id, space_id, ttl_seconds)
-
-            raise PoolFullError(f"pool at hard K={self.config.K}; all slots leased")
-
-    def _reuse_warm_and_lease(
+    def _reserve_starting_locked(
         self,
         slot: SlotState,
         agent_id: str,
         space_id: str,
-        ttl_seconds: int | None,
-    ) -> dict[str, Any]:
-        """Attach a new lease to an existing FREE_WARM process (same Space)."""
-        return self._attach_lease(
-            slot,
-            agent_id,
-            space_id,
-            ttl_seconds,
-            cdp_http_url=slot.cdp_http_url,
-            cdp_ws_url=slot.cdp_ws_url,
-        )
+    ) -> tuple[int, LaunchHandle | None]:
+        """Under lock: take ownership of ``slot`` for a cold launch attempt.
 
-    def _start_and_lease(
-        self,
-        slot: SlotState,
-        agent_id: str,
-        space_id: str,
-        ttl_seconds: int | None,
-    ) -> dict[str, Any]:
+        Pops any existing handle (caller must stop it outside the lock).
+        Sets status STARTING and binds space/agent. Returns (cdp_port, handle_to_stop).
+        """
+        handle = self._handles.pop(slot.slot_id, None)
+        self._clear_process_fields(slot)
+        self._clear_lease_fields(slot)
         slot.status = SlotStatus.STARTING
         slot.space_id = space_id
         slot.agent_id = agent_id
-        port = self._cdp_port_for(slot.slot_id)
-        try:
-            handle = self.launcher.launch(space_id, port)
-        except Exception:
-            # Failed launch must not leave the slot stuck in STARTING
-            self._reset_slot_cold(slot)
-            raise
+        return self._cdp_port_for(slot.slot_id), handle
 
+    def _finish_launch_locked(
+        self,
+        slot: SlotState,
+        agent_id: str,
+        space_id: str,
+        ttl_seconds: int | None,
+        handle: LaunchHandle,
+    ) -> dict[str, Any]:
+        """Under lock: attach lease after a successful launch outside the lock."""
         self._handles[slot.slot_id] = handle
         result = self._attach_lease(
             slot,
@@ -297,7 +261,170 @@ class BrowserPool:
             slot.rss_bytes = sample_tree_rss(handle.pid)
         return result
 
+    # --- lease API -----------------------------------------------------
+
+    def lease(
+        self,
+        agent_id: str,
+        space_id: str,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        # Validate early (rejects ".", "..", "/", NULs, empty, unsafe)
+        space_id = self.config.normalize_space_id(space_id)
+
+        # Handles that must be stopped outside the lock (released/replaced trees).
+        pending_stops: list[LaunchHandle] = []
+        # If set: (slot_id, cdp_port) reserved as STARTING for launch outside lock.
+        launch_job: tuple[int, int] | None = None
+        # Warm reuse completed under lock (no IO).
+        early_result: dict[str, Any] | None = None
+
+        bookkeeping_error: Exception | None = None
+        with self._lock:
+            now = time.time()
+            # Idempotent: same agent+space already leased → return existing
+            # unless hard TTL has expired (then release and fall through).
+            for lid, existing in list(self._leases.items()):
+                if existing.agent_id == agent_id and existing.space_id == space_id:
+                    slot = self._find_slot_by_lease(lid)
+                    if slot and slot.status == SlotStatus.LEASED:
+                        if existing.expires_at is not None and now >= existing.expires_at:
+                            h = self._detach_lease_locked(lid, allow_warm=False)
+                            if h is not None:
+                                pending_stops.append(h)
+                            break
+                        # Dead Chromium under an active lease → stop + fall through
+                        # to cold start (mirror dead-warm path); never hand off a
+                        # stale CDP endpoint.
+                        if not self._handle_alive(slot):
+                            h = self._detach_lease_locked(lid, allow_warm=False)
+                            if h is not None:
+                                pending_stops.append(h)
+                            break
+                        slot.last_heartbeat = now
+                        early_result = existing.to_dict()
+                        break
+
+            if early_result is None:
+                try:
+                    # Space exclusivity: never two trees on one Space without handoff
+                    for s in self._slots:
+                        if s.space_id == space_id and s.status in (
+                            SlotStatus.LEASED,
+                            SlotStatus.STARTING,
+                        ):
+                            raise SpaceInUseError(
+                                f"space_id {space_id!r} already in use "
+                                f"(agent_id={s.agent_id!r}, status={s.status.value})"
+                            )
+
+                    # Prefer FREE_WARM with matching space_id → reuse process (no relaunch)
+                    # if still alive; dead warm → stop + cold start.
+                    matching_warm = next(
+                        (
+                            s
+                            for s in self._slots
+                            if s.status == SlotStatus.FREE_WARM and s.space_id == space_id
+                        ),
+                        None,
+                    )
+                    if matching_warm is not None:
+                        if self._handle_alive(matching_warm):
+                            early_result = self._attach_lease(
+                                matching_warm,
+                                agent_id,
+                                space_id,
+                                ttl_seconds,
+                                cdp_http_url=matching_warm.cdp_http_url,
+                                cdp_ws_url=matching_warm.cdp_ws_url,
+                            )
+                        else:
+                            port, h = self._reserve_starting_locked(
+                                matching_warm, agent_id, space_id
+                            )
+                            if h is not None:
+                                pending_stops.append(h)
+                            launch_job = (matching_warm.slot_id, port)
+                    else:
+                        # Prefer any FREE_WARM (different Space → stop + relaunch)
+                        warm = next(
+                            (s for s in self._slots if s.status == SlotStatus.FREE_WARM),
+                            None,
+                        )
+                        cold = next(
+                            (s for s in self._slots if s.status == SlotStatus.FREE_COLD),
+                            None,
+                        )
+
+                        if warm is not None:
+                            port, h = self._reserve_starting_locked(
+                                warm, agent_id, space_id
+                            )
+                            if h is not None:
+                                pending_stops.append(h)
+                            launch_job = (warm.slot_id, port)
+                        elif cold is not None:
+                            # Cap: count of live process trees must stay ≤ K
+                            if self._count_live_processes() >= self.config.K:
+                                raise PoolFullError(f"pool at hard K={self.config.K}")
+                            port, h = self._reserve_starting_locked(
+                                cold, agent_id, space_id
+                            )
+                            if h is not None:
+                                pending_stops.append(h)
+                            launch_job = (cold.slot_id, port)
+                        else:
+                            raise PoolFullError(
+                                f"pool at hard K={self.config.K}; all slots leased"
+                            )
+                except (SpaceInUseError, PoolFullError) as exc:
+                    bookkeeping_error = exc
+
+        # Dropped lock — stop / launch IO (and any CDP wait) happens here.
+        for h in pending_stops:
+            self.launcher.stop(h)
+
+        if bookkeeping_error is not None:
+            raise bookkeeping_error
+
+        if early_result is not None:
+            return early_result
+
+        assert launch_job is not None
+        slot_id, port = launch_job
+        try:
+            handle = self.launcher.launch(space_id, port)
+        except Exception:
+            # Failed launch must not leave the slot stuck in STARTING
+            with self._lock:
+                self._reset_slot_cold(self._slots[slot_id])
+            raise
+
+        with self._lock:
+            slot = self._slots[slot_id]
+            # Ownership check: still our STARTING reservation?
+            if (
+                slot.status != SlotStatus.STARTING
+                or slot.space_id != space_id
+                or slot.agent_id != agent_id
+            ):
+                # Lost reservation (should be rare); tear down the orphan tree outside.
+                orphan = handle
+            else:
+                return self._finish_launch_locked(
+                    slot, agent_id, space_id, ttl_seconds, handle
+                )
+
+        self.launcher.stop(orphan)
+        raise PoolFullError(
+            f"slot {slot_id} lost STARTING reservation during launch for space_id={space_id!r}"
+        )
+
     def heartbeat(self, lease_id: str) -> dict[str, Any]:
+        stop_handle: LaunchHandle | None = None
+        expired = False
+        result: dict[str, Any] | None = None
         with self._lock:
             lease = self._leases.get(lease_id)
             if not lease:
@@ -308,70 +435,46 @@ class BrowserPool:
             now = time.time()
             # Hard lease TTL: release then fail (do not refresh); never keep warm
             if lease.expires_at is not None and now >= lease.expires_at:
-                self._release_locked(lease_id, reason="hard_ttl_expired", allow_warm=False)
-                raise LeaseExpiredError(lease_id)
-            slot.last_heartbeat = now
-            return {
-                "lease_id": lease_id,
-                "ok": True,
-                "last_heartbeat": now,
-                "idle_ttl_seconds": self.config.idle_ttl_seconds,
-            }
+                stop_handle = self._detach_lease_locked(
+                    lease_id, allow_warm=False
+                )
+                expired = True
+            else:
+                slot.last_heartbeat = now
+                result = {
+                    "lease_id": lease_id,
+                    "ok": True,
+                    "last_heartbeat": now,
+                    "idle_ttl_seconds": self.config.idle_ttl_seconds,
+                }
+
+        if stop_handle is not None:
+            self.launcher.stop(stop_handle)
+        if expired:
+            raise LeaseExpiredError(lease_id)
+        assert result is not None
+        return result
 
     def release(self, lease_id: str, reason: str = "client_release") -> dict[str, Any]:
         """Explicit client DELETE — may keep warm up to W."""
         with self._lock:
-            return self._release_locked(lease_id, reason=reason, allow_warm=True)
+            lease = self._leases.get(lease_id)
+            if not lease:
+                raise LeaseNotFoundError(lease_id)
+            slot_id = lease.slot_id
+            stop_handle = self._detach_lease_locked(lease_id, allow_warm=True)
+            slot = self._slots[slot_id]
+            kept_warm = slot.status == SlotStatus.FREE_WARM
+            result = {
+                "lease_id": lease_id,
+                "released": True,
+                "reason": reason,
+                "kept_warm": kept_warm,
+            }
 
-    def _release_locked(
-        self,
-        lease_id: str,
-        reason: str = "client_release",
-        *,
-        allow_warm: bool = False,
-    ) -> dict[str, Any]:
-        """Release assuming ``self._lock`` is held.
-
-        ``allow_warm`` is True only for explicit client DELETE. Idle / hard-TTL
-        evictions always stop Chromium (no FREE_WARM / no stale CDP handoff).
-        """
-        lease = self._leases.get(lease_id)
-        if not lease:
-            raise LeaseNotFoundError(lease_id)
-        slot = self._find_slot_by_lease(lease_id)
-        if not slot:
-            raise LeaseNotFoundError(lease_id)
-
-        keep_warm = allow_warm and self._count_warm() < self.config.W
-
-        if keep_warm:
-            # Detach lease; keep process as FREE_WARM with Space binding for reuse
-            self._clear_lease_fields(slot)
-            slot.status = SlotStatus.FREE_WARM
-            # Keep space_id so a later lease for the same Space can reuse the process
-        else:
-            self._stop_slot(slot)
-            slot.status = SlotStatus.FREE_COLD
-
-        del self._leases[lease_id]
-        return {"lease_id": lease_id, "released": True, "reason": reason, "kept_warm": keep_warm}
-
-    def _clear_lease_fields(self, slot: SlotState) -> None:
-        slot.lease_id = None
-        slot.agent_id = None
-        slot.last_heartbeat = None
-        slot.leased_at = None
-
-    def _stop_slot(self, slot: SlotState) -> None:
-        handle = self._handles.pop(slot.slot_id, None)
-        self.launcher.stop(handle)
-        slot.chromium_pid = None
-        slot.cdp_port = None
-        slot.cdp_http_url = None
-        slot.cdp_ws_url = None
-        slot.rss_bytes = None
-        self._clear_lease_fields(slot)
-        slot.space_id = None
+        if stop_handle is not None:
+            self.launcher.stop(stop_handle)
+        return result
 
     def evict_idle(self, now: float | None = None) -> list[str]:
         """Soft-evict idle leases and hard-TTL-expired leases.
@@ -379,9 +482,11 @@ class BrowserPool:
         Re-checks staleness / expiry under the lock immediately before teardown
         so a concurrent heartbeat cannot be raced into an eviction.
         Evictions never keep warm (always stop Chromium).
+        Stop IO runs outside the lock.
         """
         now = now if now is not None else time.time()
         evicted: list[str] = []
+        pending_stops: list[LaunchHandle] = []
         with self._lock:
             candidates = [
                 s.lease_id
@@ -397,7 +502,9 @@ class BrowserPool:
                 # Hard TTL takes precedence
                 if lease.expires_at is not None and now >= lease.expires_at:
                     try:
-                        self._release_locked(lid, reason="hard_ttl_expired", allow_warm=False)
+                        h = self._detach_lease_locked(lid, allow_warm=False)
+                        if h is not None:
+                            pending_stops.append(h)
                         evicted.append(lid)
                     except LeaseNotFoundError:
                         pass
@@ -410,16 +517,28 @@ class BrowserPool:
                     # Heartbeat refreshed after any stale snapshot — skip
                     continue
                 try:
-                    self._release_locked(lid, reason="idle_evicted", allow_warm=False)
+                    h = self._detach_lease_locked(lid, allow_warm=False)
+                    if h is not None:
+                        pending_stops.append(h)
                     evicted.append(lid)
                 except LeaseNotFoundError:
                     pass
+
+        for h in pending_stops:
+            self.launcher.stop(h)
         return evicted
 
     def shutdown(self) -> None:
+        pending_stops: list[LaunchHandle] = []
         with self._lock:
             for slot in self._slots:
-                if slot.chromium_pid is not None:
-                    self._stop_slot(slot)
-                    slot.status = SlotStatus.FREE_COLD
+                handle = self._handles.pop(slot.slot_id, None)
+                if handle is not None:
+                    pending_stops.append(handle)
+                self._clear_process_fields(slot)
+                self._clear_lease_fields(slot)
+                slot.space_id = None
+                slot.status = SlotStatus.FREE_COLD
             self._leases.clear()
+        for h in pending_stops:
+            self.launcher.stop(h)

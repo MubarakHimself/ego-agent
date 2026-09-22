@@ -86,6 +86,16 @@ Returns `{K,W,live,warm,leased,mock,slots[…]}` including per-slot `rss_bytes` 
 
 Liveness probe.
 
+## Concurrency
+
+The pool uses a single `threading.RLock` for slot / lease bookkeeping only.
+**Chromium `stop` / `launch` (and any CDP wait) run outside the lock.** While a
+slot is `STARTING`, other agents can still heartbeat existing leases, read
+`GET /v1/pool/status`, and lease *different* `space_id`s. Space exclusivity
+still applies: a second lease for the same `space_id` gets `409` while the
+first is `LEASED` or `STARTING`. Callers see no new request fields — semantics
+are transparent aside from lower latency under concurrent load.
+
 ## Driver notes
 
 - Drive leased browsers via CDP (`cdp_http_url` / DevTools WebSocket).
