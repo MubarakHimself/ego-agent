@@ -22,7 +22,7 @@ MVP is always **isolated** mode (one process tree per Space). There is no `mode`
 | `cdp_base_port` | 9222 | Slot *i* uses port `9222 + i` |
 | `host` / `port` | `127.0.0.1` / `8755` | API bind |
 
-Env overrides: `EGO_POOL_MOCK=1`, `EGO_POOL_CHROME`, `EGO_POOL_SPACES_ROOT`, `EGO_POOL_K`, `EGO_POOL_W`, `EGO_POOL_PORT`, `EGO_POOL_HEADLESS=0`.
+Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`.
 
 ## Endpoints
 
@@ -104,4 +104,4 @@ are transparent aside from lower latency under concurrent load.
 
 ## RSS sampling hook
 
-`ego_pool.rss.sample_tree_rss(pid)` sums `/proc` VmRSS across the process tree (Linux). Returns `None` if unavailable. Exposed on slot status as `rss_bytes` for later K tuning — see README.
+`slipstream.rss.sample_tree_rss(pid)` sums `/proc` VmRSS across the process tree (Linux). Returns `None` if unavailable. Exposed on slot status as `rss_bytes` for later K tuning — see README.

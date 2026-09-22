@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ego-pool"
+name = "slipstream"
 version = "0.1.0"
 description = "Browser Pool Manager MVP — lease/heartbeat/release for K=5 Chromium CDP slots"
 readme = "README.md"
@@ -16,10 +16,10 @@ dependencies = []
 dev = ["pytest>=8.0"]
 
 [project.scripts]
-ego-pool = "ego_pool.__main__:main"
+slipstream = "slipstream.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["ego_pool*"]
+include = ["slipstream*"]
 
 [tool.pytest.ini_options]
 markers = [

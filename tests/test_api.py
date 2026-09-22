@@ -8,9 +8,9 @@ import urllib.request
 
 import pytest
 
-from ego_pool.api import PoolServer
-from ego_pool.config import PoolConfig
-from ego_pool.pool import BrowserPool
+from slipstream.api import PoolServer
+from slipstream.config import PoolConfig
+from slipstream.pool import BrowserPool
 
 
 @pytest.fixture
@@ -163,7 +163,7 @@ def test_launch_failure_returns_503(api_server: PoolServer, monkeypatch):
     # Slot freed — subsequent lease (with mock restored) works
     monkeypatch.undo()
     # Re-bind a working launch by creating a fresh mock launcher behavior
-    from ego_pool.launcher import ChromiumLauncher
+    from slipstream.launcher import ChromiumLauncher
 
     api_server.pool.launcher = ChromiumLauncher(api_server.pool.config)
     code, lease = _req("POST", f"{base}/v1/leases", {"agent_id": "a1", "space_id": "s1"})

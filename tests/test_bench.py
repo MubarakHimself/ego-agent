@@ -18,7 +18,7 @@ BENCH = ROOT / "scripts" / "bench_pool.py"
 def test_bench_mock_timings(tmp_path):
     out = tmp_path / "bench.json"
     env = os.environ.copy()
-    env["EGO_POOL_MOCK"] = "1"
+    env["SLIPSTREAM_MOCK"] = "1"
     proc = subprocess.run(
         [sys.executable, str(BENCH), "--mode", "MOCK", "--out", str(out)],
         cwd=str(ROOT),
@@ -40,10 +40,10 @@ def test_bench_mock_timings(tmp_path):
 
 @pytest.mark.bench
 def test_bench_live_timings(tmp_path):
-    if os.environ.get("EGO_POOL_MOCK") == "1":
-        pytest.skip("EGO_POOL_MOCK=1 set")
+    if os.environ.get("SLIPSTREAM_MOCK") == "1":
+        pytest.skip("SLIPSTREAM_MOCK=1 set")
     out = tmp_path / "bench-live.json"
-    env = {k: v for k, v in os.environ.items() if k != "EGO_POOL_MOCK"}
+    env = {k: v for k, v in os.environ.items() if k != "SLIPSTREAM_MOCK"}
     proc = subprocess.run(
         [sys.executable, str(BENCH), "--mode", "LIVE", "--out", str(out)],
         cwd=str(ROOT),

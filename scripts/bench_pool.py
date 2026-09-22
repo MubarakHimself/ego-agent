@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pool speed benchmark — LIVE (real Chrome) and/or MOCK (EGO_POOL_MOCK=1).
+"""Pool speed benchmark — LIVE (real Chrome) and/or MOCK (SLIPSTREAM_MOCK=1).
 
 Measures wall times for:
   - cold lease (first launch)
@@ -11,9 +11,9 @@ Measures wall times for:
 
 Usage:
   # Mock only (no Chrome)
-  EGO_POOL_MOCK=1 python scripts/bench_pool.py --mode MOCK
+  SLIPSTREAM_MOCK=1 python scripts/bench_pool.py --mode MOCK
 
-  # Live Chrome (system google-chrome / EGO_POOL_CHROME)
+  # Live Chrome (system google-chrome / SLIPSTREAM_CHROME)
   python scripts/bench_pool.py --mode LIVE
 
   # Both
@@ -41,10 +41,10 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from ego_pool.cdp_http import navigate_via_json_new, wait_cdp_ready
-from ego_pool.config import PoolConfig
-from ego_pool.launcher import find_chrome_binary
-from ego_pool.pool import BrowserPool
+from slipstream.cdp_http import navigate_via_json_new, wait_cdp_ready
+from slipstream.config import PoolConfig
+from slipstream.launcher import find_chrome_binary
+from slipstream.pool import BrowserPool
 
 
 def _ms(t0: float, t1: float | None = None) -> float:
@@ -225,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         "--mode",
         choices=("LIVE", "MOCK", "BOTH"),
         default=os.environ.get("EGO_BENCH_MODE", "BOTH"),
-        help="LIVE=real Chrome, MOCK=EGO_POOL_MOCK, BOTH=run each (default BOTH)",
+        help="LIVE=real Chrome, MOCK=SLIPSTREAM_MOCK, BOTH=run each (default BOTH)",
     )
     parser.add_argument(
         "--navigate-url",
@@ -240,8 +240,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--chrome",
-        default=os.environ.get("EGO_POOL_CHROME") or None,
-        help="Chrome binary path (default: auto-detect / EGO_POOL_CHROME)",
+        default=os.environ.get("SLIPSTREAM_CHROME") or None,
+        help="Chrome binary path (default: auto-detect / SLIPSTREAM_CHROME)",
     )
     args = parser.parse_args(argv)
 
@@ -268,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             continue
-        # mock= is passed explicitly to PoolConfig; no EGO_POOL_MOCK env mutate.
+        # mock= is passed explicitly to PoolConfig; no SLIPSTREAM_MOCK env mutate.
         run = _run_once(
             mock=mock,
             chrome_binary=None if mock else chrome,

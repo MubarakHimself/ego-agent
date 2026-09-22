@@ -23,7 +23,7 @@ class PoolConfig:
     host: str = "127.0.0.1"
     port: int = 8755
     headless: bool = True
-    mock: bool = field(default_factory=lambda: os.environ.get("EGO_POOL_MOCK", "") == "1")
+    mock: bool = field(default_factory=lambda: os.environ.get("SLIPSTREAM_MOCK", "") == "1")
     chrome_binary: str | None = None  # auto-detect if None
 
     @staticmethod
@@ -56,18 +56,18 @@ class PoolConfig:
     @classmethod
     def from_env(cls) -> PoolConfig:
         cfg = cls()
-        if os.environ.get("EGO_POOL_MOCK") == "1":
+        if os.environ.get("SLIPSTREAM_MOCK") == "1":
             cfg.mock = True
-        if os.environ.get("EGO_POOL_HEADLESS", "1") == "0":
+        if os.environ.get("SLIPSTREAM_HEADLESS", "1") == "0":
             cfg.headless = False
-        if bin_path := os.environ.get("EGO_POOL_CHROME"):
+        if bin_path := os.environ.get("SLIPSTREAM_CHROME"):
             cfg.chrome_binary = bin_path
-        if root := os.environ.get("EGO_POOL_SPACES_ROOT"):
+        if root := os.environ.get("SLIPSTREAM_SPACES_ROOT"):
             cfg.spaces_root = Path(root)
-        if k := os.environ.get("EGO_POOL_K"):
+        if k := os.environ.get("SLIPSTREAM_K"):
             cfg.K = int(k)
-        if w := os.environ.get("EGO_POOL_W"):
+        if w := os.environ.get("SLIPSTREAM_W"):
             cfg.W = int(w)
-        if port := os.environ.get("EGO_POOL_PORT"):
+        if port := os.environ.get("SLIPSTREAM_PORT"):
             cfg.port = int(port)
         return cfg

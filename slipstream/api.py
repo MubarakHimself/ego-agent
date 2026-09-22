@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
-from ego_pool.pool import (
+from slipstream.pool import (
     BrowserPool,
     LeaseExpiredError,
     LeaseNotFoundError,

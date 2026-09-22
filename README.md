@@ -1,4 +1,8 @@
-# ego-agent
+# Slipstream
+
+Fast multi-agent browser lanes over CDP. Inspired by public ego-lite patterns — not a fork of CitroLabs ego lite.
+
+# slipstream
 
 Personal multi-agent **CDP browser pool** (research → build).
 
@@ -22,15 +26,15 @@ Architecture locked — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and F
 ## Layout
 
 ```text
-ego_pool/          # Pool service package
+slipstream/          # Pool service package
   config.py        # K=5, W=1, idle_ttl=300, spaces_root, cdp_base_port
   models.py        # SlotState, Lease
-  launcher.py      # ChromiumLauncher (CDP + user-data-dir); mock via EGO_POOL_MOCK=1
+  launcher.py      # ChromiumLauncher (CDP + user-data-dir); mock via SLIPSTREAM_MOCK=1
   cdp_http.py      # Thin DevTools HTTP helpers (smoke/bench; not full driver)
   rss.py           # sample_tree_rss(pid) — /proc tree RSS hook
   pool.py          # BrowserPool lease/heartbeat/release/evict
   api.py           # HTTP JSON API (stdlib)
-  __main__.py      # python -m ego_pool
+  __main__.py      # python -m slipstream
 scripts/
   bench_pool.py    # LIVE + MOCK pool speed benchmark
 tests/             # pytest (mocked by default; @pytest.mark.live / bench)
@@ -51,10 +55,10 @@ source .venv/bin/activate
 pip install -r requirements.txt   # pytest only; service is stdlib
 
 # Mock mode (no Chrome required)
-EGO_POOL_MOCK=1 python -m ego_pool --port 8755
+SLIPSTREAM_MOCK=1 python -m slipstream --port 8755
 
-# Real Chrome (system google-chrome / chromium; or EGO_POOL_CHROME=/usr/bin/google-chrome)
-python -m ego_pool --port 8755
+# Real Chrome (system google-chrome / chromium; or SLIPSTREAM_CHROME=/usr/bin/google-chrome)
+python -m slipstream --port 8755
 ```
 
 Base URL: `http://127.0.0.1:8755` — see [`docs/POOL_API.md`](docs/POOL_API.md).
@@ -73,7 +77,7 @@ curl -s -X DELETE http://127.0.0.1:8755/v1/leases/<lease_id>
 
 Spaces are exclusive while leased (second agent gets HTTP 409). Warm slots (from explicit DELETE only) with a matching live `space_id` are reused without relaunch. Idle / hard-TTL always stop Chromium.
 
-Drive a leased browser via CDP (`cdp_http_url` / DevTools WebSocket) or Playwright `connectOverCDP`. Smoke/bench use thin HTTP helpers in `ego_pool.cdp_http` (PUT `/json/new`).
+Drive a leased browser via CDP (`cdp_http_url` / DevTools WebSocket) or Playwright `connectOverCDP`. Smoke/bench use thin HTTP helpers in `slipstream.cdp_http` (PUT `/json/new`).
 
 ## Tests
 
@@ -81,14 +85,14 @@ Drive a leased browser via CDP (`cdp_http_url` / DevTools WebSocket) or Playwrig
 source .venv/bin/activate
 
 # Unit tests (mocked launcher — no browsers needed)
-EGO_POOL_MOCK=1 pytest -q -m "not live and not bench"
+SLIPSTREAM_MOCK=1 pytest -q -m "not live and not bench"
 
-# Optional live smoke only (requires Chrome on PATH or EGO_POOL_CHROME)
+# Optional live smoke only (requires Chrome on PATH or SLIPSTREAM_CHROME)
 # lease → CDP ready → navigate example.com → title check → heartbeat → release → warm reuse
 pytest -q -m live
 
-# Optional bench via pytest (-m bench only; LIVE needs Chrome, skips if EGO_POOL_MOCK=1)
-EGO_POOL_MOCK=1 pytest -q -m bench          # MOCK timings
+# Optional bench via pytest (-m bench only; LIVE needs Chrome, skips if SLIPSTREAM_MOCK=1)
+SLIPSTREAM_MOCK=1 pytest -q -m bench          # MOCK timings
 pytest -q -m bench                          # LIVE timings (uses scripts/bench_pool.py)
 # Or run the harness directly:
 #   python scripts/bench_pool.py --mode LIVE|MOCK|BOTH
@@ -100,7 +104,7 @@ pytest -q -m bench                          # LIVE timings (uses scripts/bench_p
 source .venv/bin/activate
 
 # MOCK only (fast, no Chrome)
-EGO_POOL_MOCK=1 python scripts/bench_pool.py --mode MOCK --out benches/latest.json
+SLIPSTREAM_MOCK=1 python scripts/bench_pool.py --mode MOCK --out benches/latest.json
 
 # LIVE only (real Chrome; records cold lease, CDP ready, navigate, heartbeat, release, warm reuse)
 python scripts/bench_pool.py --mode LIVE --out benches/latest.json
@@ -113,7 +117,7 @@ JSON goes to stdout (and `--out` if set). Sample committed under [`benches/SAMPL
 
 ## RSS sampling (K-tuning hook)
 
-`ego_pool.rss.sample_tree_rss(pid) -> int | None` walks `/proc` and sums VmRSS (bytes) for the Chromium process tree. Returns `None` on non-Linux or if the pid is gone. Pool status includes `rss_bytes` per slot when available. Use this later to validate the K=5 RAM budget on Firstmate hardware before locking production K.
+`slipstream.rss.sample_tree_rss(pid) -> int | None` walks `/proc` and sums VmRSS (bytes) for the Chromium process tree. Returns `None` on non-Linux or if the pid is gone. Pool status includes `rss_bytes` per slot when available. Use this later to validate the K=5 RAM budget on Firstmate hardware before locking production K.
 
 ## Non-goals (MVP)
 

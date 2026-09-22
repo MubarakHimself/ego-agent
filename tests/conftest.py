@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from ego_pool.config import PoolConfig
-from ego_pool.pool import BrowserPool
+from slipstream.config import PoolConfig
+from slipstream.pool import BrowserPool
 
 
 @pytest.fixture

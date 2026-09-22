@@ -1,7 +1,7 @@
 """Chromium launcher stub — one process tree per slot via CDP.
 
 Finds google-chrome / chromium / Chrome-for-Testing. Launches with
---remote-debugging-port and --user-data-dir=<Space>. When EGO_POOL_MOCK=1
+--remote-debugging-port and --user-data-dir=<Space>. When SLIPSTREAM_MOCK=1
 (or config.mock), launch is a no-op stub (fake PID/ports).
 """
 
@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from ego_pool.config import PoolConfig
+from slipstream.config import PoolConfig
 
 
 CHROME_CANDIDATES = (
@@ -93,7 +93,7 @@ class ChromiumLauncher:
         if not self._binary:
             raise RuntimeError(
                 "No Chrome/Chromium binary found. Install google-chrome or "
-                "chromium, set EGO_POOL_CHROME, or use EGO_POOL_MOCK=1."
+                "chromium, set SLIPSTREAM_CHROME, or use SLIPSTREAM_MOCK=1."
             )
 
         args = [

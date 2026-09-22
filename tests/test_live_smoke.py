@@ -6,11 +6,11 @@ import os
 
 import pytest
 
-from ego_pool.cdp_http import navigate_via_json_new, wait_cdp_ready
-from ego_pool.config import PoolConfig
-from ego_pool.launcher import find_chrome_binary
-from ego_pool.pool import BrowserPool
-from ego_pool.rss import sample_tree_rss
+from slipstream.cdp_http import navigate_via_json_new, wait_cdp_ready
+from slipstream.config import PoolConfig
+from slipstream.launcher import find_chrome_binary
+from slipstream.pool import BrowserPool
+from slipstream.rss import sample_tree_rss
 
 
 @pytest.mark.live
@@ -18,8 +18,8 @@ def test_live_chrome_lease_navigate_heartbeat_release(tmp_path):
     binary = find_chrome_binary()
     if not binary:
         pytest.skip("No Chrome/Chromium binary on PATH")
-    if os.environ.get("EGO_POOL_MOCK") == "1":
-        pytest.skip("EGO_POOL_MOCK=1 set")
+    if os.environ.get("SLIPSTREAM_MOCK") == "1":
+        pytest.skip("SLIPSTREAM_MOCK=1 set")
 
     cfg = PoolConfig(
         K=1,

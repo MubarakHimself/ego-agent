@@ -7,10 +7,10 @@ import threading
 import time
 from typing import Any
 
-from ego_pool.config import PoolConfig
-from ego_pool.launcher import ChromiumLauncher, LaunchHandle
-from ego_pool.models import Lease, SlotState, SlotStatus, new_lease_id
-from ego_pool.rss import sample_tree_rss
+from slipstream.config import PoolConfig
+from slipstream.launcher import ChromiumLauncher, LaunchHandle
+from slipstream.models import Lease, SlotState, SlotStatus, new_lease_id
+from slipstream.rss import sample_tree_rss
 
 
 class PoolFullError(Exception):

@@ -7,17 +7,17 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ego_pool.config import PoolConfig
-from ego_pool.launcher import LaunchHandle
-from ego_pool.models import SlotStatus
-from ego_pool.pool import (
+from slipstream.config import PoolConfig
+from slipstream.launcher import LaunchHandle
+from slipstream.models import SlotStatus
+from slipstream.pool import (
     BrowserPool,
     LeaseExpiredError,
     LeaseNotFoundError,
     PoolFullError,
     SpaceInUseError,
 )
-from ego_pool.rss import sample_tree_rss
+from slipstream.rss import sample_tree_rss
 
 
 def test_config_defaults():
@@ -141,7 +141,7 @@ def test_idempotent_dead_leased_handle_cold_starts(pool: BrowserPool):
 
 def test_stop_final_wait_timeout_is_best_effort(mock_config):
     """TimeoutExpired on final wait must not raise — release can clear lease state."""
-    from ego_pool.launcher import ChromiumLauncher
+    from slipstream.launcher import ChromiumLauncher
 
     launcher = ChromiumLauncher(mock_config)
     proc = MagicMock()
@@ -161,7 +161,7 @@ def test_stop_final_wait_timeout_is_best_effort(mock_config):
         process=proc,
         mocked=False,
     )
-    with patch("ego_pool.launcher.os.killpg"):
+    with patch("slipstream.launcher.os.killpg"):
         launcher.stop(handle, grace_seconds=0.01)  # must not raise
     assert proc.wait.call_count == 2
 
@@ -359,7 +359,7 @@ def test_rss_hook_self_process():
 
 
 def test_sample_tree_rss_mb_removed():
-    import ego_pool.rss as rss_mod
+    import slipstream.rss as rss_mod
 
     assert not hasattr(rss_mod, "sample_tree_rss_mb")
 

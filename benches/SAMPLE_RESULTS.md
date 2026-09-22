@@ -19,7 +19,7 @@ Captured on Firstmate box during `ego-runtime-livebench-001`.
 
 Navigate snapshot: title=`Example Domain`, url=`https://example.com/`, warm_reuse_same_cdp=`True`, warm_reuse_same_pid=`True` (pid=596185).
 
-## MOCK (`EGO_POOL_MOCK=1`)
+## MOCK (`SLIPSTREAM_MOCK=1`)
 
 | Metric | ms | Scope |
 |---|---|---|

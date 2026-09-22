@@ -7,7 +7,7 @@ No Electron / Jev / Laya / proprietary ego binary code.
 
 __version__ = "0.1.0"
 
-from ego_pool.config import PoolConfig
-from ego_pool.pool import BrowserPool
+from slipstream.config import PoolConfig
+from slipstream.pool import BrowserPool
 
 __all__ = ["PoolConfig", "BrowserPool", "__version__"]
