@@ -204,7 +204,15 @@ def test_watch_mark_signed_in_tokenized(api_server: PoolServer):
     watch_url = out["harness"]["watch_url"]
     token = urllib.parse.parse_qs(urllib.parse.urlparse(watch_url).query)["token"][0]
     lid = out["lease"]["lease_id"]
-    # Confirm take-over first (optional for mark, but exercises path)
+    # ADV-LOGIN-002: mark without Take-over confirm → 403
+    code, forbidden = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/mark-signed-in?token={token}",
+        {"signed_in": True, "host": "news.ycombinator.com"},
+    )
+    assert code == 403
+    assert forbidden.get("error") == "forbidden"
+    # Confirm take-over then mark
     _req("POST", f"{base}/v1/leases/{lid}/watch/confirm?token={token}", {})
     code, marked = _req(
         "POST",
@@ -221,6 +229,15 @@ def test_watch_mark_signed_in_tokenized(api_server: PoolServer):
         {"signed_in": True},
     )
     assert code in (401, 403, 404)
+
+
+def test_mark_signed_in_refuses_storage_state_dump_keys():
+    """ADV-LOGIN-004: storage_state / dump treated as secret-like fields."""
+    from slipstream.alerts import AlertValidationError, reject_secret_fields
+
+    for key in ("storage_state", "dump", "storageState"):
+        with pytest.raises(AlertValidationError):
+            reject_secret_fields({key: "nope"})
 
 
 def test_refuse_secret_free_read_endpoints(api_server: PoolServer):
@@ -245,6 +262,13 @@ def test_refuse_secret_free_read_endpoints(api_server: PoolServer):
         "POST",
         f"{base}/v1/spaces/s1/signed-in",
         {"signed_in": True, "password": "nope"},
+    )
+    assert code == 400
+    assert body.get("error") == "invalid_signed_in"
+    code, body = _req(
+        "POST",
+        f"{base}/v1/spaces/s1/signed-in",
+        {"signed_in": True, "storage_state": "{}"},
     )
     assert code == 400
     assert body.get("error") == "invalid_signed_in"

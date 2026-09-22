@@ -620,6 +620,43 @@ def cmd_leases_list(
     return 0
 
 
+
+
+def cmd_sessions(
+    *,
+    q: str | None = None,
+    tags: list[str] | None = None,
+    url: str | None = None,
+    as_json: bool = False,
+) -> int:
+    """GET /v1/ops/sessions — ops list with duration + watch presence."""
+    from slipstream.metadata import MetadataValidationError, combine_q
+    from slipstream.sessions import format_sessions_table
+
+    base = resolve_base_url(url)
+    try:
+        query = combine_q(q, tags)
+    except MetadataValidationError as e:
+        raise CliError(str(e), exit_code=2) from e
+    path = f"{base}/v1/ops/sessions"
+    if query:
+        path = f"{path}?q={quote(query)}"
+    status, payload = _request("GET", path)
+    if status != 200:
+        _fail_http(status, payload)
+    if as_json:
+        _print_json(payload)
+        return 0
+    sessions = payload.get("sessions") or []
+    sys.stdout.write(format_sessions_table(sessions))
+    # Tip: secret watch_url only in --json
+    if any(s.get("watch_url") for s in sessions):
+        sys.stdout.write(
+            "# watch_url present (secret) — use --json to print tokenized URLs\n"
+        )
+    return 0
+
+
 def cmd_spaces_signed_in(
     *,
     space_id: str,
