@@ -52,7 +52,7 @@ class DownloadForbiddenError(DownloadError):
 
 
 _SAFE_LEASE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-_SAFE_ARTIFACT_RE = re.compile(r"^(dl|up)_[A-Za-z0-9]{8,32}$")
+_SAFE_ARTIFACT_RE = re.compile(r"^(dl|up|ev)_[A-Za-z0-9]{8,32}$")
 _SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9._+@%-][A-Za-z0-9._+@% -]{0,199}$")
 
 # Filenames that look like secrets — refuse list/serve/upload.
@@ -84,8 +84,9 @@ _LABEL_ARTIFACT_DIR = "artifact dir"
 KIND_DOWNLOADS = "downloads"
 _HAS_O_NOFOLLOW = hasattr(os, "O_NOFOLLOW")
 KIND_UPLOADS = "uploads"
+KIND_EVIDENCE = "evidence"
 _LEASES_DIRNAME = "leases"
-_ARTIFACT_KINDS = frozenset({KIND_DOWNLOADS, KIND_UPLOADS})
+_ARTIFACT_KINDS = frozenset({KIND_DOWNLOADS, KIND_UPLOADS, KIND_EVIDENCE})
 
 
 # ---------------------------------------------------------------------------
@@ -149,8 +150,13 @@ def sanitize_upload_filename(raw: Any) -> str:
 
 
 def artifact_id_for_filename(filename: str, *, kind: str = KIND_DOWNLOADS) -> str:
-    """Stable id from basename (dl_/up_ + sha256 prefix)."""
-    prefix = "dl" if kind == KIND_DOWNLOADS else "up"
+    """Stable id from basename (dl_/up_/ev_ + sha256 prefix)."""
+    if kind == KIND_EVIDENCE:
+        prefix = "ev"
+    elif kind == KIND_DOWNLOADS:
+        prefix = "dl"
+    else:
+        prefix = "up"
     digest = hashlib.sha256(filename.encode("utf-8")).hexdigest()[:16]
     return f"{prefix}_{digest}"
 
@@ -176,7 +182,7 @@ def ensure_lease_artifact_dirs(artifacts_root: Path, lease_id: str) -> dict[str,
     Path.resolve through unverified ancestors.
     """
     out: dict[str, Path] = {}
-    for kind in (KIND_DOWNLOADS, KIND_UPLOADS):
+    for kind in (KIND_DOWNLOADS, KIND_UPLOADS, KIND_EVIDENCE):
         with walk_lease_kind_dir(
             artifacts_root, lease_id, kind, create=True
         ) as handle:
@@ -251,7 +257,7 @@ def _public_meta(
         "bytes": size,
         "sha256": sha256,
         "created_at": created_at,
-        "kind": "download" if kind == KIND_DOWNLOADS else "upload",
+        "kind": ("download" if kind == KIND_DOWNLOADS else ("evidence" if kind == KIND_EVIDENCE else "upload")),
     }
     if include_rel_path:
         out["path"] = f"{kind}/{filename}"

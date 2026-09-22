@@ -273,6 +273,7 @@ def render_watch_html(
     cede_url: str | None = None,
     events_url: str | None = None,
     timeline_url: str | None = None,
+    evidence_url: str | None = None,
     signed_in: bool = False,
     signed_in_host: str | None = None,
     mark_signed_in_url: str | None = None,
@@ -291,6 +292,8 @@ def render_watch_html(
     why = html.escape(reason or "other")
     safe_detail = html.escape(scrub_text(detail or "")[:200])
     frame_href = html.escape(frame_url, quote=True)
+    events_href = html.escape(events_url, quote=True) if events_url else ""
+    evidence_href = html.escape(evidence_url, quote=True) if evidence_url else ""
     exp = html.escape(str(max(0, int(expires_in_s))))
     if input_enabled:
         mode_label = html.escape("Pair-browse (exclusive)")
@@ -337,7 +340,6 @@ def render_watch_html(
         else '<meta http-equiv="refresh" content="2"/>'
     )
 
-    events_href = html.escape(events_url, quote=True) if events_url else ""
 
     parts = [
         '<!DOCTYPE html><html lang="en"><head>',
@@ -382,7 +384,7 @@ def render_watch_html(
         ".scrub .ticks{position:relative;height:0.4rem;max-width:520px;margin-top:0.15rem;}",
         ".scrub .tick{position:absolute;top:0;width:2px;height:0.4rem;background:#568;}",
         ".scrub-sum{min-height:1.2rem;color:#9cf;font-size:0.85rem;}",
-        ".feed .ev.hi{background:#243048;outline:1px solid #46a;}",
+        ".feed .ev.hi{background:#243048;outline:1px solid #46a;}.feed .ev{cursor:pointer;}.evidence{flex:0 1 280px;max-width:100%;max-height:70vh;overflow:auto;border:1px solid #333;background:#1a1a1a;padding:0.5rem 0.75rem;font-size:0.8rem;}.evidence h2{margin:0 0 0.5rem;font-size:0.95rem;color:#ccc;}.evidence .thumb{max-width:100%;border:1px solid #444;background:#000;margin-top:0.35rem;}.evidence .refs{color:#9cf;font-size:0.75rem;margin-top:0.25rem;}.evidence .empty{color:#666;}",
         "</style></head><body>",
         "<h1>Slipstream Watch</h1>",
         '<p class="meta">Lease ',
@@ -431,13 +433,21 @@ def render_watch_html(
         parts.append(_signed_in_ok_html(signed_in_host))
     parts.append("</div>")  # .main
     # Activity feed dock (CTO 007) — polls tokenized /watch/events
-    parts.append('<aside class="feed" id="feed" aria-label="Activity feed">')
+    parts.append('<aside class="feed" id="feed" aria-label="Activity feed" data-events="'+events_href+'">')
     parts.append("<h2>Activity</h2>")
     parts.append('<div id="feed-list"><p class="empty">No events yet.</p></div>')
-    parts.append("</aside></div>")  # feed + layout
+    parts.append("</aside>")
+    parts.append('<aside class="evidence" id="evidence" aria-label="Evidence panel" data-evidence="'+evidence_href+'">')
+    parts.append("<h2>Evidence</h2>")
+    parts.append('<div id="evidence-meta" class="empty">Select a feed event.</div>')
+    parts.append('<img id="evidence-thumb" class="thumb" alt="evidence still" hidden/>')
+    parts.append('<div id="evidence-refs" class="refs"></div>')
+    parts.append("</aside></div>")  # evidence + layout
     if events_url:
-        # Poll feed + dual-timeline scrubber (feed-only seek; JPEG stays live).
-        parts.append(_activity_feed_client_script(events_url, timeline_url))
+        # Poll feed + dual-timeline scrubber + evidence panel (JPEG stays live).
+        parts.append(
+            _activity_feed_client_script(events_url, timeline_url, evidence_url)
+        )
 
 
     if input_enabled and input_url:
@@ -479,7 +489,7 @@ def render_watch_html(
 _ACTIVITY_FEED_JS = (
     "(function(){"
     "var EVENTS_URL=__EVENTS__;"
-    "var TIMELINE_URL=__TIMELINE__;"
+    "var TIMELINE_URL=__TIMELINE__;var EVIDENCE_URL=__EVIDENCE__;"
     "var list=document.getElementById('feed-list');"
     "var wallEl=document.getElementById('wall-clock');"
     "var evEl=document.getElementById('event-clock');"
@@ -487,7 +497,7 @@ _ACTIVITY_FEED_JS = (
     "var range=document.getElementById('scrub-range');"
     "var ticks=document.getElementById('scrub-ticks');"
     "var sumEl=document.getElementById('scrub-sum');"
-    "var after=0;var markers=[];var live=true;var seekSeq=null;"
+    "var after=0;var markers=[];var live=true;var seekSeq=null;var evMap={};"
     "function fmt(ts){try{return new Date(ts*1000).toLocaleTimeString();}catch(e){return '';}}"
     "function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\"/g,'&quot;');}"
     "function setWall(){if(wallEl)wallEl.textContent=new Date().toLocaleTimeString();}"
@@ -497,6 +507,19 @@ _ACTIVITY_FEED_JS = (
     "var on=!live&&seekSeq!=null&&String(rows[i].getAttribute('data-seq'))===String(seekSeq);"
     "rows[i].className=on?'ev hi':'ev';"
     "if(on)rows[i].scrollIntoView({block:'nearest'});}}"
+    "function showEvidence(seq){"
+    "var meta=document.getElementById('evidence-meta');"
+    "var img=document.getElementById('evidence-thumb');"
+    "var refs=document.getElementById('evidence-refs');"
+    "if(!seq||!EVIDENCE_URL){if(meta){meta.className='empty';meta.textContent='Select a feed event.';}"
+    "if(img)img.hidden=true;if(refs)refs.textContent='';return;}"
+    "var m=evMap[String(seq)];"
+    "if(!m){if(meta){meta.className='empty';meta.textContent='No evidence for #'+seq;}"
+    "if(img)img.hidden=true;if(refs)refs.textContent='';return;}"
+    "if(meta){meta.className='';meta.textContent=esc(m.kind||'')+' · '+esc(m.summary||'')+' · #'+seq;}"
+    "if(refs)refs.textContent=(m.refs&&m.refs.length)?('refs: '+m.refs.map(esc).join(', ')):'';"
+    "if(img){var u=EVIDENCE_URL+(EVIDENCE_URL.indexOf('?')>=0?'&':'?')+'seq='+seq+'&_t='+Date.now();"
+    "img.hidden=false;img.src=u;}}"
     "function applySeek(idx){"
     "if(!markers.length){live=true;seekSeq=null;if(evEl)evEl.textContent='live';"
     "if(sumEl)sumEl.textContent='';highlight();return;}"
@@ -504,7 +527,7 @@ _ACTIVITY_FEED_JS = (
     "var m=markers[idx];seekSeq=m.seq;"
     "if(evEl)evEl.textContent=live?'live':fmt(m.ts);"
     "if(sumEl)sumEl.textContent=live?'':(esc(m.kind)+' · '+esc(m.summary)+' · #'+m.seq);"
-    "if(range)range.value=String(idx);highlight();}"
+    "if(range)range.value=String(idx);highlight();if(!live)showEvidence(seekSeq);}"
     "function renderTicks(){"
     "if(!ticks||!range)return;ticks.innerHTML='';var n=markers.length;"
     "range.min='0';range.max=String(Math.max(0,n-1));"
@@ -524,6 +547,7 @@ _ACTIVITY_FEED_JS = (
     "+'<span class=\"k\">'+esc(r.kind)+'</span>'"
     "+'<span>'+esc(r.summary)+'</span> '"
     "+'<span class=\"'+oc+'\">'+esc(r.outcome)+'</span>';"
+    "(function(seq){d.addEventListener('click',function(){seekSeq=seq;live=false;showEvidence(seq);highlight();});})(r.seq||0);"
     "list.appendChild(d);}"
     "if(live)list.parentElement.scrollTop=list.parentElement.scrollHeight;highlight();}"
     "function pull(url,cb){if(!url)return;"
@@ -535,6 +559,10 @@ _ACTIVITY_FEED_JS = (
     "pull(u,function(data){if(data.events)addRows(data.events);});}"
     "function tickTimeline(){if(!TIMELINE_URL)return;"
     "pull(TIMELINE_URL,function(data){markers=data.markers||[];renderTicks();});}"
+    "function tickEvidence(){if(!EVIDENCE_URL)return;"
+    "pull(EVIDENCE_URL,function(data){evMap={};var rows=data.markers||[];"
+    "for(var i=0;i<rows.length;i++){evMap[String(rows[i].seq)]=rows[i];}"
+    "if(seekSeq!=null)showEvidence(seekSeq);});}"
     "function refreshFrame(){var img=document.getElementById('frame');if(!img)return;"
     "var u=img.getAttribute('data-src')||img.src.split('&_t=')[0];"
     "img.setAttribute('data-src',u);img.src=u+(u.indexOf('?')>=0?'&':'?')+'_t='+Date.now();}"
@@ -542,17 +570,22 @@ _ACTIVITY_FEED_JS = (
     "setWall();setInterval(setWall,1000);"
     "tickFeed();setInterval(tickFeed,2000);"
     "tickTimeline();setInterval(tickTimeline,2000);"
+    "tickEvidence();setInterval(tickEvidence,2500);"
     "setInterval(refreshFrame,2000);"
     "})();"
 )
 
 
 def _activity_feed_client_script(
-    events_url: str, timeline_url: str | None = None
+    events_url: str,
+    timeline_url: str | None = None,
+    evidence_url: str | None = None,
 ) -> str:
-    """Inline JS: poll scrubbed feed + dual-timeline scrubber (JPEG stays live)."""
-    js = _ACTIVITY_FEED_JS.replace("__EVENTS__", json_quote(events_url)).replace(
-        "__TIMELINE__", json_quote(timeline_url) if timeline_url else "null"
+    """Inline JS: poll scrubbed feed + scrubber + evidence panel (JPEG stays live)."""
+    js = (
+        _ACTIVITY_FEED_JS.replace("__EVENTS__", json_quote(events_url))
+        .replace("__TIMELINE__", json_quote(timeline_url) if timeline_url else "null")
+        .replace("__EVIDENCE__", json_quote(evidence_url) if evidence_url else "null")
     )
     return "<script>" + js + "</script>"  # skylos: ignore[SKY-D228] URLs json_quote'd; markers server-scrubbed
 
@@ -624,6 +657,12 @@ _INPUT_REFUSED_KEYS = frozenset(
     }
 )
 
+
+
+def evidence_path(lease_id: str, token: str, *, base_path: str = "") -> str:
+    """Tokenized evidence markers / JPEG path (same TTL/revoke as Watch)."""
+    q = urlencode({"token": token})
+    return f"{base_path}{_PATH_LEASES}{quote(lease_id, safe='')}/watch/evidence?{q}"
 
 def _refuse_secret_keys(body: dict) -> None:
     for k in body:

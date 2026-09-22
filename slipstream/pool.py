@@ -17,6 +17,14 @@ from slipstream.alerts import (
     parse_alert_request,
 )
 from slipstream.activity_feed import LeaseActivityFeed, safe_url_summary
+from slipstream.evidence import (
+    clear_lease_evidence,
+    evidence_auto_kinds,
+    list_evidence_markers,
+    read_evidence_jpeg,
+    store_evidence_jpeg,
+)
+
 from slipstream.captcha import (
     EVENT_FAILED,
     REASON_TIMEOUT,
@@ -91,6 +99,7 @@ from slipstream.watch import (
     capture_jpeg_frame,
     cede_path,
     events_path,
+    evidence_path,
     timeline_path,
     confirm_path,
     dispatch_cdp_input,
@@ -730,6 +739,8 @@ class BrowserPool:
                 "reason": reason,
                 "kept_warm": kept_warm,
             }
+            self._activity_feeds.pop(lease_id, None)
+            clear_lease_evidence(self.config.artifacts_root, lease_id)
 
         if stop_handle is not None:
             self.launcher.stop(stop_handle)
@@ -949,6 +960,10 @@ class BrowserPool:
                 detail={"event": EVENT_TASK_DONE},
             )
             stop_handle = self._detach_lease_locked(lease_id, allow_warm=True)
+            # ADV-EV-003: clear evidence on task_done (same as release), not
+            # only on explicit release/shutdown — residual JPEGs after revoke.
+            self._activity_feeds.pop(lease_id, None)
+            clear_lease_evidence(self.config.artifacts_root, lease_id)
 
         if stop_handle is not None:
             self.launcher.stop(stop_handle)
@@ -1582,12 +1597,86 @@ class BrowserPool:
         *,
         outcome: str = "ok",
         detail: dict | None = None,
-    ) -> None:
-        """Append scrubbed feed row (acquires lock)."""
+    ):
+        """Append scrubbed feed row (acquires lock); maybe capture evidence still."""
         with self._lock:
-            self._feed_for(lease_id).append(
+            ev = self._feed_for(lease_id).append(
                 kind, summary, outcome=outcome, detail=detail
             )
+        if kind in evidence_auto_kinds():
+            self._maybe_capture_evidence(lease_id, ev)
+        return ev
+
+    def _maybe_capture_evidence(self, lease_id: str, ev) -> None:
+        """Best-effort JPEG still keyed by feed seq (never fails the action)."""
+        try:
+            with self._lock:
+                lease = self._leases.get(lease_id)
+                if not lease:
+                    return
+                cdp = lease.cdp_http_url or ""
+                slot_id = lease.slot_id
+                mock = self.config.mock
+                art_root = self.config.artifacts_root
+            jpeg = capture_jpeg_frame(cdp, mock=mock)
+            with self._lock:
+                self._revalidate_watch_after_capture(
+                    lease_id, slot_id=slot_id, cdp_http_url=cdp
+                )
+            store_evidence_jpeg(
+                art_root,
+                lease_id,
+                seq=int(ev.seq),
+                jpeg=jpeg,
+                annotation={
+                    "seq": int(ev.seq),
+                    "ts": float(ev.ts),
+                    "kind": ev.kind,
+                    "summary": ev.summary,
+                    "outcome": ev.outcome,
+                    "refs": [ev.kind, f"seq:{ev.seq}"],
+                },
+            )
+        except Exception:
+            return
+
+    def get_watch_evidence(
+        self,
+        lease_id: str,
+        token: str | None,
+        *,
+        seq: int | None = None,
+    ):
+        """Token-gated evidence list (dict) or JPEG bytes for seq (same TTL/revoke).
+
+        ADV-EV-001: auth under lock, FS I/O outside, then revalidate revoked /
+        lease identity under lock before returning (mirror get_watch_frame).
+        """
+        with self._lock:
+            self._get_watch_session_locked(lease_id, token)
+            lease = self._leases.get(lease_id)
+            if not lease:
+                sess = self._lookup_watch(lease_id)
+                if sess is not None:
+                    self._invalidate_pair_browse_locked(sess, revoke=True)
+                raise WatchGoneError(_ERR_LEASE_INACTIVE)
+            art_root = self.config.artifacts_root
+            slot_id = lease.slot_id
+            cdp = lease.cdp_http_url or ""
+        if seq is None:
+            out = list_evidence_markers(art_root, lease_id)
+            with self._lock:
+                self._revalidate_watch_after_capture(
+                    lease_id, slot_id=slot_id, cdp_http_url=cdp
+                )
+            out["lease_id"] = lease_id
+            return out
+        jpeg = read_evidence_jpeg(art_root, lease_id, int(seq))
+        with self._lock:
+            self._revalidate_watch_after_capture(
+                lease_id, slot_id=slot_id, cdp_http_url=cdp
+            )
+        return jpeg
 
     def get_watch_events(
         self,
@@ -1684,6 +1773,7 @@ class BrowserPool:
             ),
             events_url=events_path(lease_id, tok),
             timeline_url=timeline_path(lease_id, tok),
+            evidence_url=evidence_path(lease_id, tok),
             signed_in=bool(badge.get("signed_in")),
             signed_in_host=badge.get(_KEY_SIGNED_IN_HOST),
             mark_signed_in_url=(
@@ -2329,6 +2419,8 @@ class BrowserPool:
             self._space_signed_in.clear()
             self._watches.clear()
             self._watch_input_log.clear()
+            for _lid in list(self._activity_feeds):
+                clear_lease_evidence(self.config.artifacts_root, _lid)
             self._activity_feeds.clear()
             self._captcha.clear()
         for h in pending_stops:
