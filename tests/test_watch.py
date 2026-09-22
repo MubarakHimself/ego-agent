@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -231,3 +232,223 @@ def test_watch_page_no_secrets(api_server: PoolServer):
     text = html.decode("utf-8").lower()
     for needle in ("set-cookie", "password=", "authorization:", "private_key", "vault_root"):
         assert needle not in text
+
+
+def test_adv_watch_005_cross_lease_missing_unknown(api_server: PoolServer):
+    """ADV-WATCH-005: cross-lease token → 401; missing → 401; unknown lease → 404."""
+    base = api_server.base_url
+    lid_a = _lease(base, space="watch-a")
+    lid_b = _lease(base, space="watch-b")
+    code, env_a = _req(
+        "POST",
+        f"{base}/v1/leases/{lid_a}/alerts",
+        {"event": "need_human", "reason": "stuck"},
+    )
+    assert code == 200
+    code, env_b = _req(
+        "POST",
+        f"{base}/v1/leases/{lid_b}/alerts",
+        {"event": "need_human", "reason": "captcha"},
+    )
+    assert code == 200
+    token_a = _token_from_watch_url(env_a["alert"]["watch_url"])
+    token_b = _token_from_watch_url(env_b["alert"]["watch_url"])
+
+    # Cross-lease token on B's path → 401
+    code, body = _req("GET", f"{base}/v1/leases/{lid_b}/watch?token={token_a}")
+    assert code == 401, body
+    code, body = _req("GET", f"{base}/v1/leases/{lid_b}/watch/frame?token={token_a}")
+    assert code == 401, body
+    code, body = _req(
+        "POST", f"{base}/v1/leases/{lid_a}/watch/confirm?token={token_b}", {}
+    )
+    assert code == 401, body
+
+    # Missing token → 401
+    code, body = _req("GET", f"{base}/v1/leases/{lid_a}/watch")
+    assert code == 401
+    code, body = _req("GET", f"{base}/v1/leases/{lid_a}/watch/frame")
+    assert code == 401
+
+    # Unknown lease (no watch session) → 404
+    code, body = _req(
+        "GET",
+        f"{base}/v1/leases/lease_does_not_exist_zzzz/watch?token={token_a}",
+    )
+    assert code == 404, body
+
+
+def test_adv_watch_003_clickjack_headers(api_server: PoolServer):
+    """ADV-WATCH-003: X-Frame-Options DENY + CSP frame-ancestors none."""
+    base = api_server.base_url
+    lid = _lease(base, space="watch-cj")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "other"},
+    )
+    assert code == 200
+    watch = env["alert"]["watch_url"]
+    token = _token_from_watch_url(watch)
+
+    for url in (
+        watch,
+        f"{base}/v1/leases/{lid}/watch/frame?token={token}",
+    ):
+        code, headers, _body = _req("GET", url, raw=True)
+        assert code == 200, url
+        assert headers.get("X-Frame-Options") == "DENY", headers
+        csp = headers.get("Content-Security-Policy") or ""
+        assert "frame-ancestors" in csp and "'none'" in csp, csp
+
+    code, headers, _body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/confirm?token={token}",
+        {},
+        raw=True,
+    )
+    assert code == 200
+    assert headers.get("X-Frame-Options") == "DENY"
+    assert "frame-ancestors" in (headers.get("Content-Security-Policy") or "")
+
+
+def test_adv_watch_001_frame_inflight_vs_revoke_410(api_server: PoolServer, monkeypatch):
+    """ADV-WATCH-001: frame in flight vs task_done → 410 (no mock soft-fallback)."""
+    base = api_server.base_url
+    lid = _lease(base, space="watch-race")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "stuck"},
+    )
+    assert code == 200
+    token = _token_from_watch_url(env["alert"]["watch_url"])
+    frame_url = f"{base}/v1/leases/{lid}/watch/frame?token={token}"
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_capture(cdp_http_url: str, *, mock: bool = False):
+        entered.set()
+        assert release.wait(timeout=5), "release not signaled"
+        # Return distinctive non-mock bytes so a soft-fallback would be visible
+        return b"\xff\xd8" + b"RACE" + b"\xff\xd9"
+
+    monkeypatch.setattr("slipstream.pool.capture_jpeg_frame", slow_capture)
+
+    result: dict = {}
+
+    def _worker():
+        result["status"], result["headers"], result["body"] = _req(
+            "GET", frame_url, raw=True
+        )
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    assert entered.wait(timeout=5), "capture never started"
+    # Revoke while capture is in flight
+    code, done = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "task_done", "outcome": {"ok": True, "summary": "revoked mid-frame"}},
+    )
+    assert code == 200
+    assert done["harness"]["lease_released"] is True
+    # Simulate port reuse: a new lease may occupy the same slot/CDP later;
+    # revoke alone must already yield 410 before bytes return.
+    release.set()
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert result["status"] == 410, result
+    # Must not have returned the in-flight JPEG (or a mock soft-fallback 200)
+    assert b"RACE" not in (result.get("body") or b"")
+
+
+def test_adv_watch_001_identity_mismatch_after_capture(api_server: PoolServer, monkeypatch):
+    """ADV-WATCH-001: slot/CDP identity change during capture → 410."""
+    base = api_server.base_url
+    lid = _lease(base, space="watch-ident")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "other"},
+    )
+    assert code == 200
+    token = _token_from_watch_url(env["alert"]["watch_url"])
+    frame_url = f"{base}/v1/leases/{lid}/watch/frame?token={token}"
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_capture(cdp_http_url: str, *, mock: bool = False):
+        entered.set()
+        assert release.wait(timeout=5)
+        return b"\xff\xd8XXXX\xff\xd9"
+
+    monkeypatch.setattr("slipstream.pool.capture_jpeg_frame", slow_capture)
+
+    result: dict = {}
+
+    def _worker():
+        result["status"], _, result["body"] = _req("GET", frame_url, raw=True)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    assert entered.wait(timeout=5)
+    # Mutate lease CDP identity while capture holds (port-reuse style)
+    with api_server.pool._lock:
+        lease = api_server.pool._leases[lid]
+        lease.cdp_http_url = "http://127.0.0.1:1"  # different port identity
+    release.set()
+    t.join(timeout=5)
+    assert result["status"] == 410, result
+
+
+def test_adv_watch_001_no_mock_soft_fallback_after_auth(api_server: PoolServer, monkeypatch):
+    """ADV-WATCH-001: CDP failure after auth must not soft-return mock JPEG 200."""
+    from slipstream.watch import WatchCaptureError
+
+    base = api_server.base_url
+    lid = _lease(base, space="watch-nofallback")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "stuck"},
+    )
+    assert code == 200
+    token = _token_from_watch_url(env["alert"]["watch_url"])
+
+    def boom(cdp_http_url: str, *, mock: bool = False):
+        raise WatchCaptureError("simulated CDP failure")
+
+    monkeypatch.setattr("slipstream.pool.capture_jpeg_frame", boom)
+    code, body = _req("GET", f"{base}/v1/leases/{lid}/watch/frame?token={token}")
+    # Not 200 with mock JPEG — capture failure after auth → 502 (no soft-fallback).
+    assert code == 502, body
+    assert isinstance(body, dict)
+    assert body.get("error") == "watch_capture_failed"
+
+
+def test_adv_watch_006_reject_bad_ws_debugger_url():
+    """ADV-WATCH-006: non-loopback / non-ws(s) webSocketDebuggerUrl refused."""
+    from slipstream.watch import WatchCaptureError, assert_ws_debugger_url
+    from slipstream.cdp_inject import CdpInjectError, _assert_ws_debugger_url
+
+    assert_ws_debugger_url("ws://127.0.0.1:9222/devtools/page/x")
+    assert_ws_debugger_url("wss://localhost:9222/devtools/page/x")
+    for bad in (
+        "http://127.0.0.1:9222/devtools/page/x",
+        "ws://evil.example:9222/devtools/page/x",
+        "ws://8.8.8.8:9222/devtools/page/x",
+        "ftp://127.0.0.1:9222/x",
+    ):
+        try:
+            assert_ws_debugger_url(bad)
+            raise AssertionError(f"expected refuse for {bad}")
+        except WatchCaptureError:
+            pass
+        try:
+            _assert_ws_debugger_url(bad)
+            raise AssertionError(f"expected cdp refuse for {bad}")
+        except CdpInjectError:
+            pass

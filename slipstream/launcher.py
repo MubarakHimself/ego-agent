@@ -110,6 +110,8 @@ class ChromiumLauncher:
             self._binary,
             f"--remote-debugging-port={cdp_port}",
             # Required for pool-side CDP WebSocket (Watch screenshot, cred fill).
+            # Residual risk on shared hosts (any loopback origin); tighten later
+            # — see docs/POOL_API.md Live Watch. Do not change without Firstmate.
             "--remote-allow-origins=*",
             f"--user-data-dir={user_data}",
             "--no-first-run",

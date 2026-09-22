@@ -27,7 +27,13 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from slipstream.alerts import AlertConflictError, AlertValidationError
-from slipstream.watch import WatchAuthError, WatchGoneError, WatchNotFoundError
+from slipstream.watch import (
+    WATCH_CLICKJACK_HEADERS,
+    WatchAuthError,
+    WatchCaptureError,
+    WatchGoneError,
+    WatchNotFoundError,
+)
 from slipstream.cdp_inject import CdpInjectError
 from slipstream.pool import (
     BrowserPool,
@@ -60,11 +66,20 @@ def _refused_credentials_body() -> dict:
     }
 
 
-def _json_response(handler: BaseHTTPRequestHandler, status: int, body: dict[str, Any]) -> None:
+def _json_response(
+    handler: BaseHTTPRequestHandler,
+    status: int,
+    body: dict[str, Any],
+    *,
+    extra_headers: dict[str, str] | None = None,
+) -> None:
     raw = json.dumps(body).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(raw)))
+    if extra_headers:
+        for k, v in extra_headers.items():
+            handler.send_header(k, v)
     handler.end_headers()
     handler.wfile.write(raw)
 
@@ -103,6 +118,15 @@ def _watch_error(handler: BaseHTTPRequestHandler, exc: Exception) -> bool:
             handler,
             404,
             {"error": "watch_not_found", "lease_id": exc.lease_id},
+        )
+        return True
+    if isinstance(exc, WatchCaptureError):
+        # ADV-WATCH-001: never mock soft-fallback after auth — surface capture fail.
+        _json_response(
+            handler,
+            502,
+            {"error": "watch_capture_failed", "detail": str(exc)},
+            extra_headers=WATCH_CLICKJACK_HEADERS,
         )
         return True
     return False
@@ -181,7 +205,13 @@ def make_handler(pool: BrowserPool):
                 lease_id = parts[2]
                 try:
                     ctype, body = pool.get_watch_page(lease_id, token, mode=mode)
-                    _bytes_response(self, 200, body.encode("utf-8"), ctype)
+                    _bytes_response(
+                        self,
+                        200,
+                        body.encode("utf-8"),
+                        ctype,
+                        extra_headers=WATCH_CLICKJACK_HEADERS,
+                    )
                 except Exception as e:
                     if _watch_error(self, e):
                         return
@@ -197,7 +227,13 @@ def make_handler(pool: BrowserPool):
                 lease_id = parts[2]
                 try:
                     jpeg = pool.get_watch_frame(lease_id, token)
-                    _bytes_response(self, 200, jpeg, "image/jpeg")
+                    _bytes_response(
+                        self,
+                        200,
+                        jpeg,
+                        "image/jpeg",
+                        extra_headers=WATCH_CLICKJACK_HEADERS,
+                    )
                 except Exception as e:
                     if _watch_error(self, e):
                         return
@@ -239,9 +275,13 @@ def make_handler(pool: BrowserPool):
                         self.send_response(303)
                         self.send_header("Location", loc)
                         self.send_header("Content-Length", "0")
+                        for hk, hv in WATCH_CLICKJACK_HEADERS.items():
+                            self.send_header(hk, hv)
                         self.end_headers()
                         return
-                    _json_response(self, 200, result)
+                    _json_response(
+                        self, 200, result, extra_headers=WATCH_CLICKJACK_HEADERS
+                    )
                 except Exception as e:
                     if _watch_error(self, e):
                         return

@@ -843,21 +843,66 @@ class BrowserPool:
         )
         return "text/html; charset=utf-8", body
 
+    def _revalidate_watch_after_capture(
+        self,
+        lease_id: str,
+        *,
+        slot_id: int,
+        cdp_http_url: str,
+    ) -> None:
+        """ADV-WATCH-001: after CDP IO, refuse revoked / identity-mismatched frames.
+
+        Must hold ``self._lock``. Raises WatchGoneError → HTTP 410. Never soft-
+        falls back to mock JPEG after auth (would mask revoke / port reuse).
+        """
+        sess = self._lookup_watch(lease_id)
+        if sess is None or sess.revoked:
+            raise WatchGoneError("watch_url revoked during capture")
+        if time.time() >= sess.expires_at:
+            raise WatchGoneError("watch_url expired during capture")
+        lease = self._leases.get(lease_id)
+        if not lease:
+            raise WatchGoneError("lease no longer active")
+        if lease.slot_id != slot_id:
+            raise WatchGoneError("lease/slot identity changed during capture")
+        if (lease.cdp_http_url or "") != (cdp_http_url or ""):
+            raise WatchGoneError("lease/slot identity changed during capture")
+        slot = self._slots[slot_id] if 0 <= slot_id < len(self._slots) else None
+        if slot is None or slot.lease_id != lease_id:
+            raise WatchGoneError("lease/slot identity changed during capture")
+
     def get_watch_frame(self, lease_id: str, token: str | None) -> bytes:
-        """Return JPEG bytes for the leased CDP viewport (mock JPEG under mock)."""
+        """Return JPEG bytes for the leased CDP viewport (mock JPEG under mock).
+
+        ADV-WATCH-001: capture runs outside the lock; before returning bytes we
+        re-check revoked + lease/slot/CDP identity so a concurrent task_done /
+        port reuse cannot deliver another session's screenshot (or a mock soft-
+        fallback that would look like a live 200).
+        """
         with self._lock:
             self._get_watch_session_locked(lease_id, token)
             lease = self._leases.get(lease_id)
             if not lease:
                 raise WatchGoneError("lease no longer active")
             cdp = lease.cdp_http_url or ""
+            slot_id = lease.slot_id
             mock = self.config.mock
         # Capture outside lock (CDP IO).
         try:
-            return capture_jpeg_frame(cdp, mock=mock)
+            jpeg = capture_jpeg_frame(cdp, mock=mock)
         except WatchCaptureError:
-            # Soft fallback so the HTML shell still refreshes under flaky CDP.
-            return capture_jpeg_frame("", mock=True)
+            # Prefer 410 if revoke/identity race during a failed capture; never
+            # mock soft-fallback after auth (ADV-WATCH-001).
+            with self._lock:
+                self._revalidate_watch_after_capture(
+                    lease_id, slot_id=slot_id, cdp_http_url=cdp
+                )
+            raise
+        with self._lock:
+            self._revalidate_watch_after_capture(
+                lease_id, slot_id=slot_id, cdp_http_url=cdp
+            )
+        return jpeg
 
     def confirm_watch_takeover(
         self, lease_id: str, token: str | None
