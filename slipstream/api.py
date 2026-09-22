@@ -7,9 +7,12 @@ Endpoints:
   POST   /v1/leases/{id}/heartbeat
   POST   /v1/leases/{id}/alerts
   POST   /v1/leases/{id}/credentials/fill
+  POST   /v1/leases/{id}/watch/confirm
   POST   /v1/spaces/{space_id}/credentials/bind
   POST   /v1/spaces/{space_id}/credentials/{cred_id}/unbind
   GET    /v1/spaces/{space_id}/credentials
+  GET    /v1/leases/{id}/watch
+  GET    /v1/leases/{id}/watch/frame
   DELETE /v1/leases/{id}
   GET    /v1/pool/status
   GET    /healthz
@@ -21,9 +24,10 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from slipstream.alerts import AlertConflictError, AlertValidationError
+from slipstream.watch import WatchAuthError, WatchGoneError, WatchNotFoundError
 from slipstream.cdp_inject import CdpInjectError
 from slipstream.pool import (
     BrowserPool,
@@ -63,6 +67,45 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, body: dict[str,
     handler.send_header("Content-Length", str(len(raw)))
     handler.end_headers()
     handler.wfile.write(raw)
+
+
+def _bytes_response(
+    handler: BaseHTTPRequestHandler,
+    status: int,
+    body: bytes,
+    content_type: str,
+    *,
+    extra_headers: dict[str, str] | None = None,
+) -> None:
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    if extra_headers:
+        for k, v in extra_headers.items():
+            handler.send_header(k, v)
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _watch_error(handler: BaseHTTPRequestHandler, exc: Exception) -> bool:
+    """Map Watch* errors to HTTP; return True if handled."""
+    if isinstance(exc, WatchAuthError):
+        _json_response(
+            handler, 401, {"error": "unauthorized", "detail": str(exc.detail)}
+        )
+        return True
+    if isinstance(exc, WatchGoneError):
+        _json_response(handler, 410, {"error": "gone", "detail": str(exc.detail)})
+        return True
+    if isinstance(exc, WatchNotFoundError):
+        _json_response(
+            handler,
+            404,
+            {"error": "watch_not_found", "lease_id": exc.lease_id},
+        )
+        return True
+    return False
 
 
 def _parse_ttl_seconds(raw: Any) -> int | None:
@@ -124,10 +167,87 @@ def make_handler(pool: BrowserPool):
             if is_refused_credentials_path(parts):
                 _json_response(self, 404, _refused_credentials_body())
                 return
+
+            # GET /v1/leases/{id}/watch  and  /v1/leases/{id}/watch/frame
+            qs = parse_qs(urlparse(self.path).query)
+            token = (qs.get("token") or [None])[0]
+            mode = (qs.get("mode") or [None])[0]
+            if (
+                len(parts) == 4
+                and parts[0] == "v1"
+                and parts[1] == "leases"
+                and parts[3] == "watch"
+            ):
+                lease_id = parts[2]
+                try:
+                    ctype, body = pool.get_watch_page(lease_id, token, mode=mode)
+                    _bytes_response(self, 200, body.encode("utf-8"), ctype)
+                except Exception as e:
+                    if _watch_error(self, e):
+                        return
+                    raise
+                return
+            if (
+                len(parts) == 5
+                and parts[0] == "v1"
+                and parts[1] == "leases"
+                and parts[3] == "watch"
+                and parts[4] == "frame"
+            ):
+                lease_id = parts[2]
+                try:
+                    jpeg = pool.get_watch_frame(lease_id, token)
+                    _bytes_response(self, 200, jpeg, "image/jpeg")
+                except Exception as e:
+                    if _watch_error(self, e):
+                        return
+                    raise
+                return
+
             _json_response(self, 404, {"error": "not_found", "path": path})
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path.rstrip("/") or "/"
+            parts_early = path.strip("/").split("/")
+
+            # Take-over confirm may be an HTML form POST (not JSON).
+            if (
+                len(parts_early) == 5
+                and parts_early[0] == "v1"
+                and parts_early[1] == "leases"
+                and parts_early[3] == "watch"
+                and parts_early[4] == "confirm"
+            ):
+                # Drain body without requiring JSON.
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 0:
+                    self.rfile.read(length)
+                lease_id = parts_early[2]
+                qs = parse_qs(urlparse(self.path).query)
+                token = (qs.get("token") or [None])[0]
+                try:
+                    result = pool.confirm_watch_takeover(lease_id, token)
+                    content_type = (self.headers.get("Content-Type") or "").lower()
+                    # HTML form POST → redirect; JSON clients get JSON.
+                    if "application/x-www-form-urlencoded" in content_type:
+                        from urllib.parse import urlencode
+
+                        loc = (
+                            f"/v1/leases/{lease_id}/watch?"
+                            + urlencode({"token": token or "", "mode": "takeover"})
+                        )
+                        self.send_response(303)
+                        self.send_header("Location", loc)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    _json_response(self, 200, result)
+                except Exception as e:
+                    if _watch_error(self, e):
+                        return
+                    raise
+                return
+
             try:
                 body = self._read_json()
             except json.JSONDecodeError:

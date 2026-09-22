@@ -167,6 +167,7 @@ def _probe_cdp_with_chrome(binary: str, *, timeout: float = 12.0) -> CheckResult
     args = [
         binary,
         f"--remote-debugging-port={port}",
+        "--remote-allow-origins=*",
         f"--user-data-dir={user_data}",
         "--headless=new",
         "--no-first-run",

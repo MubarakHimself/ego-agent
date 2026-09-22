@@ -16,6 +16,18 @@ from slipstream.alerts import (
     default_takeover_url,
     parse_alert_request,
 )
+from slipstream.watch import (
+    WatchAuthError,
+    WatchCaptureError,
+    WatchGoneError,
+    WatchNotFoundError,
+    WatchSession,
+    capture_jpeg_frame,
+    confirm_path,
+    frame_path,
+    mint_watch_token,
+    render_watch_html,
+)
 from slipstream.config import PoolConfig
 from slipstream.launcher import ChromiumLauncher, LaunchHandle
 from slipstream.models import Lease, SlotState, SlotStatus, new_lease_id
@@ -71,6 +83,8 @@ class BrowserPool:
         # Bounded LRU eviction is deferred — document trust: single long-lived process.
         self._alert_log: dict[str, list[dict[str, Any]]] = {}
         self._task_done_envelopes: dict[str, dict[str, Any]] = {}
+        # Watch sessions: tokenized short-TTL observe URLs (survive revoke for 410).
+        self._watches: dict[str, WatchSession] = {}
         self._api_base_url: str = f"http://{self.config.host}:{self.config.port}"
         # Ensure spaces root exists
         self.config.spaces_root.mkdir(parents=True, exist_ok=True)
@@ -229,6 +243,11 @@ class BrowserPool:
         slot = self._find_slot_by_lease(lease_id)
         if not slot:
             raise LeaseNotFoundError(lease_id)
+
+        # Revoke any live Watch URL when the lease leaves the pool.
+        sess = self._lookup_watch(lease_id)
+        if sess is not None:
+            sess.revoked = True
 
         keep_warm = allow_warm and self._count_warm() < self.config.W
         del self._leases[lease_id]
@@ -636,13 +655,35 @@ class BrowserPool:
             if event == EVENT_NEED_HUMAN and lease_id in self._task_done_envelopes:
                 raise AlertConflictError("lease already completed via task_done")
 
+            watch_token: str | None = None
+            if event == EVENT_NEED_HUMAN:
+                watch_token = mint_watch_token()
+                now = time.time()
+                self._watches[lease_id] = WatchSession(
+                    lease_id=lease_id,
+                    token=watch_token,
+                    expires_at=now + float(parsed["ttl_s"]),
+                    reason=parsed.get("reason"),
+                    detail=parsed.get("detail") or "",
+                    revoked=False,
+                    takeover_confirmed=False,
+                    created_at=now,
+                )
+
             payload = build_alert_payload(
                 lease_id=lease_id,
                 space_id=lease.space_id,
                 parsed=parsed,
                 base_url=base,
+                watch_token=watch_token,
             )
-            takeover = default_takeover_url(lease_id, base_url=base)
+            if watch_token:
+                takeover = default_takeover_url(
+                    lease_id, token=watch_token, base_url=base
+                )
+            else:
+                # task_done: watch revoked; takeover link is inert
+                takeover = f"{base.rstrip('/')}/v1/leases/{lease_id}/watch?mode=takeover"
 
             if event == EVENT_NEED_HUMAN:
                 lease.status = "awaiting_human"
@@ -662,7 +703,10 @@ class BrowserPool:
                 self._alert_log.setdefault(lease_id, []).append(payload)
                 return envelope
 
-            # task_done — notify then release once (explicit client-style warm ok)
+            # task_done — revoke watch_url, notify, then release once
+            sess = self._lookup_watch(lease_id)
+            if sess is not None:
+                sess.revoked = True
             envelope = build_harness_envelope(
                 payload,
                 lease_kept=False,
@@ -739,6 +783,108 @@ class BrowserPool:
             self.launcher.stop(h)
         return evicted
 
+
+    # --- live Watch (observe-only) ------------------------------------
+
+    def _lookup_watch(self, lease_id: str) -> WatchSession | None:
+        """Dict lookup for watch state (name avoids Session.get SSRF false-positive)."""
+        return self._watches[lease_id] if lease_id in self._watches else None
+
+
+    def _get_watch_session_locked(
+        self, lease_id: str, token: str | None
+    ) -> WatchSession:
+        """Validate tokenized watch access; raise Watch* errors."""
+        import secrets as _secrets
+
+        sess = self._lookup_watch(lease_id)
+        if sess is None:
+            raise WatchNotFoundError(lease_id)
+        if (
+            not token
+            or len(token) != len(sess.token)
+            or not _secrets.compare_digest(sess.token, token)
+        ):
+            raise WatchAuthError("invalid or missing watch token")
+        now = time.time()
+        if sess.revoked:
+            raise WatchGoneError("watch_url revoked")
+        if now >= sess.expires_at:
+            raise WatchGoneError("watch_url expired")
+        return sess
+
+    def get_watch_page(
+        self, lease_id: str, token: str | None, *, mode: str | None = None
+    ) -> tuple[str, str]:
+        """Return (content_type, html_body) for observe-only Watch UI."""
+        with self._lock:
+            sess = self._get_watch_session_locked(lease_id, token)
+            # Lease must still be live for streaming; revoked already handled.
+            if lease_id not in self._leases:
+                # Session exists but lease gone without revoke race — treat gone
+                sess.revoked = True
+                raise WatchGoneError("lease no longer active")
+            expires_in = max(0, int(sess.expires_at - time.time()))
+            reason = sess.reason
+            detail = sess.detail
+            confirmed = sess.takeover_confirmed
+            tok = sess.token
+        frame = frame_path(lease_id, tok)
+        confirm = confirm_path(lease_id, tok) if mode == "takeover" else None
+        body = render_watch_html(
+            lease_id=lease_id,
+            reason=reason,
+            detail=detail,
+            frame_url=frame,
+            confirm_url=confirm,
+            mode=mode,
+            expires_in_s=expires_in,
+            takeover_confirmed=confirmed,
+        )
+        return "text/html; charset=utf-8", body
+
+    def get_watch_frame(self, lease_id: str, token: str | None) -> bytes:
+        """Return JPEG bytes for the leased CDP viewport (mock JPEG under mock)."""
+        with self._lock:
+            self._get_watch_session_locked(lease_id, token)
+            lease = self._leases.get(lease_id)
+            if not lease:
+                raise WatchGoneError("lease no longer active")
+            cdp = lease.cdp_http_url or ""
+            mock = self.config.mock
+        # Capture outside lock (CDP IO).
+        try:
+            return capture_jpeg_frame(cdp, mock=mock)
+        except WatchCaptureError:
+            # Soft fallback so the HTML shell still refreshes under flaky CDP.
+            return capture_jpeg_frame("", mock=True)
+
+    def confirm_watch_takeover(
+        self, lease_id: str, token: str | None
+    ) -> dict[str, Any]:
+        """Confirm Take-over → keep agent paused / lease warm (no pair-browse)."""
+        with self._lock:
+            sess = self._get_watch_session_locked(lease_id, token)
+            lease = self._leases.get(lease_id)
+            if not lease:
+                sess.revoked = True
+                raise WatchGoneError("lease no longer active")
+            lease.status = "awaiting_human"
+            slot = self._find_slot_by_lease(lease_id)
+            if slot is not None:
+                slot.last_heartbeat = time.time()
+            sess.takeover_confirmed = True
+            return {
+                "ok": True,
+                "lease_id": lease_id,
+                "status": "awaiting_human",
+                "agent_paused": True,
+                "lease_kept": True,
+                "takeover_confirmed": True,
+                "action": "pause",
+                "expires_in_s": max(0, int(sess.expires_at - time.time())),
+            }
+
     def shutdown(self) -> None:
         pending_stops: list[LaunchHandle] = []
         with self._lock:
@@ -751,5 +897,6 @@ class BrowserPool:
                 slot.space_id = None
                 slot.status = SlotStatus.FREE_COLD
             self._leases.clear()
+            self._watches.clear()
         for h in pending_stops:
             self.launcher.stop(h)

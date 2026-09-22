@@ -172,8 +172,10 @@ slipstream alert done --lease-id "$LEASE_ID" --fail --summary "Blocked by paywal
 
 Harness JSON (`alert` + `harness`) tells the caller to `pause` or `continue`.
 Fields include `captain_message`, `watch_url`, `takeover_url`, `lease_kept` /
-`lease_released`. Server-derived `watch_url` is a short-TTL local placeholder
-until live pair-browse UI ships (no client override).
+`lease_released`. Server-derived `watch_url` is a short-TTL **tokenized** local
+Watch (observe-only JPEG/HTML). Open it for live frames; Take-over confirms
+pause only (no pair-browse yet). Revoked on `task_done` / TTL (`401`/`410`).
+Never put secrets on the page. No client override of `watch_url`.
 
 curl:
 

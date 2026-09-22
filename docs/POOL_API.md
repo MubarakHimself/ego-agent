@@ -101,7 +101,7 @@ Request must **not** include `watch_url` or `status` — both are server-derived
     "reason": "captcha",
     "detail": "…",
     "status": "awaiting_human",
-    "watch_url": "http://127.0.0.1:8755/v1/leases/…/watch",
+    "watch_url": "http://127.0.0.1:8755/v1/leases/…/watch?token=…",
     "ttl_s": 300,
     "outcome": null
   },
@@ -133,9 +133,28 @@ Request must **not** include `watch_url` or `status` — both are server-derived
 
 **Trust boundary (free-text):** `detail` and `outcome.summary` are caller-controlled strings. Callers must not put secrets there. The server lightly scrubs `password=` / `cookie=` / `token=` / `secret=` / `authorization=` / `bearer=` patterns to `[REDACTED]` but this is defense-in-depth, not a guarantee — treat alert text as untrusted for secret storage.
 
-**Server-derived fields:** `status` (`awaiting_human` / `done` / `failed`) and `watch_url` (short-TTL local handoff placeholder until live pair-browse UI exists). Soft-idle eviction is skipped while `lease.status == awaiting_human` (hard TTL still applies).
+**Server-derived fields:** `status` (`awaiting_human` / `done` / `failed`) and `watch_url` (short-TTL **tokenized** local Watch — observe-only JPEG/HTML). Soft-idle eviction is skipped while `lease.status == awaiting_human` (hard TTL still applies).
 
-**In-memory alert state:** `_alert_log` and `_task_done_envelopes` are **process-lifetime** maps (survive lease release for idempotent `task_done` replay; cleared on pool shutdown / process exit). Bounded LRU eviction is deferred.
+### Live Watch v1 (observe-only)
+
+On `need_human` the pool mints an unguessable token and returns:
+
+- `watch_url` = `/v1/leases/{id}/watch?token=…` (TTL from `ttl_s`, default 300s)
+- `takeover_url` = same + `&mode=takeover` (Confirm Take-over → pause only; **no** pair-browse)
+
+| Method | Path | Result |
+|--------|------|--------|
+| `GET` | `/v1/leases/{id}/watch?token=…` | HTML shell (meta-refresh) embedding JPEG frame; observe-only |
+| `GET` | `/v1/leases/{id}/watch/frame?token=…` | `image/jpeg` viewport via CDP `Page.captureScreenshot` (mock JPEG under `SLIPSTREAM_MOCK`) |
+| `POST` | `/v1/leases/{id}/watch/confirm?token=…` | Confirm Take-over → `{action: pause, agent_paused: true, lease_kept: true}` |
+
+→ `401` missing/wrong token · `410` after `task_done`, lease release, or Watch TTL expiry · `404` no session.
+
+**Never on the Watch page / frame:** cookies, passwords, tokens-as-JSON, vault dumps, raw CDP auth / `cdp_http_url` / debugger WS. Treat `watch_url` itself as a credential (loopback allowlist still applies to pool/CDP URLs).
+
+**Defer:** pair-browse, replay, WS dashboard, iframe embed product, Take/Cede exclusive lock.
+
+**In-memory alert state:** `_alert_log`, `_task_done_envelopes`, and `_watches` are **process-lifetime** maps (survive lease release for idempotent `task_done` / revoked-watch `410`; cleared on pool shutdown / process exit). Bounded LRU eviction is deferred.
 
 ### Credential vault (bound to Space)
 
