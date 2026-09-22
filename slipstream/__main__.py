@@ -1,4 +1,15 @@
-"""CLI entry: python -m slipstream"""
+"""CLI entry: ``slipstream`` / ``python -m slipstream``.
+
+Subcommands:
+  serve       Start the pool HTTP server (lease/heartbeat/release API)
+  lease       POST /v1/leases — acquire a CDP slot
+  heartbeat   POST /v1/leases/{id}/heartbeat
+  release     DELETE /v1/leases/{id}
+  status      GET /v1/pool/status
+
+Client commands talk to a running pool (SLIPSTREAM_URL or --url).
+HTTP remains the primary surface — there is no MCP server.
+"""
 
 from __future__ import annotations
 
@@ -7,18 +18,19 @@ import signal
 import sys
 
 from slipstream.api import PoolServer
+from slipstream.cli import (
+    CliError,
+    DEFAULT_URL,
+    cmd_heartbeat,
+    cmd_lease,
+    cmd_release,
+    cmd_status,
+)
 from slipstream.config import PoolConfig
 from slipstream.pool import BrowserPool
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Ego Browser Pool Manager (MVP)")
-    parser.add_argument("--host", default=None, help="Bind host (default 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=None, help="Bind port (default 8755)")
-    parser.add_argument("--mock", action="store_true", help="Mock Chromium launches (SLIPSTREAM_MOCK=1)")
-    parser.add_argument("--headed", action="store_true", help="Run Chromium headed (not headless)")
-    args = parser.parse_args(argv)
-
+def _run_serve(args: argparse.Namespace) -> int:
     cfg = PoolConfig.from_env()
     if args.mock:
         cfg.mock = True
@@ -41,14 +53,135 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _shutdown)
 
     print(
-        f"ego-pool listening on {server.base_url}  "
+        f"slipstream listening on {server.base_url}  "
         f"(K={cfg.K} W={cfg.W} mock={cfg.mock} chrome={pool.launcher.binary})",
         flush=True,
     )
-    print("Endpoints: POST /v1/leases  POST /v1/leases/{id}/heartbeat  "
-          "DELETE /v1/leases/{id}  GET /v1/pool/status", flush=True)
+    print(
+        "Endpoints: POST /v1/leases  POST /v1/leases/{id}/heartbeat  "
+        "DELETE /v1/leases/{id}  GET /v1/pool/status",
+        flush=True,
+    )
+    print(
+        "Agent CLI: slipstream lease|heartbeat|release|status  "
+        "(see skills/slipstream/SKILL.md)",
+        flush=True,
+    )
     server.start(background=False)
     return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="slipstream",
+        description=(
+            "Slipstream browser pool — serve the HTTP API or call lease/"
+            "heartbeat/release/status against a running pool."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    # --- serve ---
+    p_serve = sub.add_parser(
+        "serve",
+        help="Start the pool HTTP server (agents lease via CLI/HTTP, not MCP)",
+    )
+    p_serve.add_argument("--host", default=None, help="Bind host (default 127.0.0.1)")
+    p_serve.add_argument(
+        "--port", type=int, default=None, help="Bind port (default 8755)"
+    )
+    p_serve.add_argument(
+        "--mock",
+        action="store_true",
+        help="Mock Chromium launches (same as SLIPSTREAM_MOCK=1)",
+    )
+    p_serve.add_argument(
+        "--headed",
+        action="store_true",
+        help="Run Chromium headed (not headless)",
+    )
+    p_serve.set_defaults(_handler="serve")
+
+    # Shared client options
+    def _add_url(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--url",
+            default=None,
+            help=f"Pool base URL (env SLIPSTREAM_URL, default {DEFAULT_URL})",
+        )
+
+    # --- lease ---
+    p_lease = sub.add_parser("lease", help="Acquire a lease (prints lease JSON)")
+    _add_url(p_lease)
+    p_lease.add_argument("--agent-id", required=True, help="Calling agent id")
+    p_lease.add_argument("--space-id", required=True, help="Space / user-data-dir id")
+    p_lease.add_argument(
+        "--ttl-seconds",
+        type=int,
+        default=None,
+        help="Optional lease TTL (clamped to pool hard TTL)",
+    )
+    p_lease.set_defaults(_handler="lease")
+
+    # --- heartbeat ---
+    p_hb = sub.add_parser("heartbeat", help="Renew a lease soft-idle window")
+    _add_url(p_hb)
+    p_hb.add_argument("--lease-id", required=True, help="Lease id from lease JSON")
+    p_hb.set_defaults(_handler="heartbeat")
+
+    # --- release ---
+    p_rel = sub.add_parser("release", help="Release a lease (DELETE)")
+    _add_url(p_rel)
+    p_rel.add_argument("--lease-id", required=True, help="Lease id from lease JSON")
+    p_rel.add_argument(
+        "--reason",
+        default=None,
+        help="Optional release reason (JSON body)",
+    )
+    p_rel.set_defaults(_handler="release")
+
+    # --- status ---
+    p_st = sub.add_parser("status", help="Print pool status JSON")
+    _add_url(p_st)
+    p_st.set_defaults(_handler="status")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not getattr(args, "command", None):
+        parser.print_help(sys.stderr)
+        return 2
+
+    try:
+        if args._handler == "serve":
+            return _run_serve(args)
+        if args._handler == "lease":
+            return cmd_lease(
+                agent_id=args.agent_id,
+                space_id=args.space_id,
+                ttl_seconds=args.ttl_seconds,
+                url=args.url,
+            )
+        if args._handler == "heartbeat":
+            return cmd_heartbeat(lease_id=args.lease_id, url=args.url)
+        if args._handler == "release":
+            return cmd_release(
+                lease_id=args.lease_id,
+                reason=args.reason,
+                url=args.url,
+            )
+        if args._handler == "status":
+            return cmd_status(url=args.url)
+    except CliError as e:
+        print(e, file=sys.stderr)
+        return e.exit_code
+
+    parser.print_help(sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

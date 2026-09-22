@@ -1,6 +1,7 @@
-"""Ego Browser Pool Manager — shared Chromium CDP lease service (MVP scaffold).
+"""Slipstream — shared Chromium CDP lease service (MVP).
 
 Architecture lock: docs/ARCHITECTURE.md, docs/POOL_API.md
+Agent surface: skills/slipstream/SKILL.md + ``slipstream`` CLI (no MCP).
 Hard K=5 live slots, W=1 warm, Space = user-data-dir, Linux-first.
 No Electron / Jev / Laya / proprietary ego binary code.
 """
