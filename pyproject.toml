@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ego-pool"
+version = "0.1.0"
+description = "Browser Pool Manager MVP — lease/heartbeat/release for K=5 Chromium CDP slots"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "MubarakHimself" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+ego-pool = "ego_pool.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["ego_pool*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "live: optional live smoke requiring a real Chrome/Chromium binary",
+]
+testpaths = ["tests"]
