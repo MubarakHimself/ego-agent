@@ -19,3 +19,15 @@ First run creates `.venv-skylos` and installs `skylos`.
 ```bash
 skylos . --danger --secrets --quality --ai-defects --gate
 ```
+
+## Vulture (dead code)
+
+Companion gate on every ship:
+
+```bash
+pip install -e ".[dev]"
+./scripts/run_vulture.sh
+```
+
+Whitelist justified false positives only in `scripts/vulture_whitelist.py`.
+

@@ -6,6 +6,7 @@ Subcommands:
   heartbeat   POST /v1/leases/{id}/heartbeat
   release     DELETE /v1/leases/{id}
   status      GET /v1/pool/status
+  doctor     Preflight: Chrome, CDP, pool healthz, spaces, skill
 
 Client commands talk to a running pool (SLIPSTREAM_URL or --url).
 HTTP remains the primary surface — there is no MCP server.
@@ -26,6 +27,7 @@ from slipstream.cli import (
     cmd_release,
     cmd_status,
 )
+from slipstream.doctor import cmd_doctor
 from slipstream.config import PoolConfig
 from slipstream.pool import BrowserPool
 
@@ -44,7 +46,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     pool = BrowserPool(cfg)
     server = PoolServer(pool)
 
-    def _shutdown(signum, frame):  # noqa: ARG001
+    def _shutdown(_signum, _frame) -> None:
         print("\nShutting down pool…", flush=True)
         server.stop()
         sys.exit(0)
@@ -63,7 +65,7 @@ def _run_serve(args: argparse.Namespace) -> int:
         flush=True,
     )
     print(
-        "Agent CLI: slipstream lease|heartbeat|release|status  "
+        "Agent CLI: slipstream lease|heartbeat|release|status|doctor  "
         "(see skills/slipstream/SKILL.md)",
         flush=True,
     )
@@ -75,8 +77,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="slipstream",
         description=(
-            "Slipstream browser pool — serve the HTTP API or call lease/"
-            "heartbeat/release/status against a running pool."
+            "Slipstream browser pool — serve, lease/heartbeat/release/status, "
+            "or doctor (preflight) against Chrome + pool."
         ),
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -145,6 +147,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_url(p_st)
     p_st.set_defaults(_handler="status")
 
+    # --- doctor ---
+    p_doc = sub.add_parser(
+        "doctor",
+        help="Preflight: Chrome, CDP probe, pool healthz, spaces root, skill path",
+    )
+    _add_url(p_doc)
+    p_doc.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit machine-readable JSON instead of human text",
+    )
+    p_doc.set_defaults(_handler="doctor")
+
     return parser
 
 
@@ -176,6 +192,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args._handler == "status":
             return cmd_status(url=args.url)
+        if args._handler == "doctor":
+            return cmd_doctor(url=args.url, as_json=args.as_json)
     except CliError as e:
         print(e, file=sys.stderr)
         return e.exit_code

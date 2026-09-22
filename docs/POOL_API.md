@@ -2,7 +2,7 @@
 
 Transport: **localhost HTTP/JSON** via Python stdlib `ThreadingHTTPServer`.
 
-**No MCP** — this HTTP API is the external surface for agents/tools. The agent-facing **`slipstream` CLI** (`lease` / `heartbeat` / `release` / `status`) is another client of these same endpoints (see `skills/slipstream/SKILL.md`). There is no MCP server in this project.
+**No MCP** — this HTTP API is the external surface for agents/tools. The agent-facing **`slipstream` CLI** (`lease` / `heartbeat` / `release` / `status` / `doctor`) is another client of these same endpoints (see `skills/slipstream/SKILL.md`; alias intent `slipstream-browser`). There is no MCP server in this project.
 
 Default base URL: `http://127.0.0.1:8755` (override for CLI clients with `SLIPSTREAM_URL` or `--url`).
 
@@ -107,8 +107,10 @@ Console script / module entry (`slipstream` or `python -m slipstream`):
 | `slipstream heartbeat --lease-id …` | `POST /v1/leases/{id}/heartbeat` |
 | `slipstream release --lease-id …` | `DELETE /v1/leases/{id}` |
 | `slipstream status` | `GET /v1/pool/status` |
+| `slipstream doctor [--json]` | local preflight + `GET /healthz` (Chrome/CDP/spaces/skill) |
 
 Uses stdlib `urllib`. Env: `SLIPSTREAM_URL` for base URL. Non-zero exit + stderr on HTTP errors.
+`doctor` also probes an ephemeral Chrome CDP endpoint and checks Spaces root + skill path (no lease required).
 
 ## Driver notes
 

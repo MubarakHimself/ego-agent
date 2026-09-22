@@ -149,7 +149,7 @@ def test_build_parser_has_expected_subcommands():
             choice = action.choices
             break
     assert choice is not None
-    for name in ("serve", "lease", "heartbeat", "release", "status"):
+    for name in ("serve", "lease", "heartbeat", "release", "status", "doctor"):
         assert name in choice
 
 

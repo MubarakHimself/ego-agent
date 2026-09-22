@@ -55,7 +55,7 @@ def _parse_ttl_seconds(raw: Any) -> int | None:
 
 def make_handler(pool: BrowserPool):
     class PoolHandler(BaseHTTPRequestHandler):
-        def log_message(self, fmt: str, *args) -> None:  # quieter default
+        def log_message(self, *_args) -> None:  # quieter default
             pass
 
         def _read_json(self) -> dict[str, Any]:
