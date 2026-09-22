@@ -23,6 +23,9 @@ _STORE_TRUE = "store_true"
 _OPT_LEASE_ID = "--lease-id"
 _OPT_SPACE_ID = "--space-id"
 _OPT_TAG = "--tag"
+_OPT_JSON = "--json"
+_DEST_AS_JSON = "as_json"
+_HANDLER_SESSIONS = "sessions"
 
 import argparse
 import signal
@@ -43,6 +46,7 @@ from slipstream.cli import (
     cmd_heartbeat,
     cmd_lease,
     cmd_leases_list,
+    cmd_sessions,
     cmd_navigate,
     cmd_spaces_list,
     cmd_spaces_login_once,
@@ -402,6 +406,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_sp_lo.add_argument("--ttl-s", type=int, default=None, help="Watch TTL seconds")
     p_sp_lo.set_defaults(_handler="spaces_login_once")
 
+    # --- sessions (ops list) ---
+    p_sess = sub.add_parser(
+        _HANDLER_SESSIONS,
+        help="Ops session list: status, duration, tags, signed-in, watch presence",
+    )
+    _add_url(p_sess)
+    p_sess.add_argument("--q", default=None, help="Metadata query filter")
+    p_sess.add_argument(
+        _OPT_TAG,
+        action="append",
+        default=None,
+        help="Filter tag key=value (repeatable; AND with --q)",
+    )
+    p_sess.add_argument(
+        _OPT_JSON,
+        dest=_DEST_AS_JSON,
+        action=_STORE_TRUE,
+        help="Print full JSON (includes secret watch_url when minted)",
+    )
+    p_sess.set_defaults(_handler=_HANDLER_SESSIONS)
+
     # --- leases list ---
     p_leases = sub.add_parser("leases", help="List/filter active leases by user_metadata")
     leases_sub = p_leases.add_subparsers(dest="leases_cmd", metavar="SUBCOMMAND")
@@ -422,9 +447,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_url(p_doc)
     p_doc.add_argument(
-        "--json",
+        _OPT_JSON,
         action=_STORE_TRUE,
-        dest="as_json",
+        dest=_DEST_AS_JSON,
         help="Emit machine-readable JSON instead of human text",
     )
     p_doc.set_defaults(_handler="doctor")
@@ -435,9 +460,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compose /watch detection only (PASS/WARN; never hard-fail)",
     )
     p_ws.add_argument(
-        "--json",
+        _OPT_JSON,
         action=_STORE_TRUE,
-        dest="as_json",
+        dest=_DEST_AS_JSON,
         help="Emit machine-readable JSON",
     )
     p_ws.set_defaults(_handler="watch_status")
@@ -513,6 +538,10 @@ def main(argv: list[str] | None = None) -> int:
                 host=args.host,
                 ttl_s=args.ttl_s,
                 url=args.url,
+            )
+        if args._handler == _HANDLER_SESSIONS:
+            return cmd_sessions(
+                q=args.q, tags=args.tag, url=args.url, as_json=args.as_json
             )
         if args._handler == "leases_list":
             return cmd_leases_list(q=args.q, tags=args.tag, url=args.url)

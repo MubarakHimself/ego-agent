@@ -22,6 +22,8 @@ Endpoints:
   POST   /v1/leases/{id}/watch/mark-signed-in
   GET    /v1/spaces?q=…
   GET    /v1/leases?q=…
+  GET    /v1/ops/sessions
+  GET    /v1/ops/
   GET    /v1/leases/{id}/watch
   GET    /v1/leases/{id}/watch/frame
   GET    /v1/leases/{id}/watch/events
@@ -65,6 +67,7 @@ from slipstream.pool import (
 from slipstream.vault import CredNotFoundError, VaultUnavailableError, VaultValidationError
 from slipstream.metadata import MetadataValidationError
 from slipstream.signed_in import SignedInValidationError
+from slipstream.sessions import render_sessions_html
 
 # --- quality-debt: shared path / header / error literals (SKY-L027) ---
 _HDR_CONTENT_TYPE = "Content-Type"
@@ -316,6 +319,26 @@ def make_handler(pool: BrowserPool):
                 qs = parse_qs(urlparse(self.path).query)
                 q = (qs.get("q") or [None])[0]
                 _json_response(self, 200, pool.list_leases(q=q))
+                return
+            # GET /v1/ops/sessions — thin ops session list (JSON)
+            if path == "/v1/ops/sessions":
+                qs = parse_qs(urlparse(self.path).query)
+                q = (qs.get("q") or [None])[0]
+                _json_response(self, 200, pool.list_sessions(q=q))
+                return
+            # GET /v1/ops/ — thin HTML ops page (loopback)
+            if path in ("/v1/ops", "/v1/ops/"):
+                qs = parse_qs(urlparse(self.path).query)
+                q = (qs.get("q") or [None])[0]
+                payload = pool.list_sessions(q=q)
+                html_body = render_sessions_html(payload.get("sessions") or [])
+                _bytes_response(
+                    self,
+                    200,
+                    html_body.encode(_UTF8),
+                    "text/html; charset=utf-8",
+                    extra_headers=WATCH_CLICKJACK_HEADERS,
+                )
                 return
             # GET /v1/spaces/{space_id}/credentials — metadata only
             parts = path.strip("/").split("/")

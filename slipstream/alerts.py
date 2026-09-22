@@ -6,6 +6,8 @@ Captain chat gets a one-liner + Watch/Take-over link fields; harness gets JSON.
 
 from __future__ import annotations
 
+_DEFAULT_POOL_BASE = "http://127.0.0.1:8755"
+
 import re
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -28,7 +30,7 @@ _FORBIDDEN_KEY_RE = re.compile(
     r"auth(_?headers?)?|authorization|api[_-]?keys?|"
     r"cookie[_-]?paths?|secret[_-]?paths?|cdp[_-]?auth|"
     r"session[_-]?cookies?|set-cookie|"
-    r"private[_-]?keys?|jwts?|bearers?|access[_-]?keys?)$"
+    r"private[_-]?keys?|jwts?|bearers?|access[_-]?keys?|storage[_-]?states?|dumps?)$"
 )
 
 # Exact key names (after lower + hyphen→underscore) that trip rejection.
@@ -57,6 +59,8 @@ _FORBIDDEN_FRAGMENTS = frozenset(
         "jwt",
         "bearer",
         "access_key",
+        "storage_state",
+        "dump",
     }
 )
 
@@ -80,6 +84,7 @@ _FORBIDDEN_SEGMENTS = frozenset(
         "bearer",
         "bearers",
         "auth",  # ADV-META-001-GAP: basicAuth / proxyAuth / myAuth
+        "dump",  # ADV-LOGIN-004: no storage dump free-read keys
     }
 )
 
@@ -97,6 +102,7 @@ _FORBIDDEN_FLAT = frozenset(
         "privatekey",
         "accesskey",
         "apikey",
+        "storagestate",  # ADV-LOGIN-004
     }
 )
 
@@ -120,6 +126,7 @@ _FORBIDDEN_SEGMENT_PAIRS = frozenset(
         ("secret", "path"),
         ("cdp", "auth"),
         ("set", "cookie"),
+        ("storage", "state"),  # ADV-LOGIN-004
     }
 )
 
@@ -253,7 +260,7 @@ def default_watch_url(
     lease_id: str,
     *,
     token: str,
-    base_url: str = "http://127.0.0.1:8755",
+    base_url: str = _DEFAULT_POOL_BASE,
 ) -> str:
     """Short-TTL tokenized Watch URL (observe-only JPEG/HTML stream)."""
     from slipstream.watch import build_watch_url
@@ -265,7 +272,7 @@ def default_takeover_url(
     lease_id: str,
     *,
     token: str,
-    base_url: str = "http://127.0.0.1:8755",
+    base_url: str = _DEFAULT_POOL_BASE,
 ) -> str:
     """Take-over URL = same watch stream with confirm-pause UI (not pair-browse)."""
     from slipstream.watch import build_takeover_url
@@ -397,7 +404,7 @@ def build_alert_payload(
     lease_id: str,
     space_id: str,
     parsed: dict[str, Any],
-    base_url: str = "http://127.0.0.1:8755",
+    base_url: str = _DEFAULT_POOL_BASE,
     event_id: str | None = None,
     ts: str | None = None,
     watch_token: str | None = None,

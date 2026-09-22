@@ -42,6 +42,11 @@ _STATE_AWAITING_HUMAN = "awaiting_human"
 _STATE_LEASED = "leased"
 _ACTION_CONFIRM = "confirm"
 _ACTION_PAUSE = "pause"
+_KEY_SIGNED_IN = "signed_in"
+_KEY_SIGNED_IN_HOST = "signed_in_host"
+_KEY_WATCH_URL = "watch_url"
+_KEY_DURATION_S = "duration_s"
+_EVT_ALERT = "alert"
 from slipstream.watch import (
     WatchAuthError,
     WatchCaptureError,
@@ -75,6 +80,7 @@ from slipstream.metadata import (
     metadata_matches,
     validate_user_metadata,
 )
+from slipstream.sessions import alive_watch_url, session_row
 from slipstream.signed_in import (
     SignedInValidationError,
     badge_from_registry,
@@ -315,7 +321,7 @@ class BrowserPool:
             allowed_domains_override=domains_override,
             allowed_domains=self._effective_domains_for(space_id, domains_override),
             signed_in=bool(badge.get("signed_in")),
-            signed_in_host=badge.get("signed_in_host"),
+            signed_in_host=badge.get(_KEY_SIGNED_IN_HOST),
         )
         self._leases[lease_id] = lease
         slot.status = SlotStatus.LEASED
@@ -861,7 +867,7 @@ class BrowserPool:
                 )
                 self._alert_log.setdefault(lease_id, []).append(payload)
                 self._feed_for(lease_id).append(
-                    "alert",
+                    _EVT_ALERT,
                     f"need_human:{parsed.get('reason') or 'other'}",
                     outcome="pending",
                     detail={"event": EVENT_NEED_HUMAN, "reason": parsed.get("reason")},
@@ -884,7 +890,7 @@ class BrowserPool:
             self._alert_log.setdefault(lease_id, []).append(payload)
             self._task_done_envelopes[lease_id] = envelope
             self._feed_for(lease_id).append(
-                "alert",
+                _EVT_ALERT,
                 f"task_done:{parsed.get('outcome') or 'ok'}",
                 outcome=str(parsed.get("outcome") or "ok")[:32],
                 detail={"event": EVENT_TASK_DONE},
@@ -1309,7 +1315,7 @@ class BrowserPool:
             cede_url=cede,
             events_url=events,
             signed_in=bool(badge.get("signed_in")),
-            signed_in_host=badge.get("signed_in_host"),
+            signed_in_host=badge.get(_KEY_SIGNED_IN_HOST),
             mark_signed_in_url=mark_url,
         )
         return "text/html; charset=utf-8", body
@@ -1618,7 +1624,7 @@ class BrowserPool:
         """Copy Space signed-in badge onto lease (metadata only)."""
         badge = badge_from_registry(self._space_signed_in.get(lease.space_id))
         lease.signed_in = bool(badge.get("signed_in"))
-        lease.signed_in_host = badge.get("signed_in_host")
+        lease.signed_in_host = badge.get(_KEY_SIGNED_IN_HOST)
 
     def _apply_space_signed_in_locked(
         self, space_id: str, *, signed: bool, host: str | None
@@ -1750,16 +1756,27 @@ class BrowserPool:
                 ),
             }
             if signed and host:
-                out["signed_in_host"] = host
+                out[_KEY_SIGNED_IN_HOST] = host
             return out
 
 
     def mark_watch_signed_in(
         self, lease_id: str, token: str | None, body: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Tokenized Watch path: mark lease Space signed-in after human login."""
+        """Tokenized Watch path: mark lease Space signed-in after human login.
+
+        ADV-LOGIN-002: requires Take-over confirm (and reason=login when set).
+        """
         with self._lock:
             sess = self._get_watch_session_locked(lease_id, token)
+            if not sess.takeover_confirmed:
+                raise WatchForbiddenError(
+                    "takeover confirm required before mark-signed-in"
+                )
+            if sess.reason is not None and sess.reason != "login":
+                raise WatchForbiddenError(
+                    "mark-signed-in only for need_human reason=login"
+                )
             if lease_id not in self._leases:
                 self._invalidate_pair_browse_locked(sess, revoke=True)
                 raise WatchGoneError(_ERR_LEASE_INACTIVE)
@@ -1848,8 +1865,13 @@ class BrowserPool:
             return {"spaces": items, "q": q}
 
     def list_leases(self, *, q: str | None = None) -> dict[str, Any]:
-        """List active leases filtered by effective user_metadata q=."""
+        """List active leases filtered by effective user_metadata q=.
+
+        Adds ``duration_s`` and ``watch_url`` (only when a valid tokenized Watch
+        exists — treat as secret; never log).
+        """
         with self._lock:
+            now = time.time()
             items: list[dict[str, Any]] = []
             for lease in self._leases.values():
                 lease.user_metadata = effective_metadata(
@@ -1859,9 +1881,61 @@ class BrowserPool:
                 self._sync_lease_signed_in(lease)
                 if not metadata_matches(lease.user_metadata, q):
                     continue
-                items.append(lease.to_dict())
+                item = lease.to_dict()
+                item[_KEY_DURATION_S] = max(0, int(now - float(lease.created_at)))
+                item.update(self._watch_url_fields_locked(lease.lease_id, now=now))
+                items.append(item)
             items.sort(key=lambda x: x.get("created_at") or 0)
             return {"leases": items, "q": q}
+
+    def _watch_url_fields_locked(
+        self, lease_id: str, *, now: float | None = None
+    ) -> dict[str, Any]:
+        """Return {watch_url} only when Watch session is alive. Caller holds lock."""
+        sess = self._lookup_watch(lease_id)
+        if sess is None:
+            return {}
+        url = alive_watch_url(
+            lease_id=lease_id,
+            token=sess.token,
+            revoked=sess.revoked,
+            expires_at=sess.expires_at,
+            base_url=self._api_base_url,
+            now=now,
+        )
+        return {_KEY_WATCH_URL: url} if url else {}
+
+    def list_sessions(self, *, q: str | None = None) -> dict[str, Any]:
+        """Ops session list: active leases + duration + tags + optional watch_url."""
+        with self._lock:
+            now = time.time()
+            items: list[dict[str, Any]] = []
+            for lease in self._leases.values():
+                meta = effective_metadata(
+                    self._space_metadata.get(lease.space_id, {}),
+                    lease.user_metadata_override,
+                )
+                lease.user_metadata = meta
+                self._sync_lease_signed_in(lease)
+                if not metadata_matches(meta, q):
+                    continue
+                watch = self._watch_url_fields_locked(lease.lease_id, now=now)
+                items.append(
+                    session_row(
+                        space_id=lease.space_id,
+                        lease_id=lease.lease_id,
+                        agent_id=lease.agent_id,
+                        status=lease.status,
+                        leased_at=lease.created_at,
+                        user_metadata=meta,
+                        signed_in=bool(lease.signed_in),
+                        signed_in_host=lease.signed_in_host,
+                        watch_url=watch.get(_KEY_WATCH_URL),
+                        now=now,
+                    )
+                )
+            items.sort(key=lambda x: x.get("leased_at") or 0)
+            return {"sessions": items, "q": q}
 
     def shutdown(self) -> None:
         pending_stops: list[LaunchHandle] = []

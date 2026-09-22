@@ -341,7 +341,8 @@ POST /v1/spaces/{space_id}/signed-in
 → 200 {space_id, signed_in:false, …}
 
 POST /v1/leases/{lease_id}/watch/mark-signed-in?token=…
-# form or JSON; marks the lease's Space (same badge fields)
+# form or JSON; marks the lease's Space (same badge fields).
+# Requires Take-over confirm + need_human reason=login (ADV-LOGIN-002).
 ```
 
 `GET /v1/spaces` / `GET /v1/leases` include `signed_in` (+ `signed_in_host` when set). Watch header shows a **signed-in** chip. `user_metadata` mirrors `signed_in=true` / `signed_in_host` for `q=` filters.
@@ -366,6 +367,28 @@ slipstream cred unbind --space-id "$S" --cred-id "$C"
 ```
 
 Env: `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_VAULT_KEY` (mock/tests; or `SLIPSTREAM_ALLOW_VAULT_KEY=1`), `SLIPSTREAM_ALLOW_SECRET_ARGV=1`, optional extras `pip install 'slipstream[vault]'` / `'slipstream[cdp]'`.
+
+### Ops session list (thin)
+
+Browserbase-style **fleet / ops list** (ui-peers steal #7). Joins active leases with status, duration, tags, signed-in badge, and **watch_url only when a valid tokenized Watch already exists** (need_human / awaiting_human). Treat `watch_url` as a screen-share secret — never log it; do not invent long-lived public URLs.
+
+```http
+GET /v1/ops/sessions
+GET /v1/ops/sessions?q=env=staging
+→ 200 { "sessions": [
+    { "space_id", "lease_id", "agent_id?", "status", "leased_at", "duration_s",
+      "user_metadata", "signed_in", "signed_in_host?", "watch_url?" }
+  ], "q" }
+
+GET /v1/ops/
+→ 200 text/html  (loopback table; Open Watch button when watch_url present)
+```
+
+`GET /v1/leases` also includes `duration_s` and optional `watch_url` (same secret rule).
+
+CLI: `slipstream sessions` (table; watch presence only) · `slipstream sessions --json` (includes tokenized URLs).
+
+**Not included:** CAPTCHA chips, downloads product, full dashboard WS, Monid, Electron, MCP.
 
 ### `DELETE /v1/leases/{lease_id}`
 

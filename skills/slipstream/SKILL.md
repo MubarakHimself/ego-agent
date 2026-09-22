@@ -380,6 +380,19 @@ same Space after a successful human or fill login.
 **Refuse:** free-read secret endpoints (`error=refused`), cookie/`storageState`
 dumps to the agent, secrets in alert payloads / fill bodies.
 
+## Ops session list
+
+Thin fleet view of active leases (status, duration, tags, signed-in, Watch when minted):
+
+```bash
+slipstream sessions                  # table (watch column = yes/—; no secret URL)
+slipstream sessions --json           # includes watch_url when need_human minted it
+# HTML (loopback pool): open http://127.0.0.1:8755/v1/ops/
+# JSON: GET /v1/ops/sessions
+```
+
+`watch_url` is a short-TTL screen-share secret — only present when already minted; never invent public URLs; do not log the token.
+
 ## Exclusivity and warm rules
 
 - **Space exclusivity:** a `space_id` may be leased by only one agent at a time.
