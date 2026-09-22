@@ -21,10 +21,13 @@ from slipstream.captcha import (
     EVENT_FAILED,
     REASON_TIMEOUT,
     STATE_FAILED,
+    STATE_SOLVED,
+    STATE_SOLVING,
     CaptchaState,
     apply_captcha_event,
     captcha_banner_html,
     captcha_chip_html,
+    captcha_may_escalate,
     feed_outcome_for_event,
     mark_escalated,
     parse_captcha_request,
@@ -951,11 +954,13 @@ class BrowserPool:
             pass
 
     def report_captcha(self, lease_id: str, body: dict[str, Any]) -> dict[str, Any]:
-        """Client/stub CAPTCHA lifecycle → activity feed + optional need_human."""
+        """Client/stub CAPTCHA lifecycle → activity feed + optional need_human.
+
+        ADV-CAP-001: late ``failed`` after ``finished`` (SOLVED) does not escalate.
+        ADV-CAP-002: escalate under RLock with re-check before/after raise_alert.
+        """
         parsed = parse_captcha_request(body)
         event = parsed["event"]
-        escalate = False
-        escalate_detail = ""
 
         with self._lock:
             self._require_leased(lease_id)
@@ -968,17 +973,13 @@ class BrowserPool:
                 timeout_s=parsed["timeout_s"],
             )
             self._record_captcha_bus_locked(lease_id, state, event=event)
-            if event == EVENT_FAILED and not state.escalated:
-                escalate = True
-                escalate_detail = parsed["detail"] or "CAPTCHA solve failed"
-            public = state.to_public()
-
-        return self._captcha_response(
-            lease_id,
-            public,
-            escalate=escalate,
-            escalate_detail=escalate_detail,
-        )
+            # ADV-CAP-001: only escalate failed when still eligible (not SOLVED).
+            if event == EVENT_FAILED and captcha_may_escalate(state):
+                return self._captcha_escalate_locked(
+                    lease_id,
+                    detail=parsed["detail"] or "CAPTCHA solve failed",
+                )
+            return {"lease_id": lease_id, "captcha": state.to_public()}
 
     def _require_leased(self, lease_id: str) -> Lease:
         """Caller holds lock. Raise LeaseNotFoundError if lease/slot not LEASED."""
@@ -1028,30 +1029,42 @@ class BrowserPool:
             row.update(extra)
         self._alert_log.setdefault(lease_id, []).append(row)
 
-    def _captcha_response(
-        self,
-        lease_id: str,
-        public: dict[str, Any],
-        *,
-        escalate: bool,
-        escalate_detail: str,
+    def _captcha_escalate_locked(
+        self, lease_id: str, *, detail: str
     ) -> dict[str, Any]:
-        out: dict[str, Any] = {"lease_id": lease_id, "captcha": public}
-        if not escalate:
-            return out
+        """Caller holds RLock. Re-check eligibility, raise need_human, mark escalated.
+
+        ADV-CAP-002: re-check under lock immediately before raise_alert and again
+        after; only mark escalated when still SOLVING/FAILED and not SOLVED.
+        Holding the RLock across raise_alert closes the unlock→SOLVED race.
+        """
+        st = self._captcha.get(lease_id)
+        # Re-check immediately before escalate.
+        if st is None or not captcha_may_escalate(st):
+            public = st.to_public() if st is not None else {"state": STATE_SOLVED}
+            return {"lease_id": lease_id, "captcha": public}
+
         envelope = self.raise_alert(
             lease_id,
             {
                 "event": EVENT_NEED_HUMAN,
                 "reason": "captcha",
-                "detail": escalate_detail or "CAPTCHA unsolved",
+                "detail": detail or "CAPTCHA unsolved",
             },
         )
-        with self._lock:
-            st = self._captcha.get(lease_id)
-            if st is not None:
-                mark_escalated(st)
-                out["captcha"] = st.to_public()
+        # Re-check after raise_alert — never stamp ESCALATED over SOLVED.
+        st = self._captcha.get(lease_id)
+        if (
+            st is not None
+            and not st.escalated
+            and st.state != STATE_SOLVED
+            and st.state in (STATE_FAILED, STATE_SOLVING)
+        ):
+            mark_escalated(st)
+        out: dict[str, Any] = {
+            "lease_id": lease_id,
+            "captcha": st.to_public() if st is not None else {},
+        }
         out["alert"] = envelope["alert"]
         out["harness"] = envelope["harness"]
         return out
@@ -1059,11 +1072,20 @@ class BrowserPool:
     def _escalate_captcha_timeout_if_needed(
         self, lease_id: str
     ) -> dict[str, Any] | None:
-        """If solving past timeout, raise need_human once. Returns envelope or None."""
+        """If solving past timeout, raise need_human once. Returns envelope or None.
+
+        ADV-CAP-002: set FAILED, re-check under lock before escalate, hold RLock
+        across raise_alert, re-check after — skip if concurrent finished→SOLVED.
+        """
         detail = "CAPTCHA solve timed out"
         with self._lock:
             state = self._captcha.get(lease_id)
-            if state is None or state.escalated or not state.is_timed_out():
+            if (
+                state is None
+                or state.escalated
+                or state.state == STATE_SOLVED
+                or not state.is_timed_out()
+            ):
                 return None
             state.state = STATE_FAILED
             detail = state.detail or detail
@@ -1074,20 +1096,13 @@ class BrowserPool:
                 outcome=REASON_TIMEOUT,
                 extra={"reason": REASON_TIMEOUT},
             )
-
-        envelope = self.raise_alert(
-            lease_id,
-            {
-                "event": EVENT_NEED_HUMAN,
-                "reason": "captcha",
-                "detail": detail,
-            },
-        )
-        with self._lock:
-            st = self._captcha.get(lease_id)
-            if st is not None:
-                mark_escalated(st)
-        return envelope
+            # Re-check immediately before escalate (still under same RLock).
+            if not captcha_may_escalate(state):
+                return None
+            out = self._captcha_escalate_locked(lease_id, detail=detail)
+            if "alert" not in out:
+                return None
+            return {"alert": out["alert"], "harness": out["harness"]}
 
     # --- permission ladder (confirm-actions) ---------------------------
 

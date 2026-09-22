@@ -399,12 +399,14 @@ POST /v1/leases/{lease_id}/captcha
 |-------|-------|-------------|
 | `started` / `captcha_solving_started` | `solving` | No — chip on Watch/activity |
 | `finished` / `captcha_solving_finished` | `solved` | **No** |
-| `failed` / `captcha_solving_failed` | `failed` → `escalated` | **Yes** (`reason=captcha`) |
-| timeout while `solving` (`SLIPSTREAM_CAPTCHA_TIMEOUT`, default 60s; checked on heartbeat / Watch) | `escalated` | **Yes** |
+| `failed` / `captcha_solving_failed` | `failed` → `escalated` | **Yes** (`reason=captcha`) — **not** if already `solved` (late failed ignored) |
+| timeout while `solving` (`SLIPSTREAM_CAPTCHA_TIMEOUT`, default 60s; heartbeat / Watch) | `failed` → `escalated` | **Yes** — aborted if concurrent `finished`→`solved` (re-check under lock) |
 
-Secrets refused (same denylist as alerts). Watch HTML shows a high-salience
-chip/banner when state is solving or failed/escalated. Activity feed kind
-`captcha`. CLI: `slipstream captcha started|finished|failed --lease-id …`.
+Secrets refused (alerts denylist) plus captcha `detail` scrubs unlabeled JWT-like /
+`sk-` / `AKIA` / `ghp_` shapes. Chip/banner HTML escapes dynamic provider/detail.
+Watch HTML shows a high-salience chip/banner when state is solving or
+failed/escalated. Activity feed kind `captcha`. CLI:
+`slipstream captcha started|finished|failed --lease-id …`.
 
 ### Ops session list (thin)
 
