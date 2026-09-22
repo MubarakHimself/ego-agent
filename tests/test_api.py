@@ -32,6 +32,9 @@ def api_server(tmp_path):
 
 
 def _req(method: str, url: str, body: dict | None = None) -> tuple[int, dict]:
+    # Tests only talk to the local PoolServer (loopback).
+    if not url.startswith(("http://127.0.0.1:", "http://localhost:")):
+        raise ValueError(f"test helper refuses non-loopback URL: {url!r}")
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
         url,
