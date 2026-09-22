@@ -14,7 +14,6 @@ class SlotStatus(str, enum.Enum):
     FREE_WARM = "free_warm"
     STARTING = "starting"
     LEASED = "leased"
-    RELEASING = "releasing"
 
 
 @dataclass

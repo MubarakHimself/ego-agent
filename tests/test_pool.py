@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from ego_pool.config import PoolConfig
+from ego_pool.launcher import LaunchHandle
 from ego_pool.models import SlotStatus
 from ego_pool.pool import (
     BrowserPool,
@@ -34,12 +35,21 @@ def test_space_path_convention(mock_config):
     assert path.name == "task-42"
 
 
-@pytest.mark.parametrize("bad", [".", "..", "", "   "])
+@pytest.mark.parametrize("bad", [".", "..", "", "   ", "a/b", "a\\b", "foo..bar", "x\0y"])
 def test_space_id_rejects_unsafe(mock_config, bad):
     with pytest.raises(ValueError):
         mock_config.space_path(bad)
     with pytest.raises(ValueError):
         PoolConfig.normalize_space_id(bad)
+
+
+def test_space_id_slash_rejected_not_collapsed(mock_config):
+    """Path separators must 400 — never rewritten into '_' (would collapse ids)."""
+    with pytest.raises(ValueError, match="unsafe"):
+        PoolConfig.normalize_space_id("a/b")
+    # Distinct underscore form remains distinct and valid
+    assert PoolConfig.normalize_space_id("a_b") == "a_b"
+    assert mock_config.space_path("a_b") == mock_config.spaces_root / "a_b"
 
 
 def test_lease_heartbeat_release(pool: BrowserPool):
@@ -69,6 +79,20 @@ def test_idempotent_lease_same_agent_space(pool: BrowserPool):
     assert a["lease_id"] == b["lease_id"]
 
 
+def test_idempotent_release_after_hard_ttl_gets_fresh(pool: BrowserPool):
+    """Expired (agent_id, space_id) hit must release then issue a new lease."""
+    a = pool.lease("agent-1", "space-a", ttl_seconds=60)
+    old_id = a["lease_id"]
+    pool._leases[old_id].expires_at = time.time() - 1
+    b = pool.lease("agent-1", "space-a")
+    assert b["lease_id"] != old_id
+    assert b["status"] == "leased"
+    assert old_id not in pool._leases
+    assert pool.status()["leased"] == 1
+    # Fresh lease is heartbeatable
+    assert pool.heartbeat(b["lease_id"])["ok"] is True
+
+
 def test_space_exclusivity_different_agent(pool: BrowserPool):
     pool.lease("agent-1", "space-a")
     with pytest.raises(SpaceInUseError):
@@ -87,9 +111,10 @@ def test_hard_k_cap(pool: BrowserPool):
     pool.lease("agent-overflow", "space-overflow")
 
 
-def test_warm_slot_on_release(pool: BrowserPool):
+def test_warm_slot_on_client_release(pool: BrowserPool):
     lease = pool.lease("agent-1", "space-a")
-    pool.release(lease["lease_id"])
+    rel = pool.release(lease["lease_id"])
+    assert rel["kept_warm"] is True
     st = pool.status()
     assert st["warm"] == 1  # W=1
     warm_slots = [s for s in st["slots"] if s["status"] == SlotStatus.FREE_WARM.value]
@@ -115,6 +140,36 @@ def test_warm_reuse_same_space_no_relaunch(pool: BrowserPool):
     assert slot.cdp_port == port_before
     assert lease2["space_id"] == "space-a"
     assert lease2["lease_id"] != lease["lease_id"]
+
+
+def test_dead_warm_same_space_relaunches(pool: BrowserPool):
+    """Matching FREE_WARM with a dead process must stop + cold start."""
+    lease = pool.lease("agent-1", "space-a")
+    pool.release(lease["lease_id"])
+    assert pool.status()["warm"] == 1
+    warm = next(s for s in pool._slots if s.status == SlotStatus.FREE_WARM)
+    # Simulate a non-mocked dead handle (poll returns exit code)
+    dead_proc = MagicMock()
+    dead_proc.poll.return_value = 1  # exited
+    pool._handles[warm.slot_id] = LaunchHandle(
+        pid=warm.chromium_pid or 99999,
+        cdp_port=warm.cdp_port or 19222,
+        cdp_http_url=warm.cdp_http_url or "http://127.0.0.1:19222",
+        cdp_ws_url=warm.cdp_ws_url,
+        user_data_dir=pool.config.spaces_root / "space-a",
+        process=dead_proc,
+        mocked=False,
+    )
+
+    with patch.object(pool.launcher, "launch", wraps=pool.launcher.launch) as launch_spy:
+        lease2 = pool.lease("agent-2", "space-a")
+        assert launch_spy.call_count == 1
+
+    assert lease2["space_id"] == "space-a"
+    assert lease2["lease_id"] != lease["lease_id"]
+    slot = pool._find_slot_by_lease(lease2["lease_id"])
+    assert slot is not None
+    assert slot.status == SlotStatus.LEASED
 
 
 def test_warm_different_space_relaunches(pool: BrowserPool):
@@ -143,7 +198,7 @@ def test_heartbeat_unknown_lease(pool: BrowserPool):
         pool.heartbeat("does-not-exist")
 
 
-def test_idle_evict(pool: BrowserPool):
+def test_idle_evict_stops_chromium_no_warm(pool: BrowserPool):
     lease = pool.lease("agent-1", "space-a")
     lid = lease["lease_id"]
     # Force stale heartbeat
@@ -153,6 +208,9 @@ def test_idle_evict(pool: BrowserPool):
     evicted = pool.evict_idle()
     assert lid in evicted
     assert pool.status()["leased"] == 0
+    assert pool.status()["warm"] == 0
+    cold = [s for s in pool.status()["slots"] if s["status"] == SlotStatus.FREE_COLD.value]
+    assert len(cold) == pool.config.K
 
 
 def test_evict_skips_freshly_heartbeated_lease(pool: BrowserPool):
@@ -172,7 +230,7 @@ def test_evict_skips_freshly_heartbeated_lease(pool: BrowserPool):
     assert pool.heartbeat(lid)["ok"] is True
 
 
-def test_hard_ttl_expires_on_heartbeat(pool: BrowserPool):
+def test_hard_ttl_expires_on_heartbeat_stops_no_warm(pool: BrowserPool):
     lease = pool.lease("agent-1", "space-a", ttl_seconds=1)
     lid = lease["lease_id"]
     # Force expires_at into the past
@@ -180,11 +238,12 @@ def test_hard_ttl_expires_on_heartbeat(pool: BrowserPool):
     with pytest.raises(LeaseExpiredError):
         pool.heartbeat(lid)
     assert pool.status()["leased"] == 0
+    assert pool.status()["warm"] == 0
     with pytest.raises(LeaseNotFoundError):
         pool.heartbeat(lid)
 
 
-def test_hard_ttl_expires_via_evict_idle(pool: BrowserPool):
+def test_hard_ttl_expires_via_evict_idle_stops_no_warm(pool: BrowserPool):
     lease = pool.lease("agent-1", "space-a", ttl_seconds=60)
     lid = lease["lease_id"]
     pool._leases[lid].expires_at = time.time() - 1
@@ -194,6 +253,7 @@ def test_hard_ttl_expires_via_evict_idle(pool: BrowserPool):
     evicted = pool.evict_idle()
     assert lid in evicted
     assert pool.status()["leased"] == 0
+    assert pool.status()["warm"] == 0
 
 
 def test_launch_failure_frees_slot(pool: BrowserPool):
@@ -231,9 +291,10 @@ def test_sample_tree_rss_mb_removed():
     assert not hasattr(rss_mod, "sample_tree_rss_mb")
 
 
-def test_slot_status_no_evicting_dead():
+def test_slot_status_no_evicting_dead_releasing():
     assert not hasattr(SlotStatus, "EVICTING")
     assert not hasattr(SlotStatus, "DEAD")
+    assert not hasattr(SlotStatus, "RELEASING")
 
 
 def test_space_dir_created_on_lease(pool: BrowserPool, mock_config):

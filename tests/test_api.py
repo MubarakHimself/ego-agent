@@ -59,7 +59,7 @@ def test_lease_heartbeat_delete(api_server: PoolServer):
     code, lease = _req(
         "POST",
         f"{base}/v1/leases",
-        {"agent_id": "a1", "space_id": "s1", "mode": "isolated"},
+        {"agent_id": "a1", "space_id": "s1"},
     )
     assert code == 200
     lid = lease["lease_id"]
@@ -69,6 +69,7 @@ def test_lease_heartbeat_delete(api_server: PoolServer):
 
     code, rel = _req("DELETE", f"{base}/v1/leases/{lid}")
     assert code == 200 and rel["released"] is True
+    assert rel["kept_warm"] is True
 
 
 def test_pool_full_returns_503(api_server: PoolServer):
@@ -92,15 +93,34 @@ def test_space_in_use_returns_409(api_server: PoolServer):
 
 def test_bad_space_id_returns_400(api_server: PoolServer):
     base = api_server.base_url
-    for bad in (".", "..", ""):
+    for bad in (".", "..", "", "a/b", "a\\b", "foo..bar"):
         code, body = _req(
             "POST",
             f"{base}/v1/leases",
             {"agent_id": "a1", "space_id": bad},
         )
-        # empty space_id hits "required" check; "." / ".." hit validation
+        # empty space_id hits "required" check; others hit validation
         assert code == 400
         assert "error" in body
+
+
+def test_slash_space_id_not_collapsed(api_server: PoolServer):
+    base = api_server.base_url
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases",
+        {"agent_id": "a1", "space_id": "task/42"},
+    )
+    assert code == 400
+    assert body["error"] == "bad_request"
+    # Underscore form is accepted and stays distinct
+    code, lease = _req(
+        "POST",
+        f"{base}/v1/leases",
+        {"agent_id": "a1", "space_id": "task_42"},
+    )
+    assert code == 200
+    assert lease["space_id"] == "task_42"
 
 
 def test_bad_ttl_seconds_returns_400(api_server: PoolServer):
@@ -146,3 +166,15 @@ def test_launch_failure_returns_503(api_server: PoolServer, monkeypatch):
     code, lease = _req("POST", f"{base}/v1/leases", {"agent_id": "a1", "space_id": "s1"})
     assert code == 200
     assert lease["status"] == "leased"
+
+
+def test_oserror_launch_failure_returns_503(api_server: PoolServer, monkeypatch):
+    base = api_server.base_url
+
+    def boom(*_a, **_k):
+        raise OSError("errno spawn failed")
+
+    monkeypatch.setattr(api_server.pool.launcher, "launch", boom)
+    code, body = _req("POST", f"{base}/v1/leases", {"agent_id": "a1", "space_id": "s1"})
+    assert code == 503
+    assert body["error"] == "launch_failed"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Any
@@ -108,29 +109,84 @@ class BrowserPool:
         self._clear_lease_fields(slot)
         slot.status = SlotStatus.FREE_COLD
 
+    def _handle_alive(self, slot: SlotState) -> bool:
+        """True if the slot's launch handle is still a live process (mocked ⇒ alive)."""
+        handle = self._handles.get(slot.slot_id)
+        if handle is None:
+            return False
+        if handle.mocked:
+            return True
+        if handle.process is not None:
+            return handle.process.poll() is None
+        pid = handle.pid if handle.pid is not None else slot.chromium_pid
+        if pid is None:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+
+    def _attach_lease(
+        self,
+        slot: SlotState,
+        agent_id: str,
+        space_id: str,
+        ttl_seconds: int | None,
+        *,
+        cdp_http_url: str | None,
+        cdp_ws_url: str | None,
+    ) -> dict[str, Any]:
+        """Wire Lease + slot lease fields; caller sets process/CDP fields as needed."""
+        now = time.time()
+        lease_id = new_lease_id()
+        hard_ttl = ttl_seconds if ttl_seconds is not None else self.config.lease_hard_ttl_seconds
+        lease = Lease(
+            lease_id=lease_id,
+            slot_id=slot.slot_id,
+            agent_id=agent_id,
+            space_id=space_id,
+            status="leased",
+            cdp_http_url=cdp_http_url,
+            cdp_ws_url=cdp_ws_url,
+            created_at=now,
+            expires_at=now + hard_ttl,
+        )
+        self._leases[lease_id] = lease
+        slot.status = SlotStatus.LEASED
+        slot.space_id = space_id
+        slot.lease_id = lease_id
+        slot.agent_id = agent_id
+        slot.last_heartbeat = now
+        slot.leased_at = now
+        return lease.to_dict()
+
     # --- lease API -----------------------------------------------------
 
     def lease(
         self,
         agent_id: str,
         space_id: str,
-        mode: str = "isolated",
         *,
         ttl_seconds: int | None = None,
     ) -> dict[str, Any]:
-        if mode != "isolated":
-            raise ValueError("MVP only supports mode=isolated (attach_user_chrome is stretch)")
-
-        # Validate / normalize early (rejects ".", "..", empty, unsafe)
+        # Validate early (rejects ".", "..", "/", NULs, empty, unsafe)
         space_id = self.config.normalize_space_id(space_id)
 
         with self._lock:
+            now = time.time()
             # Idempotent: same agent+space already leased → return existing
-            for lid, existing in self._leases.items():
+            # unless hard TTL has expired (then release and fall through).
+            for lid, existing in list(self._leases.items()):
                 if existing.agent_id == agent_id and existing.space_id == space_id:
                     slot = self._find_slot_by_lease(lid)
                     if slot and slot.status == SlotStatus.LEASED:
-                        slot.last_heartbeat = time.time()
+                        if existing.expires_at is not None and now >= existing.expires_at:
+                            self._release_locked(
+                                lid, reason="hard_ttl_expired", allow_warm=False
+                            )
+                            break
+                        slot.last_heartbeat = now
                         return existing.to_dict()
 
             # Space exclusivity: never two trees on one Space without handoff
@@ -145,6 +201,7 @@ class BrowserPool:
                     )
 
             # Prefer FREE_WARM with matching space_id → reuse process (no relaunch)
+            # if still alive; dead warm → stop + cold start.
             matching_warm = next(
                 (
                     s
@@ -154,7 +211,13 @@ class BrowserPool:
                 None,
             )
             if matching_warm is not None:
-                return self._reuse_warm_and_lease(matching_warm, agent_id, space_id, ttl_seconds)
+                if self._handle_alive(matching_warm):
+                    return self._reuse_warm_and_lease(
+                        matching_warm, agent_id, space_id, ttl_seconds
+                    )
+                self._stop_slot(matching_warm)
+                matching_warm.status = SlotStatus.FREE_COLD
+                return self._start_and_lease(matching_warm, agent_id, space_id, ttl_seconds)
 
             # Prefer any FREE_WARM (different Space → stop + relaunch)
             warm = next((s for s in self._slots if s.status == SlotStatus.FREE_WARM), None)
@@ -180,29 +243,14 @@ class BrowserPool:
         ttl_seconds: int | None,
     ) -> dict[str, Any]:
         """Attach a new lease to an existing FREE_WARM process (same Space)."""
-        now = time.time()
-        lease_id = new_lease_id()
-        hard_ttl = ttl_seconds if ttl_seconds is not None else self.config.lease_hard_ttl_seconds
-        lease = Lease(
-            lease_id=lease_id,
-            slot_id=slot.slot_id,
-            agent_id=agent_id,
-            space_id=space_id,
-            status="leased",
+        return self._attach_lease(
+            slot,
+            agent_id,
+            space_id,
+            ttl_seconds,
             cdp_http_url=slot.cdp_http_url,
             cdp_ws_url=slot.cdp_ws_url,
-            created_at=now,
-            expires_at=now + hard_ttl,
         )
-        self._leases[lease_id] = lease
-
-        slot.status = SlotStatus.LEASED
-        slot.space_id = space_id
-        slot.lease_id = lease_id
-        slot.agent_id = agent_id
-        slot.last_heartbeat = now
-        slot.leased_at = now
-        return lease.to_dict()
 
     def _start_and_lease(
         self,
@@ -223,37 +271,21 @@ class BrowserPool:
             raise
 
         self._handles[slot.slot_id] = handle
-
-        now = time.time()
-        lease_id = new_lease_id()
-        hard_ttl = ttl_seconds if ttl_seconds is not None else self.config.lease_hard_ttl_seconds
-        lease = Lease(
-            lease_id=lease_id,
-            slot_id=slot.slot_id,
-            agent_id=agent_id,
-            space_id=space_id,
-            status="leased",
+        result = self._attach_lease(
+            slot,
+            agent_id,
+            space_id,
+            ttl_seconds,
             cdp_http_url=handle.cdp_http_url,
             cdp_ws_url=handle.cdp_ws_url,
-            created_at=now,
-            expires_at=now + hard_ttl,
         )
-        self._leases[lease_id] = lease
-
-        slot.status = SlotStatus.LEASED
         slot.chromium_pid = handle.pid
         slot.cdp_port = handle.cdp_port
         slot.cdp_http_url = handle.cdp_http_url
         slot.cdp_ws_url = handle.cdp_ws_url
-        slot.space_id = space_id
-        slot.lease_id = lease_id
-        slot.agent_id = agent_id
-        slot.last_heartbeat = now
-        slot.leased_at = now
         if not self.config.mock:
             slot.rss_bytes = sample_tree_rss(handle.pid)
-
-        return lease.to_dict()
+        return result
 
     def heartbeat(self, lease_id: str) -> dict[str, Any]:
         with self._lock:
@@ -264,9 +296,9 @@ class BrowserPool:
             if not slot or slot.status != SlotStatus.LEASED:
                 raise LeaseNotFoundError(lease_id)
             now = time.time()
-            # Hard lease TTL: release then fail (do not refresh)
+            # Hard lease TTL: release then fail (do not refresh); never keep warm
             if lease.expires_at is not None and now >= lease.expires_at:
-                self._release_locked(lease_id, reason="hard_ttl_expired")
+                self._release_locked(lease_id, reason="hard_ttl_expired", allow_warm=False)
                 raise LeaseExpiredError(lease_id)
             slot.last_heartbeat = now
             return {
@@ -277,11 +309,22 @@ class BrowserPool:
             }
 
     def release(self, lease_id: str, reason: str = "client_release") -> dict[str, Any]:
+        """Explicit client DELETE — may keep warm up to W."""
         with self._lock:
-            return self._release_locked(lease_id, reason=reason)
+            return self._release_locked(lease_id, reason=reason, allow_warm=True)
 
-    def _release_locked(self, lease_id: str, reason: str = "client_release") -> dict[str, Any]:
-        """Release assuming ``self._lock`` is held."""
+    def _release_locked(
+        self,
+        lease_id: str,
+        reason: str = "client_release",
+        *,
+        allow_warm: bool = False,
+    ) -> dict[str, Any]:
+        """Release assuming ``self._lock`` is held.
+
+        ``allow_warm`` is True only for explicit client DELETE. Idle / hard-TTL
+        evictions always stop Chromium (no FREE_WARM / no stale CDP handoff).
+        """
         lease = self._leases.get(lease_id)
         if not lease:
             raise LeaseNotFoundError(lease_id)
@@ -289,8 +332,7 @@ class BrowserPool:
         if not slot:
             raise LeaseNotFoundError(lease_id)
 
-        slot.status = SlotStatus.RELEASING
-        keep_warm = self._count_warm() < self.config.W
+        keep_warm = allow_warm and self._count_warm() < self.config.W
 
         if keep_warm:
             # Detach lease; keep process as FREE_WARM with Space binding for reuse
@@ -326,6 +368,7 @@ class BrowserPool:
 
         Re-checks staleness / expiry under the lock immediately before teardown
         so a concurrent heartbeat cannot be raced into an eviction.
+        Evictions never keep warm (always stop Chromium).
         """
         now = now if now is not None else time.time()
         evicted: list[str] = []
@@ -344,7 +387,7 @@ class BrowserPool:
                 # Hard TTL takes precedence
                 if lease.expires_at is not None and now >= lease.expires_at:
                     try:
-                        self._release_locked(lid, reason="hard_ttl_expired")
+                        self._release_locked(lid, reason="hard_ttl_expired", allow_warm=False)
                         evicted.append(lid)
                     except LeaseNotFoundError:
                         pass
@@ -357,7 +400,7 @@ class BrowserPool:
                     # Heartbeat refreshed after any stale snapshot — skip
                     continue
                 try:
-                    self._release_locked(lid, reason="idle_evicted")
+                    self._release_locked(lid, reason="idle_evicted", allow_warm=False)
                     evicted.append(lid)
                 except LeaseNotFoundError:
                     pass

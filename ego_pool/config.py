@@ -28,20 +28,25 @@ class PoolConfig:
 
     @staticmethod
     def normalize_space_id(space_id: str) -> str:
-        """Normalize and validate space_id; raise ValueError if unsafe."""
+        """Validate space_id; raise ValueError if unsafe. Distinct ids stay distinct.
+
+        Rejects path separators, '..', NULs, and empty/dot names — never rewrites
+        characters into '_' (that would collapse distinct ids).
+        """
         if not isinstance(space_id, str):
             raise ValueError("space_id must be a string")
         raw = space_id.strip()
         if not raw:
             raise ValueError("space_id must be non-empty")
-        # Reject "." / ".." before normalize (normalize would turn ".." into "_")
-        if raw in (".", "..") or "\0" in raw:
+        if "\0" in raw:
             raise ValueError(f"unsafe space_id: {space_id!r}")
-        # Normalize path separators and ".." segments
-        safe = raw.replace("\\", "_").replace("/", "_").replace("..", "_")
-        if safe in (".", "..", "") or Path(safe).name != safe:
+        if "/" in raw or "\\" in raw:
             raise ValueError(f"unsafe space_id: {space_id!r}")
-        return safe
+        if raw in (".", "..") or ".." in raw:
+            raise ValueError(f"unsafe space_id: {space_id!r}")
+        if Path(raw).name != raw:
+            raise ValueError(f"unsafe space_id: {space_id!r}")
+        return raw
 
     def space_path(self, space_id: str) -> Path:
         """Return the Chromium user-data-dir for a Space: {spaces_root}/{space_id}/."""

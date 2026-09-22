@@ -88,7 +88,6 @@ def make_handler(pool: BrowserPool):
             if path == "/v1/leases":
                 agent_id = body.get("agent_id")
                 space_id = body.get("space_id")
-                mode = body.get("mode", "isolated")
                 if not agent_id or not space_id:
                     _json_response(self, 400, {"error": "agent_id and space_id required"})
                     return
@@ -102,7 +101,7 @@ def make_handler(pool: BrowserPool):
                     )
                     return
                 try:
-                    result = pool.lease(agent_id, space_id, mode=mode, ttl_seconds=ttl)
+                    result = pool.lease(agent_id, space_id, ttl_seconds=ttl)
                     _json_response(self, 200, result)
                 except PoolFullError as e:
                     _json_response(self, 503, {"error": "pool_full", "detail": str(e)})
@@ -110,7 +109,10 @@ def make_handler(pool: BrowserPool):
                     _json_response(self, 409, {"error": "space_in_use", "detail": str(e)})
                 except ValueError as e:
                     _json_response(self, 400, {"error": "bad_request", "detail": str(e)})
-                except RuntimeError as e:
+                except (RuntimeError, OSError) as e:
+                    _json_response(self, 503, {"error": "launch_failed", "detail": str(e)})
+                except Exception as e:
+                    # Other launch / unexpected failures → same 503 (not bare 500)
                     _json_response(self, 503, {"error": "launch_failed", "detail": str(e)})
                 return
 

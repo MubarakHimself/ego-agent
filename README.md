@@ -58,14 +58,14 @@ Example:
 ```bash
 curl -s -X POST http://127.0.0.1:8755/v1/leases \
   -H 'Content-Type: application/json' \
-  -d '{"agent_id":"a1","space_id":"task-1","mode":"isolated"}'
+  -d '{"agent_id":"a1","space_id":"task-1"}'
 
 # Heartbeat + release (DELETE only — no POST /release alias)
 curl -s -X POST http://127.0.0.1:8755/v1/leases/<lease_id>/heartbeat
 curl -s -X DELETE http://127.0.0.1:8755/v1/leases/<lease_id>
 ```
 
-Spaces are exclusive while leased (second agent gets HTTP 409). Warm slots with a matching `space_id` are reused without relaunch.
+Spaces are exclusive while leased (second agent gets HTTP 409). Warm slots (from explicit DELETE only) with a matching live `space_id` are reused without relaunch. Idle / hard-TTL always stop Chromium.
 
 ## Tests
 
