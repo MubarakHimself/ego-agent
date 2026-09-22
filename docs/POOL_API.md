@@ -278,6 +278,25 @@ slipstream deny c_…
 slipstream act --lease-id "$L" --category eval --summary "…" --confirm-interactive
 ```
 
+### Act → multi-step fallback (Stagehand-style)
+
+Thin peers-deep / Stagehand pattern: try one-shot `act`; on failure run a
+bounded multi-step plan (or return `need_fallback`). Soft `click` is free;
+gated `navigate` still needs ladder confirm / `consume_once`. No Stagehand
+code; no Browserbase paid APIs.
+
+```http
+POST /v1/leases/{lease_id}/act
+{"kind":"click","selector":"#sign-in","soft_retry":true,
+ "fallback_plan":[{"kind":"click","selector":"#menu"},{"kind":"click","selector":"#sign-in"}]}
+→ 200 {"status":"ok|need_fallback|failed","reason":"…","attempts":N,"steps_run":[…]}
+→ 403 {"status":"confirmation_required","category":"nav_irreversible",…}
+```
+
+Env: `SLIPSTREAM_ACT_SOFT_RETRY` (default 1), `SLIPSTREAM_ACT_FALLBACK_MAX_STEPS` (default 5; client `max_steps` may only lower this).
+`steps_run` / feed summaries use `safe_url_summary` for navigate (no query/fragment). Live click uses real CDP (selector miss → fail → soft_retry/fallback); mock failures via `_mock_act_fail_remaining`.
+CLI: `slipstream try-act --lease-id … --body '{"kind":"click","selector":"#x"}'`.
+
 ### Domain allowlist (top-frame navigate)
 
 Pattern-steal Browserbase `allowedDomains` / agent-browser domain allowlist.

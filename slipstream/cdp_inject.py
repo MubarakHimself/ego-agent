@@ -17,6 +17,18 @@ from typing import Any, Protocol
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_CDP_RUNTIME_EVAL = "Runtime.evaluate"
+
+
+def _click_exc_message(details: Any) -> str:
+    """Best-effort CDP exceptionDetails → short error text."""
+    if not isinstance(details, dict):
+        return "selector_miss"
+    exc = details.get("exception") if isinstance(details.get("exception"), dict) else {}
+    text = str(exc.get("description") or exc.get("value") or details.get("text") or "")
+    return f"click failed: {text or 'selector_miss'}"
+
 
 class CdpInjectError(RuntimeError):
     """CDP inject failed (target missing, selector miss, protocol error)."""
@@ -36,6 +48,9 @@ class CdpInjector(Protocol):
     def evaluate(self, cdp_http_url: str, expression: str) -> Any:
         """Runtime.evaluate ``expression``; return JSON-safe result value."""
 
+    def click_selector(self, cdp_http_url: str, selector: str) -> None:
+        """Click CSS ``selector`` via CDP; raise CdpInjectError on miss/fail."""
+
 
 @dataclass
 class MockCdpInjector:
@@ -50,7 +65,7 @@ class MockCdpInjector:
             self.calls.append(
                 {
                     "cdp_http_url": cdp_http_url,
-                    "method": "Runtime.evaluate",
+                    "method": _CDP_RUNTIME_EVAL,
                     "expression_len": len("location.href"),
                     "purpose": "page_url",
                 }
@@ -82,11 +97,21 @@ class MockCdpInjector:
             self.calls.append(
                 {
                     "cdp_http_url": cdp_http_url,
-                    "method": "Runtime.evaluate",
+                    "method": _CDP_RUNTIME_EVAL,
                     "expression_len": len(expression),
                 }
             )
         return {"type": "string", "value": "ok"}
+
+    def click_selector(self, cdp_http_url: str, selector: str) -> None:
+        with self._lock:
+            self.calls.append(
+                {
+                    "cdp_http_url": cdp_http_url,
+                    "method": "click_selector",
+                    "selector": selector,
+                }
+            )
 
 
 def _assert_ws_debugger_url(ws_url: str) -> str:
@@ -98,7 +123,7 @@ def _assert_ws_debugger_url(ws_url: str) -> str:
             f"refusing non-ws(s) webSocketDebuggerUrl scheme {scheme!r}"
         )
     host = (parsed.hostname or "").strip().lower().strip("[]")
-    if host not in ("127.0.0.1", "localhost", "::1"):
+    if host not in _LOOPBACK_HOSTS:
         # Also accept other loopback IPs
         try:
             import ipaddress
@@ -173,12 +198,12 @@ class RealCdpInjector:
 
     def page_url(self, cdp_http_url: str) -> str:
         host = urlparse(cdp_http_url).hostname
-        if host not in ("127.0.0.1", "localhost", "::1"):
+        if host not in _LOOPBACK_HOSTS:
             raise CdpInjectError(f"refusing non-loopback CDP URL host {host!r}")
         ws_url = _page_ws_url(cdp_http_url)
         result = _ws_cdp_call(
             ws_url,
-            "Runtime.evaluate",
+            _CDP_RUNTIME_EVAL,
             {
                 "expression": "location.href",
                 "returnByValue": True,
@@ -197,7 +222,7 @@ class RealCdpInjector:
     ) -> list[str]:
         # Validate loopback-ish CDP URL (pool-owned)
         host = urlparse(cdp_http_url).hostname
-        if host not in ("127.0.0.1", "localhost", "::1"):
+        if host not in _LOOPBACK_HOSTS:
             raise CdpInjectError(f"refusing non-loopback CDP URL host {host!r}")
 
         ws_url = _page_ws_url(cdp_http_url)
@@ -212,7 +237,7 @@ class RealCdpInjector:
             )
             _ws_cdp_call(
                 ws_url,
-                "Runtime.evaluate",
+                _CDP_RUNTIME_EVAL,
                 {
                     "expression": focus_expr,
                     "awaitPromise": False,
@@ -225,12 +250,12 @@ class RealCdpInjector:
 
     def evaluate(self, cdp_http_url: str, expression: str) -> Any:
         host = urlparse(cdp_http_url).hostname
-        if host not in ("127.0.0.1", "localhost", "::1"):
+        if host not in _LOOPBACK_HOSTS:
             raise CdpInjectError(f"refusing non-loopback CDP URL host {host!r}")
         ws_url = _page_ws_url(cdp_http_url)
         result = _ws_cdp_call(
             ws_url,
-            "Runtime.evaluate",
+            _CDP_RUNTIME_EVAL,
             {
                 "expression": expression,
                 "awaitPromise": False,
@@ -240,6 +265,25 @@ class RealCdpInjector:
         if isinstance(result, dict) and "result" in result:
             return result["result"]
         return result
+
+    def click_selector(self, cdp_http_url: str, selector: str) -> None:
+        """querySelector + Element.click; fail closed on selector_miss."""
+        host = urlparse(cdp_http_url).hostname
+        if host not in _LOOPBACK_HOSTS:
+            raise CdpInjectError(f"refusing non-loopback CDP URL host {host!r}")
+        sel_json = json.dumps(selector)
+        expr = (
+            f"(function(){{ var el=document.querySelector({sel_json}); "
+            f"if(!el) throw new Error('selector_miss'); "
+            f"el.click(); return true; }})()"
+        )
+        result = _ws_cdp_call(
+            _page_ws_url(cdp_http_url),
+            _CDP_RUNTIME_EVAL,
+            {"expression": expr, "awaitPromise": False, "returnByValue": True},
+        )
+        if isinstance(result, dict) and result.get("exceptionDetails"):
+            raise CdpInjectError(_click_exc_message(result["exceptionDetails"]))
 
 
 def default_injector(*, mock: bool) -> CdpInjector:

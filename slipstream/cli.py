@@ -508,6 +508,35 @@ def cmd_act(
     return 0
 
 
+def cmd_try_act(
+    *,
+    lease_id: str,
+    body_json: str,
+    url: str | None = None,
+) -> int:
+    """POST /v1/leases/{id}/act — body is JSON (kind/fallback_plan/soft_retry)."""
+    import json
+
+    base = resolve_base_url(url)
+    body = json.loads(body_json)
+    if not isinstance(body, dict):
+        raise CliError("--body must be a JSON object", exit_code=2)
+    status, payload = _request(
+        "POST", f"{base}{_PATH_LEASES}{lease_id}/act", body
+    )
+    if status == 403:
+        detail = payload.get("detail") if isinstance(payload, dict) else payload
+        st = payload.get("status") if isinstance(payload, dict) else None
+        err = payload.get("error") if isinstance(payload, dict) else None
+        if err == "confirmation_required" or st == "confirmation_required":
+            raise CliError(f"confirmation_required: {detail}", exit_code=3)
+        raise CliError(f"forbidden: {detail}", exit_code=3)
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0
+
+
 def cmd_confirm(*, confirm_id: str, url: str | None = None) -> int:
     """POST /v1/confirmations/{confirm_id} {action: confirm}."""
     base = resolve_base_url(url)
