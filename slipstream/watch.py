@@ -13,6 +13,8 @@ treat watch_url like a screen-share secret (v1: credential-in-URL).
 
 from __future__ import annotations
 
+_PATH_LEASES = "/v1/leases/"
+
 import base64
 import html
 import secrets
@@ -112,7 +114,7 @@ def build_watch_url(
     if mode:
         q["mode"] = mode
     return (
-        f"{base_url.rstrip('/')}/v1/leases/{quote(lease_id, safe='')}/watch"
+        f"{base_url.rstrip('/')}{_PATH_LEASES}{quote(lease_id, safe='')}/watch"
         f"?{urlencode(q)}"
     )
 
@@ -429,28 +431,28 @@ def json_quote(s: str) -> str:
 def frame_path(lease_id: str, token: str, *, base_path: str = "") -> str:
     """Relative frame URL path with token (for HTML img src)."""
     q = urlencode({"token": token})
-    return f"{base_path}/v1/leases/{quote(lease_id, safe='')}/watch/frame?{q}"
+    return f"{base_path}{_PATH_LEASES}{quote(lease_id, safe='')}/watch/frame?{q}"
 
 
 def confirm_path(lease_id: str, token: str, *, base_path: str = "") -> str:
     q = urlencode({"token": token})
-    return f"{base_path}/v1/leases/{quote(lease_id, safe='')}/watch/confirm?{q}"
+    return f"{base_path}{_PATH_LEASES}{quote(lease_id, safe='')}/watch/confirm?{q}"
 
 
 def input_path(lease_id: str, token: str, *, base_path: str = "") -> str:
     q = urlencode({"token": token})
-    return f"{base_path}/v1/leases/{quote(lease_id, safe='')}/watch/input?{q}"
+    return f"{base_path}{_PATH_LEASES}{quote(lease_id, safe='')}/watch/input?{q}"
 
 
 def cede_path(lease_id: str, token: str, *, base_path: str = "") -> str:
     q = urlencode({"token": token})
-    return f"{base_path}/v1/leases/{quote(lease_id, safe='')}/watch/cede?{q}"
+    return f"{base_path}{_PATH_LEASES}{quote(lease_id, safe='')}/watch/cede?{q}"
 
 
 def events_path(lease_id: str, token: str, *, base_path: str = "") -> str:
     """Tokenized activity-feed JSON path (same TTL/revoke as Watch)."""
     q = urlencode({"token": token})
-    return f"{base_path}/v1/leases/{quote(lease_id, safe='')}/watch/events?{q}"
+    return f"{base_path}{_PATH_LEASES}{quote(lease_id, safe='')}/watch/events?{q}"
 
 
 # --- pair-browse CDP input bridge -----------------------------------------

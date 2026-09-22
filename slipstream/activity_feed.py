@@ -102,25 +102,34 @@ def safe_url_summary(url: str | None) -> str:
 
 
 def scrub_feed_detail(raw: dict[str, Any] | None) -> dict[str, Any]:
-    """Drop secret-like keys; never keep typed text / vault / CDP auth."""
+    """Drop secret-like keys; never keep typed text / vault / CDP auth.
+
+    ADV-FEED-003: align key denylist with alerts.key_looks_secret and scrub
+    list-of-string values (not only bare strings).
+    """
     if not raw:
         return {}
+    from slipstream.alerts import key_looks_secret, scrub_text
+
     out: dict[str, Any] = {}
     for k, v in raw.items():
         if not isinstance(k, str):
             continue
         kl = k.strip().lower().replace("-", "_")
-        if kl in _SECRET_KEYS or _SECRET_KEY_RE.search(kl):
+        # Feed-specific drops (typed plaintext) + shared alerts denylist.
+        if (
+            kl in _SECRET_KEYS
+            or _SECRET_KEY_RE.search(kl)
+            or key_looks_secret(k)
+        ):
             continue
         if isinstance(v, str):
-            from slipstream.alerts import scrub_text
-
             out[k] = scrub_text(v)[:200]
         elif isinstance(v, (int, float, bool)):
             out[k] = v
         elif isinstance(v, list) and all(isinstance(x, str) for x in v):
-            # fill labels only
-            out[k] = [str(x)[:64] for x in v[:20]]
+            # fill labels / string lists — scrub each value (ADV-FEED-003)
+            out[k] = [scrub_text(str(x))[:64] for x in v[:20]]
         elif v is None:
             continue
         else:

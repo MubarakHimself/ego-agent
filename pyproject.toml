@@ -66,9 +66,9 @@ max_high = 0
 max_security = 0
 max_reliability = 0
 # Quality backlog waiver: SKY-L027/Q301/C304/etc. across vault/doctor/api/pool.
-# Raised 250→280 for session-metadata thin module (+list endpoints); not a security pass.
-# Revisit when dedicating a quality-debt ship.
-max_quality = 280
+# Lowered 280→250 after slipstream-quality-debt-001 real dedupe/helpers (gate ~242).
+# Prefer further real fixes over raising this again; security caps stay 0.
+max_quality = 250
 max_secrets = 0
 max_dependency_vulnerabilities = 0
 max_ai_defects = 5

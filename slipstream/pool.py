@@ -17,6 +17,31 @@ from slipstream.alerts import (
     parse_alert_request,
 )
 from slipstream.activity_feed import LeaseActivityFeed, safe_url_summary
+
+# ADV-FEED-001: key names safe to echo in feed summary (non-printable secret path).
+_FEED_SAFE_KEY_NAMES = frozenset(
+    {
+        "Enter",
+        "Tab",
+        "Escape",
+        "Backspace",
+        "Delete",
+        "ArrowUp",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+    }
+)
+
+_ERR_LEASE_INACTIVE = "lease no longer active"
+_STATE_AWAITING_HUMAN = "awaiting_human"
+_STATE_LEASED = "leased"
+_ACTION_CONFIRM = "confirm"
+_ACTION_PAUSE = "pause"
 from slipstream.watch import (
     WatchAuthError,
     WatchCaptureError,
@@ -806,7 +831,7 @@ class BrowserPool:
                 takeover = f"{base.rstrip('/')}/v1/leases/{lease_id}/watch?mode=takeover"
 
             if event == EVENT_NEED_HUMAN:
-                lease.status = "awaiting_human"
+                lease.status = _STATE_AWAITING_HUMAN
                 # Refresh heartbeat so soft-idle clock does not immediately fire
                 # while the human is being fetched (still honor hard TTL).
                 slot.last_heartbeat = time.time()
@@ -938,7 +963,7 @@ class BrowserPool:
             takeover = default_takeover_url(
                 lease_id, token=watch_token, base_url=base
             )
-            lease.status = "awaiting_human"
+            lease.status = _STATE_AWAITING_HUMAN
             slot.last_heartbeat = now
             envelope = build_harness_envelope(
                 payload,
@@ -998,7 +1023,7 @@ class BrowserPool:
             if not lease:
                 raise LeaseNotFoundError(lease_id)
 
-            if action == "confirm":
+            if action == _ACTION_CONFIRM:
                 pending.status = STATUS_CONFIRMED
                 decision = "allow"
             else:
@@ -1054,13 +1079,13 @@ class BrowserPool:
         if self._confirmations.lease_pending(lease_id):
             return
         lease = self._leases.get(lease_id)
-        if lease is not None and lease.status == "awaiting_human":
+        if lease is not None and lease.status == _STATE_AWAITING_HUMAN:
             # Only clear if the pause was confirmation-driven (watch reason),
             # or no other need_human reasons — for thin MVP: always clear when
             # no pending confirmations remain AND watch reason is confirmation.
             sess = self._lookup_watch(lease_id)
             if sess is not None and sess.reason == "confirmation_required":
-                lease.status = "leased"
+                lease.status = _STATE_LEASED
                 # Do not revoke watch here — TTL sweep / task_done handles it.
                 # Pair-browse input stays disabled (never was enabled).
 
@@ -1108,7 +1133,7 @@ class BrowserPool:
 
                 # Soft-idle: skip while awaiting human (lease/Chromium kept).
                 # Hard TTL above still applies.
-                if lease.status == "awaiting_human":
+                if lease.status == _STATE_AWAITING_HUMAN:
                     continue
 
                 # Idle soft-evict: re-check heartbeat freshness under lock
@@ -1151,8 +1176,8 @@ class BrowserPool:
         if revoke:
             sess.revoked = True
         lease = self._leases.get(sess.lease_id)
-        if lease is not None and lease.status == "awaiting_human":
-            lease.status = "leased"
+        if lease is not None and lease.status == _STATE_AWAITING_HUMAN:
+            lease.status = _STATE_LEASED
 
     def _get_watch_session_locked(
         self, lease_id: str, token: str | None
@@ -1217,7 +1242,7 @@ class BrowserPool:
                 sess = self._lookup_watch(lease_id)
                 if sess is not None:
                     self._invalidate_pair_browse_locked(sess, revoke=True)
-                raise WatchGoneError("lease no longer active")
+                raise WatchGoneError(_ERR_LEASE_INACTIVE)
             feed = self._activity_feeds.get(lease_id)
             events = (
                 feed.list_events(after_seq=after_seq, limit=limit) if feed else []
@@ -1234,7 +1259,7 @@ class BrowserPool:
             if lease_id not in self._leases:
                 # Session exists but lease gone without revoke race — treat gone
                 self._invalidate_pair_browse_locked(sess, revoke=True)
-                raise WatchGoneError("lease no longer active")
+                raise WatchGoneError(_ERR_LEASE_INACTIVE)
             expires_in = max(0, int(sess.expires_at - time.time()))
             reason = sess.reason
             detail = sess.detail
@@ -1282,7 +1307,7 @@ class BrowserPool:
             raise WatchGoneError("watch_url expired during capture")
         lease = self._leases.get(lease_id)
         if not lease:
-            raise WatchGoneError("lease no longer active")
+            raise WatchGoneError(_ERR_LEASE_INACTIVE)
         if lease.slot_id != slot_id:
             raise WatchGoneError("lease/slot identity changed during capture")
         if (lease.cdp_http_url or "") != (cdp_http_url or ""):
@@ -1303,7 +1328,7 @@ class BrowserPool:
             self._get_watch_session_locked(lease_id, token)
             lease = self._leases.get(lease_id)
             if not lease:
-                raise WatchGoneError("lease no longer active")
+                raise WatchGoneError(_ERR_LEASE_INACTIVE)
             cdp = lease.cdp_http_url or ""
             slot_id = lease.slot_id
             mock = self.config.mock
@@ -1333,8 +1358,8 @@ class BrowserPool:
             lease = self._leases.get(lease_id)
             if not lease:
                 self._invalidate_pair_browse_locked(sess, revoke=True)
-                raise WatchGoneError("lease no longer active")
-            lease.status = "awaiting_human"
+                raise WatchGoneError(_ERR_LEASE_INACTIVE)
+            lease.status = _STATE_AWAITING_HUMAN
             slot = self._find_slot_by_lease(lease_id)
             if slot is not None:
                 slot.last_heartbeat = time.time()
@@ -1349,7 +1374,7 @@ class BrowserPool:
             return {
                 "ok": True,
                 "lease_id": lease_id,
-                "status": "awaiting_human",
+                "status": _STATE_AWAITING_HUMAN,
                 "agent_paused": True,
                 "lease_kept": True,
                 "takeover_confirmed": True,
@@ -1379,8 +1404,8 @@ class BrowserPool:
             lease = self._leases.get(lease_id)
             if not lease:
                 self._invalidate_pair_browse_locked(sess, revoke=True)
-                raise WatchGoneError("lease no longer active")
-            if lease.status != "awaiting_human":
+                raise WatchGoneError(_ERR_LEASE_INACTIVE)
+            if lease.status != _STATE_AWAITING_HUMAN:
                 raise WatchForbiddenError("agent not paused for pair-browse")
             cdp = lease.cdp_http_url or ""
             slot_id = lease.slot_id
@@ -1432,11 +1457,16 @@ class BrowserPool:
                 detail={"text_len": len(event.get("text") or "")},
             )
         elif kind == "key":
+            # ADV-FEED-001: never echo key names (printable chars reconstruct secrets).
+            # Allowlist navigation/edit keys only; otherwise key_len in detail.
+            raw_key = event.get("key") or ""
+            safe = raw_key in _FEED_SAFE_KEY_NAMES
             self._record_activity(
                 lease_id,
                 "type",
-                f"key {event.get('key') or ''}",
+                f"key {raw_key}" if safe else "key",
                 outcome="ok",
+                detail={"key_len": len(raw_key)},
             )
         elif kind == "scroll":
             self._record_activity(
@@ -1461,7 +1491,7 @@ class BrowserPool:
             lease = self._leases.get(lease_id)
             if not lease:
                 self._invalidate_pair_browse_locked(sess, revoke=True)
-                raise WatchGoneError("lease no longer active")
+                raise WatchGoneError(_ERR_LEASE_INACTIVE)
             if not sess.takeover_confirmed and not sess.input_enabled:
                 raise WatchInputError("nothing to cede")
             self._invalidate_pair_browse_locked(sess, revoke=False)
