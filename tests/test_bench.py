@@ -39,7 +39,6 @@ def test_bench_mock_timings(tmp_path):
 
 
 @pytest.mark.bench
-@pytest.mark.live
 def test_bench_live_timings(tmp_path):
     if os.environ.get("EGO_POOL_MOCK") == "1":
         pytest.skip("EGO_POOL_MOCK=1 set")

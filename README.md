@@ -83,13 +83,15 @@ source .venv/bin/activate
 # Unit tests (mocked launcher — no browsers needed)
 EGO_POOL_MOCK=1 pytest -q -m "not live and not bench"
 
-# Optional live smoke (requires Chrome on PATH or EGO_POOL_CHROME)
+# Optional live smoke only (requires Chrome on PATH or EGO_POOL_CHROME)
 # lease → CDP ready → navigate example.com → title check → heartbeat → release → warm reuse
 pytest -q -m live
 
-# Optional bench via pytest (MOCK always; LIVE needs Chrome)
-EGO_POOL_MOCK=1 pytest -q -m "bench and not live"
-pytest -q -m "bench and live"
+# Optional bench via pytest (-m bench only; LIVE needs Chrome, skips if EGO_POOL_MOCK=1)
+EGO_POOL_MOCK=1 pytest -q -m bench          # MOCK timings
+pytest -q -m bench                          # LIVE timings (uses scripts/bench_pool.py)
+# Or run the harness directly:
+#   python scripts/bench_pool.py --mode LIVE|MOCK|BOTH
 ```
 
 ## Benchmark harness

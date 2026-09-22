@@ -1,6 +1,6 @@
 {
   "benchmark": "ego-runtime-livebench-001",
-  "generated_at": "2026-09-22T13:33:41.204731+00:00",
+  "generated_at": "2026-09-22T13:38:03.606096+00:00",
   "host": {
     "chrome_binary": "/usr/bin/google-chrome-stable",
     "python": "3.13.5"
@@ -9,12 +9,12 @@
     {
       "mode": "MOCK",
       "timings_ms": {
-        "cold_lease_ms": 0.12,
+        "cold_lease_ms": 0.144,
         "cdp_ready_ms": null,
         "navigate_ms": null,
-        "heartbeat_ms": 0.006,
-        "release_ms": 0.008,
-        "warm_reuse_lease_ms": 0.026
+        "heartbeat_ms": 0.005,
+        "release_ms": 0.01,
+        "warm_reuse_lease_ms": 0.034
       },
       "meta": {
         "mode": "MOCK",
@@ -26,20 +26,32 @@
         "cdp_base_port": 19622,
         "navigate_snapshot": null,
         "errors": [],
+        "timing_scope": {
+          "cold_lease_ms": "in-process BrowserPool",
+          "warm_reuse_lease_ms": "in-process BrowserPool",
+          "heartbeat_ms": "in-process BrowserPool",
+          "release_ms": "in-process BrowserPool",
+          "cdp_ready_ms": "DevTools HTTP /json/version",
+          "navigate_ms": "DevTools HTTP PUT /json/new"
+        },
+        "chromium_pid_lease1": 29622,
         "warm_after_release": 1,
-        "warm_reuse_same_cdp": true
+        "warm_reuse_same_cdp": true,
+        "chromium_pid_lease2": 29622,
+        "warm_reuse_same_pid": true,
+        "warm_reuse_much_faster": true
       },
       "ok": true
     },
     {
       "mode": "LIVE",
       "timings_ms": {
-        "cold_lease_ms": 303.522,
-        "cdp_ready_ms": 59.346,
-        "navigate_ms": 411.782,
-        "heartbeat_ms": 0.015,
-        "release_ms": 0.01,
-        "warm_reuse_lease_ms": 0.097
+        "cold_lease_ms": 303.149,
+        "cdp_ready_ms": 49.242,
+        "navigate_ms": 194.594,
+        "heartbeat_ms": 0.02,
+        "release_ms": 0.014,
+        "warm_reuse_lease_ms": 0.106
       },
       "meta": {
         "mode": "LIVE",
@@ -53,12 +65,24 @@
           "title": "Example Domain",
           "url": "https://example.com/",
           "matched": true,
-          "id": "BCFBAF9F1E5F966F86C367AE3F00DEED"
+          "id": "C5B866C823EFF08BEDB64EBF98FB7B5A"
         },
         "errors": [],
+        "timing_scope": {
+          "cold_lease_ms": "in-process BrowserPool",
+          "warm_reuse_lease_ms": "in-process BrowserPool",
+          "heartbeat_ms": "in-process BrowserPool",
+          "release_ms": "in-process BrowserPool",
+          "cdp_ready_ms": "DevTools HTTP /json/version",
+          "navigate_ms": "DevTools HTTP PUT /json/new"
+        },
+        "chromium_pid_lease1": 596185,
         "browser": "Chrome/151.0.7922.169",
         "warm_after_release": 1,
-        "warm_reuse_same_cdp": true
+        "warm_reuse_same_cdp": true,
+        "chromium_pid_lease2": 596185,
+        "warm_reuse_same_pid": true,
+        "warm_reuse_much_faster": true
       },
       "ok": true
     }

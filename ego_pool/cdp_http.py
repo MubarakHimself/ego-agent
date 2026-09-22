@@ -10,7 +10,23 @@ import json
 import time
 import urllib.request
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
+
+
+def _url_settled(page_url: str, observed_url: str) -> bool:
+    """True when observed URL matches page_url by scheme+netloc and path prefix."""
+    want = urlparse(page_url)
+    got = urlparse(observed_url or "")
+    if not want.scheme or not want.netloc:
+        return False
+    if got.scheme != want.scheme or got.netloc != want.netloc:
+        return False
+    want_path = want.path or "/"
+    got_path = got.path or "/"
+    if got_path == want_path:
+        return True
+    prefix = want_path if want_path.endswith("/") else want_path + "/"
+    return got_path.startswith(prefix)
 
 
 def wait_cdp_ready(cdp_http_url: str, *, timeout: float = 15.0) -> dict[str, Any]:
@@ -77,12 +93,11 @@ def navigate_via_json_new(
                 expect_title_substr is not None
                 and expect_title_substr.lower() in title.lower()
             )
-            # When no title expectation: require URL containment (do not
-            # settle on any non-empty title alone — about:blank etc.).
-            needle = page_url.rstrip("/")
-            url_ok = needle in (url or "") or page_url in (url or "")
+            # Settle by scheme+netloc equality and path prefix (not raw substring).
+            url_ok = _url_settled(page_url, url)
             if expect_title_substr is not None:
-                if title_ok:
+                # Title expectation requires both title and URL to match.
+                if title_ok and url_ok:
                     out = dict(t)
                     out["matched"] = True
                     return out

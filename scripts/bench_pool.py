@@ -5,9 +5,9 @@ Measures wall times for:
   - cold lease (first launch)
   - CDP ready (LIVE only — until /json/version)
   - navigate (LIVE only — PUT /json/new + title check)
-  - heartbeat RTT
-  - release (explicit DELETE → FREE_WARM when W>=1)
-  - warm reuse lease (same space_id after client release)
+  - heartbeat (in-process BrowserPool; not HTTP API RTT)
+  - release (in-process BrowserPool; explicit → FREE_WARM when W>=1)
+  - warm reuse lease (same space_id after client release; in-process)
 
 Usage:
   # Mock only (no Chrome)
@@ -34,6 +34,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 # Allow running from repo root without install
 _ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +50,21 @@ from ego_pool.pool import BrowserPool
 def _ms(t0: float, t1: float | None = None) -> float:
     end = time.perf_counter() if t1 is None else t1
     return round((end - t0) * 1000.0, 3)
+
+
+def _slot_pid(pool: BrowserPool, lease_id: str) -> int | None:
+    for s in pool.status().get("slots") or []:
+        if s.get("lease_id") == lease_id:
+            return s.get("chromium_pid")
+    return None
+
+
+def _default_example_title(navigate_url: str) -> str | None:
+    """Enable Example Domain title only for default example.com navigate URL."""
+    parsed = urlparse(navigate_url)
+    if navigate_url == "https://example.com" or parsed.netloc == "example.com":
+        return "Example Domain"
+    return None
 
 
 def _run_once(*, mock: bool, chrome_binary: str | None, navigate_url: str) -> dict[str, Any]:
@@ -86,6 +102,16 @@ def _run_once(*, mock: bool, chrome_binary: str | None, navigate_url: str) -> di
         "cdp_base_port": cdp_base,
         "navigate_snapshot": None,
         "errors": [],
+        # lease/heartbeat/release timings are in-process BrowserPool calls
+        # (not HTTP API RTT). CDP ready / navigate use DevTools HTTP.
+        "timing_scope": {
+            "cold_lease_ms": "in-process BrowserPool",
+            "warm_reuse_lease_ms": "in-process BrowserPool",
+            "heartbeat_ms": "in-process BrowserPool",
+            "release_ms": "in-process BrowserPool",
+            "cdp_ready_ms": "DevTools HTTP /json/version",
+            "navigate_ms": "DevTools HTTP PUT /json/new",
+        },
     }
     try:
         # --- cold lease ---
@@ -93,6 +119,8 @@ def _run_once(*, mock: bool, chrome_binary: str | None, navigate_url: str) -> di
         lease = pool.lease("bench-agent", "bench-space")
         timings["cold_lease_ms"] = _ms(t0)
         assert lease["status"] == "leased", lease
+        pid1 = _slot_pid(pool, lease["lease_id"])
+        meta["chromium_pid_lease1"] = pid1
 
         if not mock:
             t0 = time.perf_counter()
@@ -104,9 +132,7 @@ def _run_once(*, mock: bool, chrome_binary: str | None, navigate_url: str) -> di
             snap = navigate_via_json_new(
                 lease["cdp_http_url"],
                 navigate_url,
-                expect_title_substr="Example Domain"
-                if "example.com" in navigate_url
-                else None,
+                expect_title_substr=_default_example_title(navigate_url),
                 settle_timeout=15.0,
             )
             timings["navigate_ms"] = _ms(t0)
@@ -142,6 +168,10 @@ def _run_once(*, mock: bool, chrome_binary: str | None, navigate_url: str) -> di
         assert lease2["status"] == "leased", lease2
         same_cdp = lease2.get("cdp_http_url") == lease.get("cdp_http_url")
         meta["warm_reuse_same_cdp"] = same_cdp
+        pid2 = _slot_pid(pool, lease2["lease_id"])
+        meta["chromium_pid_lease2"] = pid2
+        same_pid = pid1 is not None and pid2 == pid1
+        meta["warm_reuse_same_pid"] = same_pid
         if warm < 1:
             meta["errors"].append(
                 f"warm_after_release={warm} (expected >= 1); cold-start is not warm reuse"
@@ -150,6 +180,24 @@ def _run_once(*, mock: bool, chrome_binary: str | None, navigate_url: str) -> di
             meta["errors"].append(
                 "warm_reuse_same_cdp is False "
                 f"(first={lease.get('cdp_http_url')!r} second={lease2.get('cdp_http_url')!r})"
+            )
+        if not same_pid:
+            meta["errors"].append(
+                "warm_reuse_same_pid is False "
+                f"(pid1={pid1!r} pid2={pid2!r}); chromium relaunched — not warm reuse"
+            )
+        # Secondary signal: warm reuse should be << cold lease (warn only)
+        cold_ms = timings.get("cold_lease_ms")
+        warm_ms = timings.get("warm_reuse_lease_ms")
+        meta["warm_reuse_much_faster"] = (
+            isinstance(cold_ms, (int, float))
+            and isinstance(warm_ms, (int, float))
+            and cold_ms > 0
+            and warm_ms < cold_ms * 0.5
+        )
+        if meta["warm_reuse_much_faster"] is False and isinstance(cold_ms, (int, float)) and cold_ms > 0:
+            meta.setdefault("warnings", []).append(
+                f"warm_reuse_lease_ms ({warm_ms}) not << cold_lease_ms ({cold_ms})"
             )
         # Confirm still reachable in LIVE
         if not mock:
