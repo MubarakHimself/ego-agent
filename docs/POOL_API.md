@@ -16,15 +16,16 @@ MVP is always **isolated** mode (one process tree per Space). There is no `mode`
 |---|---|---|
 | `K` | 5 | Hard max live Chromium process trees |
 | `W` | 1 | Warm idle slots after **explicit client DELETE** only |
-| `idle_ttl_seconds` | 300 | Soft-evict without heartbeat (~5 min); always stops Chromium; **skipped** while lease is `awaiting_human` **or** `keep_alive` |
-| `lease_hard_ttl_seconds` | 1800 | Hard lease ceiling (enforced on heartbeat / idle sweep / re-lease); always stops Chromium (incl. keep_alive) |
+| `idle_ttl_seconds` | 300 | Soft-evict without heartbeat (~5 min); always stops Chromium; **skipped** while lease is `awaiting_human` |
+| `keep_alive_ttl_seconds` | 600 | While `keep_alive`: soft-idle skipped until this many seconds **since last heartbeat** (same clock as soft-idle); default **600 = 2× idle_ttl**; clamped ≤ `lease_hard_ttl_seconds`; then tear down like soft-idle |
+| `lease_hard_ttl_seconds` | 1800 | Hard lease ceiling (enforced on heartbeat / idle sweep / re-lease); always stops Chromium (incl. keep_alive); wins over keep_alive_ttl |
 | `spaces_root` | `./data/spaces` | Space = `{spaces_root}/{space_id}/` = Chromium `--user-data-dir` |
 | `vault_root` | `./data/vault` | Credential vault (**must** be outside `spaces_root`; fail-closed at config/pool init) |
 | `artifacts_root` | `./data/artifacts` | Lease downloads/uploads (**must** be outside `spaces_root` + `vault_root`) |
 | `cdp_base_port` | 9222 | Operator-internal Chromium bind; **not** on public status/lease unless `SLIPSTREAM_EXPOSE_RAW_CDP=1`. Do **not** derive CDP from public JSON or `slot_id` (no `9222+slot_id` recipe) |
 | `host` / `port` | `127.0.0.1` / `8755` | API bind |
 
-Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_ARTIFACTS_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm + unused grant seconds, default 60), `SLIPSTREAM_EXPOSE_RAW_CDP=1` (include cdp_* URLs **and** `cdp_port`/`cdp_base_port`/`chromium_pid` on lease/status JSON; raw CDP nav/eval honor-system — do not derive CDP from default public JSON), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted unless Space/lease lockdown applies), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers), `SLIPSTREAM_KEEPALIVE=1` (default `keep_alive` on new leases when body omits the field; default off).
+Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_ARTIFACTS_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm + unused grant seconds, default 60), `SLIPSTREAM_EXPOSE_RAW_CDP=1` (include cdp_* URLs **and** `cdp_port`/`cdp_base_port`/`chromium_pid` on lease/status JSON; raw CDP nav/eval honor-system — do not derive CDP from default public JSON), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted unless Space/lease lockdown applies), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers), `SLIPSTREAM_KEEPALIVE_TTL` (override `keep_alive_ttl_seconds`; clamped ≤ hard TTL). **No** server env defaults `keep_alive` true on omit — only explicit body/`--keep-alive`.
 
 ## Endpoints
 
@@ -34,10 +35,11 @@ Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT
 {
   "agent_id": "agent-1",
   "space_id": "task-42",
-  "ttl_seconds": 1800,
-  "keep_alive": false
+  "ttl_seconds": 1800
 }
 ```
+
+Omit `keep_alive` on create/reconnect (defaults **false**). Do **not** send `"keep_alive": false` on reconnect unless you intend to clear survival — explicit false on idempotent re-lease clears a prior `keep_alive: true`.
 
 → `200`
 
@@ -70,17 +72,20 @@ Optional `ttl_seconds` may be shorter than `lease_hard_ttl_seconds`; requests ab
 
 Thin Browserbase-style **`keep_alive`** on lease create (pattern-steal only; no Browserbase paid APIs).
 
-| Signal | `keep_alive: false` (default) | `keep_alive: true` |
+| Signal | `keep_alive: false` (default on omit) | `keep_alive: true` |
 | --- | --- | --- |
-| Soft-idle (no heartbeat ≥ `idle_ttl_seconds`) | Release + stop Chromium | **Survive** — lease + Chromium stay |
-| Hard TTL (`expires_at`) | Release + stop | Release + stop |
+| Soft-idle (no heartbeat ≥ `idle_ttl_seconds`) | Release + stop Chromium | Soft-idle **skipped** while age since **last heartbeat** ≤ `keep_alive_ttl_seconds` (default 600 = 2× idle_ttl, clamped ≤ hard TTL) |
+| Past `keep_alive_ttl` since last heartbeat | (n/a — already soft-idle) | Release + stop (same as soft-idle teardown) |
+| Hard TTL (`expires_at`) | Release + stop | Release + stop (always wins) |
 | Explicit `DELETE` / release / `task_done` | Release (warm rules) | Release (warm rules) |
 
-**Why soft-idle ≈ “driver gone”:** the pool does not proxy agent CDP websockets (agents attach directly to Chromium). Missed heartbeats are the pool’s stand-in for agent process death / CDP client drop. `keep_alive` skips soft-idle only; it does **not** extend hard TTL.
+**Clock:** soft-idle and `keep_alive_ttl` both measure **seconds since `last_heartbeat`** (heartbeat refreshes the clock). Hard TTL uses `expires_at` from lease start.
 
-Optional body `keep_alive: true|false` (bool only → else `400 invalid_keep_alive`). Omit → env `SLIPSTREAM_KEEPALIVE` (default false). Lease / list / ops session JSON always include `keep_alive`. CLI: `slipstream lease … --keep-alive`. Idempotent re-lease with explicit `keep_alive` updates the flag; omit preserves it.
+**Why soft-idle ≈ “driver gone”:** the pool does not proxy agent CDP websockets (agents attach directly to Chromium). Missed heartbeats are the pool’s stand-in for agent process death / CDP client drop. `keep_alive` does **not** extend hard TTL.
 
-Reconnect: same `(agent_id, space_id)` while leased returns the same `lease_id` (CDP tip still via `SLIPSTREAM_EXPOSE_RAW_CDP=1` when needed).
+Optional body `keep_alive: true|false` (bool only → else `400 invalid_keep_alive`). **Omit → false** (no server env turns omit into true). Lease / list / ops / pool status expose `keep_alive` and status includes `keep_alive_ttl_seconds`. CLI: `slipstream lease … --keep-alive` or `--no-keep-alive` (mutually exclusive; `--no-keep-alive` sends `keep_alive: false` explicitly). Idempotent re-lease: explicit `keep_alive` updates the flag; **omit preserves** prior; **warn:** explicit `false` clears survival on reconnect.
+
+Reconnect: same `(agent_id, space_id)` while leased returns the same `lease_id` — omit `keep_alive` on reconnect unless flipping the flag (CDP tip still via `SLIPSTREAM_EXPOSE_RAW_CDP=1` when needed).
 
 ### `POST /v1/leases/{lease_id}/heartbeat`
 

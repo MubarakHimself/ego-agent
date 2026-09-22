@@ -94,16 +94,20 @@ Heartbeat every ~15–30s (including during LLM think). Always release when done
 (or on hard failure after you stop retrying).
 
 **keepAlive (optional):** `slipstream lease … --keep-alive` or body
-`keep_alive: true` (env default `SLIPSTREAM_KEEPALIVE=1`). Soft-idle / missed
-heartbeats (pool stand-in for agent death / CDP disconnect) do **not** tear
-down the lease+Chromium; **hard TTL** and explicit `release` / `task_done`
-still do. Without the flag, current soft-idle release applies. Status / lease
-JSON shows `keep_alive`. No Monid / Electron / MCP.
+`keep_alive: true` only (omit → false; no server env defaults it on). Soft-idle
+is skipped while age since last heartbeat ≤ `keep_alive_ttl` (default 600s =
+2× idle_ttl, clamped ≤ hard TTL); past that window the lease tears down like
+soft-idle. **Hard TTL** and explicit `release` / `task_done` always win.
+`--no-keep-alive` sends `keep_alive: false` (clears survival on re-lease).
+Create/reconnect examples omit the field. Status / lease JSON shows
+`keep_alive`. No Monid / Electron / MCP.
 
 ```bash
 # 1) Lease
 slipstream lease --agent-id "$AGENT_ID" --space-id "task-42"
-# Optional: --keep-alive  (survive soft-idle / driver disconnect; hard TTL still)
+# Optional: --keep-alive  (survive until keep_alive_ttl; hard TTL still)
+#           --no-keep-alive (send keep_alive:false; clears survival on re-lease)
+# Omit keep_alive on create/reconnect unless flipping the flag.
 # → JSON: lease_id, slot_id, expires_at, keep_alive, … (no cdp_* / chromium_pid by default;
 #    do not derive CDP from public JSON or slot_id)
 

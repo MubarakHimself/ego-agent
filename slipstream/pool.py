@@ -111,7 +111,7 @@ from slipstream.watch import (
     parse_watch_input,
     render_watch_html,
 )
-from slipstream.config import PoolConfig, keep_alive_default
+from slipstream.config import PoolConfig
 from slipstream.domains import (
     DomainAllowlistError,
     check_navigate_url,
@@ -263,6 +263,7 @@ class BrowserPool:
                 "K": self.config.K,
                 "W": self.config.W,
                 "idle_ttl_seconds": self.config.idle_ttl_seconds,
+                "keep_alive_ttl_seconds": self.config.effective_keep_alive_ttl(),
                 "live": live,
                 "warm": warm,
                 "leased": leased,
@@ -533,10 +534,11 @@ class BrowserPool:
         domains_override = (
             parse_allowed_domains(allowed_domains) if allowed_domains is not None else None
         )
-        # None = env default for *new* leases; explicit bool wins.
+        # None on *new* leases → keep_alive false (ADV-KA-002: no server env default).
+        # Explicit bool only via body JSON or CLI --keep-alive / --no-keep-alive.
         # On idempotent re-lease, omit leaves existing keep_alive unchanged.
         ka_explicit = keep_alive is not None
-        ka = bool(keep_alive) if ka_explicit else keep_alive_default()
+        ka = bool(keep_alive) if ka_explicit else False
 
         # Handles that must be stopped outside the lock (released/replaced trees).
         pending_stops: list[LaunchHandle] = []
@@ -1543,9 +1545,11 @@ class BrowserPool:
         """Soft-evict idle leases and hard-TTL-expired leases.
 
         Soft-idle eviction is skipped while ``lease.status == 'awaiting_human'``
-        (need_human pause keeps Chromium) **or** ``lease.keep_alive``
-        (Browserbase-style keepAlive — survive driver disconnect / missed
-        heartbeats). Hard TTL still tears down in both cases.
+        (need_human pause keeps Chromium) **or** while ``lease.keep_alive``
+        **and** ``(now - last_heartbeat) <= keep_alive_ttl`` (same heartbeat clock
+        as soft-idle; default 600s = 2× idle_ttl, clamped ≤ hard TTL). Past
+        ``keep_alive_ttl`` since last heartbeat → tear down like soft-idle.
+        Hard TTL still tears down first in all cases.
         Re-checks staleness / expiry under the lock immediately before teardown
         so a concurrent heartbeat cannot be raced into an eviction.
         Evictions never keep warm (always stop Chromium).
@@ -1583,16 +1587,22 @@ class BrowserPool:
                         pass
                     continue
 
-                # Soft-idle: skip while awaiting human OR keep_alive
-                # (Browserbase-style: driver gone / missed heartbeats ≠ teardown).
-                # Hard TTL above still applies; explicit DELETE still tears down.
-                if lease.status == _STATE_AWAITING_HUMAN or lease.keep_alive:
+                # Soft-idle / keep_alive window (same last_heartbeat clock).
+                # awaiting_human: skip soft-idle entirely (hard TTL still applies).
+                # keep_alive: skip soft-idle until keep_alive_ttl since last heartbeat;
+                # past that window → tear down like soft-idle (ADV-KA-001).
+                if lease.status == _STATE_AWAITING_HUMAN:
                     continue
 
-                # Idle soft-evict: re-check heartbeat freshness under lock
                 if slot.last_heartbeat is None:
                     continue
-                if (now - slot.last_heartbeat) <= self.config.idle_ttl_seconds:
+                age = now - slot.last_heartbeat
+                if lease.keep_alive:
+                    ka_ttl = self.config.effective_keep_alive_ttl()
+                    if age <= ka_ttl:
+                        continue
+                    # keep_alive_ttl expired → fall through to soft-idle teardown
+                elif age <= self.config.idle_ttl_seconds:
                     # Heartbeat refreshed after any stale snapshot — skip
                     continue
                 try:

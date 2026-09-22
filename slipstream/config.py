@@ -7,16 +7,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-def keep_alive_default() -> bool:
-    """Env default for lease keep_alive (SLIPSTREAM_KEEPALIVE; default false)."""
-    return os.environ.get("SLIPSTREAM_KEEPALIVE", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
 @dataclass
 class PoolConfig:
     """Hard-capped browser pool settings.
@@ -27,6 +17,9 @@ class PoolConfig:
     K: int = 5
     W: int = 1
     idle_ttl_seconds: int = 300
+    # Soft-idle skip window while keep_alive (since last heartbeat). Default 600 =
+    # 2× default idle_ttl; clamped to ≤ lease_hard_ttl_seconds at use / from_env.
+    keep_alive_ttl_seconds: int = 600
     lease_hard_ttl_seconds: int = 1800
     spaces_root: Path = field(default_factory=lambda: Path("./data/spaces"))
     vault_root: Path = field(default_factory=lambda: Path("./data/vault"))
@@ -101,6 +94,9 @@ class PoolConfig:
             vault_root=self.vault_root,
         )
 
+    def effective_keep_alive_ttl(self) -> int:
+        """keep_alive_ttl_seconds clamped to [1, lease_hard_ttl_seconds]."""
+        return max(1, min(int(self.keep_alive_ttl_seconds), int(self.lease_hard_ttl_seconds)))
 
     def _apply_storage_roots_from_env(self) -> None:
         """Apply SLIPSTREAM_* root path overrides from the environment."""
@@ -129,6 +125,12 @@ class PoolConfig:
             cfg.W = int(w)
         if port := os.environ.get("SLIPSTREAM_PORT"):
             cfg.port = int(port)
+        if ka_ttl := os.environ.get("SLIPSTREAM_KEEPALIVE_TTL"):
+            cfg.keep_alive_ttl_seconds = int(ka_ttl)
+        # ADV-KA-001: keep_alive survival window never exceeds hard TTL.
+        cfg.keep_alive_ttl_seconds = max(
+            1, min(cfg.keep_alive_ttl_seconds, cfg.lease_hard_ttl_seconds)
+        )
         from slipstream.domains import allowed_domains_from_env
 
         cfg.allowed_domains = allowed_domains_from_env()

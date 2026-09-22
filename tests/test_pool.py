@@ -25,6 +25,7 @@ def test_config_defaults():
     assert cfg.K == 5
     assert cfg.W == 1
     assert cfg.idle_ttl_seconds == 300
+    assert cfg.keep_alive_ttl_seconds == 600
     assert cfg.cdp_base_port == 9222
     assert not hasattr(cfg, "heartbeat_interval_hint_seconds")
 

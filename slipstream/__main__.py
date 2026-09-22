@@ -201,14 +201,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Comma-separated top-frame host allowlist for this lease (empty=unrestricted)",
     )
-    p_lease.add_argument(
+    ka_grp = p_lease.add_mutually_exclusive_group()
+    ka_grp.add_argument(
         "--keep-alive",
+        dest="keep_alive",
         action=_STORE_TRUE,
-        default=None,
-        help="Survive driver disconnect / soft-idle (Browserbase keepAlive); "
-        "hard TTL + explicit release still apply (env SLIPSTREAM_KEEPALIVE)",
+        help="Survive soft-idle until keep_alive_ttl (Browserbase keepAlive); "
+        "hard TTL + explicit release still apply; omit → keep_alive false",
     )
-    p_lease.set_defaults(_handler="lease")
+    ka_grp.add_argument(
+        "--no-keep-alive",
+        dest="keep_alive",
+        action="store_false",
+        help="Send keep_alive:false explicitly (clears survival on re-lease)",
+    )
+    p_lease.set_defaults(_handler="lease", keep_alive=None)
 
     # --- heartbeat ---
     p_hb = sub.add_parser(_CMD_HEARTBEAT, help="Renew a lease soft-idle window")

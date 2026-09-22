@@ -327,9 +327,10 @@ def _parse_ttl_seconds(raw: Any) -> int | None:
 
 
 def _parse_keep_alive(raw: Any) -> bool | None:
-    """Return explicit keep_alive, or None to use env default.
+    """Return explicit keep_alive, or None when omitted (new leases → false).
 
     Rejects non-bool (incl. 1/0) so clients do not silently coerce.
+    Server env must not default keep_alive true on omit (ADV-KA-002).
     """
     if raw is None:
         return None
