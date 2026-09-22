@@ -30,13 +30,20 @@ class CdpInjector(Protocol):
     ) -> list[str]:
         """Fill ``(field_name, selector, value)`` tuples; return filled names."""
 
+    def page_url(self, cdp_http_url: str) -> str:
+        """Return current page location.href (for origin check before inject)."""
+
 
 @dataclass
 class MockCdpInjector:
     """Records fill attempts — used under mock / unit tests."""
 
     calls: list[dict[str, Any]] = field(default_factory=list)
+    current_url: str = "https://example.com/"
     _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def page_url(self, cdp_http_url: str) -> str:
+        return self.current_url
 
     def fill_fields(
         self,
@@ -115,6 +122,25 @@ def _ws_cdp_call(ws_url: str, method: str, params: dict[str, Any] | None = None)
 
 class RealCdpInjector:
     """Focus selector via Runtime.evaluate, then Input.insertText."""
+
+    def page_url(self, cdp_http_url: str) -> str:
+        host = urlparse(cdp_http_url).hostname
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            raise CdpInjectError(f"refusing non-loopback CDP URL host {host!r}")
+        ws_url = _page_ws_url(cdp_http_url)
+        result = _ws_cdp_call(
+            ws_url,
+            "Runtime.evaluate",
+            {
+                "expression": "location.href",
+                "returnByValue": True,
+            },
+        )
+        if isinstance(result, dict) and "result" in result:
+            val = result["result"].get("value")
+            if isinstance(val, str) and val:
+                return val
+        raise CdpInjectError("could not read location.href from page")
 
     def fill_fields(
         self,

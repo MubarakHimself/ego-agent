@@ -54,6 +54,27 @@ class PoolConfig:
         safe = self.normalize_space_id(space_id)
         return self.spaces_root / safe
 
+    def ensure_vault_outside_spaces(self) -> None:
+        """Fail closed if vault_root is inside (or equal to) spaces_root.
+
+        ADV-002: resolve both paths and require vault is *not* a relative_to
+        child of spaces (vault co-located under user-data-dir is scrapeable).
+        """
+        vault = self.vault_root.expanduser().resolve()
+        spaces = self.spaces_root.expanduser().resolve()
+        if vault == spaces:
+            raise ValueError(
+                f"vault_root must be outside spaces_root (got equal paths: {vault})"
+            )
+        try:
+            vault.relative_to(spaces)
+        except ValueError:
+            return  # vault is not under spaces — OK
+        raise ValueError(
+            f"vault_root must be outside spaces_root "
+            f"(vault={vault} is under spaces={spaces})"
+        )
+
     @classmethod
     def from_env(cls) -> PoolConfig:
         cfg = cls()
@@ -75,4 +96,5 @@ class PoolConfig:
             cfg.W = int(w)
         if port := os.environ.get("SLIPSTREAM_PORT"):
             cfg.port = int(port)
+        cfg.ensure_vault_outside_spaces()
         return cfg

@@ -34,6 +34,27 @@ from slipstream.pool import (
 )
 from slipstream.vault import CredNotFoundError, VaultUnavailableError, VaultValidationError
 
+# ADV-003: shared refuse matcher for free-read secret / cookie dump paths (GET+POST)
+_REFUSED_CRED_TAILS = frozenset(
+    {"secret", "secrets", "cookies", "storage_state", "dump"}
+)
+
+
+def is_refused_credentials_path(parts: list[str]) -> bool:
+    """True when path looks like …/credentials/{secret|cookies|…} free-read."""
+    return (
+        len(parts) >= 4
+        and "credentials" in parts
+        and parts[-1] in _REFUSED_CRED_TAILS
+    )
+
+
+def _refused_credentials_body() -> dict:
+    return {
+        "error": "refused",
+        "detail": "free-read of secrets/cookies is not available; use fill",
+    }
+
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, body: dict[str, Any]) -> None:
     raw = json.dumps(body).encode("utf-8")
@@ -99,6 +120,9 @@ def make_handler(pool: BrowserPool):
                     _json_response(self, 400, {"error": "invalid_credentials", "detail": str(e)})
                 except ValueError as e:
                     _json_response(self, 400, {"error": "bad_request", "detail": str(e)})
+                return
+            if is_refused_credentials_path(parts):
+                _json_response(self, 404, _refused_credentials_body())
                 return
             _json_response(self, 404, {"error": "not_found", "path": path})
 
@@ -266,22 +290,9 @@ def make_handler(pool: BrowserPool):
                     _json_response(self, 503, {"error": "vault_unavailable", "detail": str(e)})
                 return
 
-            # Refuse free-read secret / cookie dump paths
-            if len(parts) >= 4 and "credentials" in parts and parts[-1] in (
-                "secret",
-                "secrets",
-                "cookies",
-                "storage_state",
-                "dump",
-            ):
-                _json_response(
-                    self,
-                    404,
-                    {
-                        "error": "refused",
-                        "detail": "free-read of secrets/cookies is not available; use fill",
-                    },
-                )
+            # Refuse free-read secret / cookie dump paths (shared matcher — ADV-003)
+            if is_refused_credentials_path(parts):
+                _json_response(self, 404, _refused_credentials_body())
                 return
 
             _json_response(self, 404, {"error": "not_found", "path": path})

@@ -16,6 +16,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from slipstream.cli import _validate_api_request_url
 from slipstream.config import PoolConfig
 
 
@@ -142,7 +143,8 @@ class ChromiumLauncher:
                 )
             try:
                 with urllib.request.urlopen(
-                    f"{cdp_http_url}/json/version", timeout=0.5
+                    _validate_api_request_url(f"{cdp_http_url}/json/version"),
+                    timeout=0.5,
                 ) as resp:
                     if resp.status == 200:
                         break

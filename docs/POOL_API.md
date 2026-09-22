@@ -19,10 +19,11 @@ MVP is always **isolated** mode (one process tree per Space). There is no `mode`
 | `idle_ttl_seconds` | 300 | Soft-evict without heartbeat (~5 min); always stops Chromium; **skipped** while lease is `awaiting_human` |
 | `lease_hard_ttl_seconds` | 1800 | Hard lease ceiling (enforced on heartbeat / idle sweep / re-lease); always stops Chromium |
 | `spaces_root` | `./data/spaces` | Space = `{spaces_root}/{space_id}/` = Chromium `--user-data-dir` |
+| `vault_root` | `./data/vault` | Credential vault (**must** be outside `spaces_root`; fail-closed at config/pool init) |
 | `cdp_base_port` | 9222 | Slot *i* uses port `9222 + i` |
 | `host` / `port` | `127.0.0.1` / `8755` | API bind |
 
-Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`.
+Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`.
 
 ## Endpoints
 
@@ -130,7 +131,7 @@ Request must **not** include `watch_url` or `status` — both are server-derived
 
 **Refuse in payload keys:** cookies, passwords, tokens, JWTs, bearers, private/access keys, auth headers, credential-store dumps, secret-bearing paths, raw CDP auth. Matching is exact / token-boundary (not bare substring).
 
-**Trust boundary (free-text):** `detail` and `outcome.summary` are caller-controlled strings. Callers must not put secrets there. The server lightly scrubs `password=` / `cookie=` / `token=` patterns to `[REDACTED]` but this is defense-in-depth, not a guarantee — treat alert text as untrusted for secret storage.
+**Trust boundary (free-text):** `detail` and `outcome.summary` are caller-controlled strings. Callers must not put secrets there. The server lightly scrubs `password=` / `cookie=` / `token=` / `secret=` / `authorization=` / `bearer=` patterns to `[REDACTED]` but this is defense-in-depth, not a guarantee — treat alert text as untrusted for secret storage.
 
 **Server-derived fields:** `status` (`awaiting_human` / `done` / `failed`) and `watch_url` (short-TTL local handoff placeholder until live pair-browse UI exists). Soft-idle eviction is skipped while `lease.status == awaiting_human` (hard TTL still applies).
 
@@ -138,9 +139,13 @@ Request must **not** include `watch_url` or `status` — both are server-derived
 
 ### Credential vault (bound to Space)
 
-Vault root is **outside** Space `user-data-dir` (`SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, default `./data/vault`). Space profiles keep **session cookies only** — never a password dump.
+Vault root is **outside** Space `user-data-dir` (`SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, default `./data/vault`). Pool init **fail-closes** if `vault_root` resolves inside (or equal to) `spaces_root`. Space profiles keep **session cookies only** — never a password dump. Vault dirs/files use POSIX `0700` / `0600` when the OS supports chmod.
 
-Prefer OS keyring (`keyring` optional extra). Fallback: Fernet-encrypted blobs keyed by keyring master or `SLIPSTREAM_VAULT_KEY` (**tests / CI only**). Mock mode uses in-memory secrets.
+Prefer OS keyring (`keyring` optional extra). Fallback: Fernet-encrypted blobs keyed by keyring master or `SLIPSTREAM_VAULT_KEY` (**mock/tests only**, or set `SLIPSTREAM_ALLOW_VAULT_KEY=1`). Mock mode uses in-memory secrets.
+
+**Trust boundary (API / LLM never plaintext):** bind accepts secrets in the HTTP body to the **pool process only**. List / fill / unbind responses, skill returns, and LLM context never include username or secret material — only ids, labels, origins, and `ok`/`filled` labels. Agents must not re-read filled DOM values back into prompts. Optional fill `post_inject: "scrub_memory"` (default behavior) zeroes process buffers after CDP inject; full pause-CDP / anti-readback is deferred.
+
+**Auth (v1 loopback-trust):** bind/unbind are trusted on the loopback API bind (`127.0.0.1`). There is **no** captain-token yet — do not expose the pool port beyond loopback. Captain-token / ACL gate is later.
 
 ```http
 POST /v1/spaces/{space_id}/credentials/bind
@@ -158,24 +163,27 @@ POST /v1/leases/{lease_id}/credentials/fill
 {"cred_id":"…","fields":{"username":"#user","password":"#pass"}}
 → {"ok":true,"filled":["username","password"],"cred_id":"…","lease_id":"…"}
 # pool unlocks vault + CDP inject; agent sees ok/labels only
+# → 400 origin mismatch when page location.href origin ≠ cred.origin
 ```
 
-**Refuse:** `GET/POST …/credentials/secret|cookies|storage_state|dump` → `404 refused`. Fill body must not include `password`/`secret`/`token`/`cookie` keys — only `cred_id` + selectors.
+**Refuse:** `GET/POST …/credentials/secret|cookies|storage_state|dump` → `404 {"error":"refused"}`. Fill body must not include secret-like keys (recursive; expanded denylist) — only `cred_id` + selectors (and optional `post_inject`).
 
 **Login / 2FA:** if the agent cannot complete auth after fill (or before bind), raise `need_human` with `reason=login` (or `other` for CAPTCHA/2FA). Lease stays warm; captain Watch / Take-over. Never paste passwords into chat/alerts.
 
-CLI:
+CLI (`cred` subcommands — also listed under CLI client below):
 
 ```bash
+# Prefer env/file/prompt — bare --secret needs SLIPSTREAM_ALLOW_SECRET_ARGV=1
 slipstream cred bind --space-id "$S" --label work-gh --origin https://github.com \
-  --username "$USER" --secret "$PASS"   # captain/local only
+  --username "$USER" --secret-env SLIPSTREAM_BIND_SECRET
+# or: --secret-file /path/to/secret   or: --prompt
 slipstream cred list --space-id "$S"
 slipstream cred fill --lease-id "$L" --cred-id "$C" \
   --fields '{"username":"#login","password":"#password"}'
 slipstream cred unbind --space-id "$S" --cred-id "$C"
 ```
 
-Env: `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_VAULT_KEY` (tests only), optional extras `pip install 'slipstream[vault]'` / `'slipstream[cdp]'`.
+Env: `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_VAULT_KEY` (mock/tests; or `SLIPSTREAM_ALLOW_VAULT_KEY=1`), `SLIPSTREAM_ALLOW_SECRET_ARGV=1`, optional extras `pip install 'slipstream[vault]'` / `'slipstream[cdp]'`.
 
 ### `DELETE /v1/leases/{lease_id}`
 
@@ -216,6 +224,7 @@ Console script / module entry (`slipstream` or `python -m slipstream`):
 | `slipstream release --lease-id …` | `DELETE /v1/leases/{id}` |
 | `slipstream status` | `GET /v1/pool/status` |
 | `slipstream doctor [--json]` | local preflight + `GET /healthz` (Chrome/CDP/spaces/skill) |
+| `slipstream cred bind\|unbind\|list\|fill …` | credential vault (bind/unbind captain/local; list/fill agent-safe) |
 
 Uses stdlib `urllib`. Env: `SLIPSTREAM_URL` for base URL. Non-zero exit + stderr on HTTP errors.
 `doctor` also probes an ephemeral Chrome CDP endpoint and checks Spaces root + skill path (no lease required).

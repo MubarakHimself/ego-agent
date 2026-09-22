@@ -102,7 +102,7 @@ _FORBIDDEN_SEGMENT_PAIRS = frozenset(
 # Light scrub of free-text detail/summary values (trust boundary: callers must
 # not put secrets in text; we still redact common password=/cookie=/token= leaks).
 _SCRUB_VALUE_RE = re.compile(
-    r"(?i)\b(password|cookie|token)\s*=\s*\S+"
+    r"(?i)\b(password|cookie|token|secret|authorization|bearer)\s*=\s*\S+"
 )
 
 DEFAULT_WATCH_TTL_S = 300
@@ -142,7 +142,7 @@ def _key_forbidden(key: str) -> bool:
 
 
 def scrub_text(value: str) -> str:
-    """Redact password=/cookie=/token= patterns in free-text fields."""
+    """Redact password=/cookie=/token=/secret=/authorization=/bearer= in free-text."""
     if not value:
         return value
     return _SCRUB_VALUE_RE.sub(

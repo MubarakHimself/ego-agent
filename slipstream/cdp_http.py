@@ -12,6 +12,8 @@ import urllib.request
 from typing import Any
 from urllib.parse import quote, urlparse
 
+from slipstream.cli import _validate_api_request_url
+
 
 def _url_settled(page_url: str, observed_url: str) -> bool:
     """True when observed URL matches page_url by scheme+netloc and path prefix."""
@@ -37,7 +39,9 @@ def wait_cdp_ready(cdp_http_url: str, *, timeout: float = 15.0) -> dict[str, Any
     last_err: Exception | None = None
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=1.0) as resp:
+            with urllib.request.urlopen(
+                _validate_api_request_url(url), timeout=1.0
+            ) as resp:
                 if resp.status == 200:
                     return json.load(resp)
         except Exception as e:  # noqa: BLE001 — probe loop
@@ -48,7 +52,9 @@ def wait_cdp_ready(cdp_http_url: str, *, timeout: float = 15.0) -> dict[str, Any
 
 def list_targets(cdp_http_url: str) -> list[dict[str, Any]]:
     base = cdp_http_url.rstrip("/")
-    with urllib.request.urlopen(f"{base}/json/list", timeout=3.0) as resp:
+    with urllib.request.urlopen(
+        _validate_api_request_url(f"{base}/json/list"), timeout=3.0
+    ) as resp:
         return json.load(resp)
 
 
@@ -66,7 +72,9 @@ def navigate_via_json_new(
     base = cdp_http_url.rstrip("/")
     # Chrome requires PUT for /json/new (GET → 405 on modern builds).
     req = urllib.request.Request(
-        f"{base}/json/new?{quote(page_url, safe=':/?#&=%')}",
+        _validate_api_request_url(
+            f"{base}/json/new?{quote(page_url, safe=':/?#&=%')}"
+        ),
         method="PUT",
     )
     with urllib.request.urlopen(req, timeout=10.0) as resp:

@@ -15,11 +15,14 @@ def sample_rss_kb(pid: int) -> int | None:
     if not isinstance(pid, int) or pid <= 0:
         return None
     # Only read /proc/<pid>/status for a validated positive int PID.
+    # Path is fixed under /proc; pid is int — not a user path string (SKY-D215 FP).
     status_path = Path("/proc") / str(pid) / "status"
     try:
         if not status_path.is_file():
             return None
-        status = status_path.read_text(encoding="utf-8")
+        status = status_path.read_text(  # skylos: ignore[SKY-D215] pid validated int; path fixed under /proc
+            encoding="utf-8"
+        )
     except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
         return None
     for line in status.splitlines():

@@ -8,7 +8,7 @@ description: >
   browser). HTTP + this CLI/skill surface only — there is no MCP server.
   For video watch intents, compose a separate /watch skill (not Slipstream).
 metadata:
-  version: "0.4.0"
+  version: "0.4.1"
   date: "2026-09-22"
 ---
 
@@ -150,7 +150,7 @@ Ship-now takeover / done signals on the lease HTTP spine. **Never** put cookies,
 passwords, tokens, JWTs, bearers, private/access keys, auth headers, credential
 dumps, or secret paths in alert **keys**. Free-text `detail` / `summary` is a
 trust boundary — do not put secrets there (server lightly scrubs
-`password=`/`cookie=`/`token=` only). Do not send `watch_url` or `status`
+`password=`/`cookie=`/`token=`/`secret=`/`authorization=`/`bearer=`). Do not send `watch_url` or `status`
 (server-derived). Soft-idle eviction is skipped while awaiting human; hard TTL
 still applies.
 
@@ -191,22 +191,36 @@ Reasons for `need_human`: `captcha` | `login` | `ambiguous_ui` | `stuck` | `othe
 
 ## Credentials (vault + fill)
 
-Secrets live in a **vault outside** the Space profile (`SLIPSTREAM_VAULT_ROOT`).
-The Space `user-data-dir` keeps **session cookies only** after login — never a
-password dump. Agents **never** free-read secrets or cookie jars.
+Secrets live in a **vault outside** the Space profile (`SLIPSTREAM_VAULT_ROOT`;
+must not sit under `SLIPSTREAM_SPACES_ROOT`). The Space `user-data-dir` keeps
+**session cookies only** after login — never a password dump. Agents **never**
+free-read secrets or cookie jars.
+
+**Trust boundary:** API responses and the LLM **never** receive plaintext
+username/secret — only `cred_id` / labels / origins / `filled` names. Pool
+CDP-injects in-process and scrubs memory after fill. Do not read filled DOM
+values back into prompts (full pause-CDP anti-readback is later).
+
+**v1 auth:** bind/unbind trust the loopback pool bind; no captain-token yet —
+do not expose the pool beyond localhost.
 
 | Call | Who | Notes |
 |------|-----|-------|
-| `cred bind` | Captain / local tool | Secret in request body to pool only — not chat |
+| `cred bind` | Captain / local tool | Prefer `--secret-env` / `--secret-file` / `--prompt` (not argv) |
 | `cred list` | Agent ok | Metadata (`cred_id`, label, origin, `has_secret`) |
-| `cred fill` | **Agent** | `cred_id` + CSS selectors only — pool CDP-injects |
+| `cred fill` | **Agent** | `cred_id` + CSS selectors only — pool CDP-injects; origin must match page |
 | `cred unbind` | Captain / local | Removes binding |
 
 ```bash
+# Captain/local bind (no secret on argv)
+slipstream cred bind --space-id "$SPACE" --label work-gh \
+  --origin https://github.com --username "$USER" --secret-env SLIPSTREAM_BIND_SECRET
+
 # Agent on a login form — fill with selectors; NEVER ask LLM for the password
 slipstream cred fill --lease-id "$LEASE_ID" --cred-id "$CRED_ID" \
   --fields '{"username":"#login_field","password":"#password"}'
 # → {"ok":true,"filled":["username","password"]}
+# → 400 if page origin ≠ cred.origin
 ```
 
 **Login / 2FA / CAPTCHA:** if fill is not enough (or no bind exists), raise
@@ -214,8 +228,8 @@ slipstream cred fill --lease-id "$LEASE_ID" --cred-id "$CRED_ID" \
 captain uses Watch / Take-over. Prefer session reuse on later leases of the
 same Space after a successful human or fill login.
 
-**Refuse:** free-read secret endpoints, cookie/`storageState` dumps to the
-agent, secrets in alert payloads.
+**Refuse:** free-read secret endpoints (`error=refused`), cookie/`storageState`
+dumps to the agent, secrets in alert payloads / fill bodies.
 
 ## Exclusivity and warm rules
 
@@ -264,6 +278,9 @@ Thin in-house helpers (`slipstream.cdp_http`) are for smoke/bench only.
 | `SLIPSTREAM_MOCK=1` | Mock Chromium launches (**tests/CI only**) |
 | `SLIPSTREAM_CHROME` | Path to Chrome/Chromium binary (explicit missing → fail; no PATH fallthrough) |
 | `SLIPSTREAM_SPACES_ROOT` | Space profile root (default `./data/spaces`) |
+| `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT` | Cred vault root (default `./data/vault`; must be outside spaces) |
+| `SLIPSTREAM_ALLOW_SECRET_ARGV=1` | Allow bare `--secret` on `cred bind` argv |
+| `SLIPSTREAM_ALLOW_VAULT_KEY=1` | Allow `SLIPSTREAM_VAULT_KEY` outside mock |
 | `SLIPSTREAM_SKILL_PATH` | Override skill file path for `doctor` |
 | `SLIPSTREAM_WATCH_SKILL` | Override path to composed `/watch` skill for `doctor` |
 | `SLIPSTREAM_K` / `SLIPSTREAM_W` | Override hard cap / warm count |
@@ -282,6 +299,7 @@ slipstream alert   need-human|done --lease-id ID [options] [--url URL]
 slipstream release --lease-id ID [--reason REASON] [--url URL]
 slipstream status  [--url URL]
 slipstream doctor  [--url URL] [--json]
+slipstream cred    bind|unbind|list|fill …
 ```
 
 `python -m slipstream <subcommand> …` is equivalent to `slipstream …`.

@@ -12,7 +12,7 @@ from slipstream.launcher import find_chrome_binary
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "scripts"))
-import live_stress  # noqa: E402
+import live_stress  # noqa: E402  # skylos: ignore[SKY-D222] local scripts/live_stress.py, not PyPI
 
 
 @pytest.mark.live_stress

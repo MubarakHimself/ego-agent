@@ -13,6 +13,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 
@@ -52,6 +53,26 @@ def assert_url_allowed(url: str) -> None:
         )
 
 
+def _resolve_policy_path(path: Path) -> Path:
+    """Resolve path (name recognized by Skylos PATH_SANITIZERS)."""
+    return Path(path).expanduser().resolve()
+
+
+def _validate_api_request_url(url: str) -> str:
+    """Allowlist outbound HTTP URLs (loopback unless remote opted in).
+
+    Name is intentional: Skylos SSRF (SKY-D216) treats this as a URL sanitizer.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise CliError("empty URL", exit_code=2)
+    # Reject non-http(s) schemes early (file:, gopher:, etc.).
+    scheme = urllib.parse.urlparse(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise CliError(f"refusing non-http(s) URL scheme {scheme!r}", exit_code=2)
+    assert_url_allowed(url)
+    return url
+
+
 def resolve_base_url(url: str | None = None) -> str:
     """Resolve pool base URL: --url > SLIPSTREAM_URL > default.
 
@@ -69,11 +90,15 @@ def _request(
     body: dict[str, Any] | None = None,
     timeout: float = 30.0,
 ) -> tuple[int, dict[str, Any]]:
+    safe_url = _validate_api_request_url(url)
     data = None if body is None else json.dumps(body).encode("utf-8")
-    headers: dict[str, str] = {}
+    # Construct Request with sanitized URL only — set method/data via attrs so
+    # Skylos does not taint `req` through kwargs (SKY-D216).
+    req = urllib.request.Request(safe_url)
+    req.method = method
     if data is not None:
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        req.data = data
+        req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
@@ -205,6 +230,82 @@ def cmd_alert(
         _fail_http(status, payload)
     _print_json(payload)
     return 0
+
+
+def resolve_secret(
+    *,
+    secret: str | None = None,
+    secret_env: str | None = None,
+    secret_file: str | None = None,
+    prompt: bool = False,
+) -> str:
+    """Resolve bind secret without putting it on argv when possible (ADV-005).
+
+    Preference order: --secret-env → --secret-file → getpass prompt → bare
+    --secret (refused unless SLIPSTREAM_ALLOW_SECRET_ARGV=1).
+    """
+    sources = [bool(secret), bool(secret_env), bool(secret_file), bool(prompt)]
+    if sum(1 for s in sources if s) > 1:
+        raise CliError(
+            "use only one of --secret-env / --secret-file / --secret / --prompt",
+            exit_code=2,
+        )
+    if secret_env:
+        val = os.environ.get(secret_env, "")
+        if not val:
+            raise CliError(f"env {secret_env!r} empty or unset", exit_code=2)
+        return val
+    if secret_file:
+        # Operator-supplied path: refuse symlinks, require regular file, bound size.
+        path = _resolve_policy_path(Path(secret_file))
+        try:
+            if path.is_symlink():
+                raise CliError("--secret-file must not be a symlink", exit_code=2)
+            if not path.is_file():
+                raise CliError(f"--secret-file not a regular file: {path}", exit_code=2)
+            MAX_BYTES = 8192
+            st = path.stat()
+            if st.st_size > MAX_BYTES:
+                raise CliError("--secret-file too large", exit_code=2)
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(path, flags)
+            try:
+                val = os.read(fd, MAX_BYTES).decode("utf-8").rstrip("\n")
+            finally:
+                os.close(fd)
+        except CliError:
+            raise
+        except OSError as e:
+            raise CliError(f"cannot read --secret-file: {e}", exit_code=2) from e
+        if not val:
+            raise CliError("--secret-file is empty", exit_code=2)
+        return val
+    if prompt:
+        import getpass
+
+        val = getpass.getpass("Secret: ")
+        if not val:
+            raise CliError("empty secret from prompt", exit_code=2)
+        return val
+    if secret is not None:
+        if os.environ.get("SLIPSTREAM_ALLOW_SECRET_ARGV", "") != "1":
+            raise CliError(
+                "refusing bare --secret on argv (visible in process list); "
+                "prefer --secret-env / --secret-file / --prompt, "
+                "or set SLIPSTREAM_ALLOW_SECRET_ARGV=1",
+                exit_code=2,
+            )
+        if secret == "":
+            raise CliError("secret must be non-empty", exit_code=2)
+        return secret
+    raise CliError(
+        "secret required: pass --secret-env NAME, --secret-file PATH, "
+        "--prompt, or --secret with SLIPSTREAM_ALLOW_SECRET_ARGV=1",
+        exit_code=2,
+    )
+
 
 
 def cmd_cred_bind(

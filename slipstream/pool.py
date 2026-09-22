@@ -25,6 +25,7 @@ from slipstream.vault import (
     CredVault,
     VaultValidationError,
     material_for_field,
+    origins_match,
     parse_fill_body,
 )
 from slipstream.cdp_inject import CdpInjectError, CdpInjector, default_injector
@@ -73,8 +74,8 @@ class BrowserPool:
         self._api_base_url: str = f"http://{self.config.host}:{self.config.port}"
         # Ensure spaces root exists
         self.config.spaces_root.mkdir(parents=True, exist_ok=True)
-        # Cred vault lives OUTSIDE spaces_root (never inside user-data-dir)
-        self.config.vault_root.mkdir(parents=True, exist_ok=True)
+        # Cred vault lives OUTSIDE spaces_root (never inside user-data-dir) — ADV-002
+        self.config.ensure_vault_outside_spaces()
         self.vault = CredVault(self.config.vault_root, mock=self.config.mock)
         self._cdp_injector: CdpInjector = default_injector(mock=self.config.mock)
 
@@ -556,14 +557,34 @@ class BrowserPool:
 
         unlocked = self.vault.unlock_for_fill(space_id, cred_id)
         filled: list[str] = []
+        triples: list[tuple[str, str, str]] = []
         try:
-            triples: list[tuple[str, str, str]] = []
+            # ADV-010: refuse fill when page origin != bound cred.origin
+            bound_origin = unlocked.get("origin", "")
+            try:
+                page_href = self._cdp_injector.page_url(cdp_http)
+            except CdpInjectError:
+                raise
+            except Exception as e:
+                raise CdpInjectError(f"page origin check failed: {e}") from e
+            if not origins_match(bound_origin, page_href):
+                raise VaultValidationError(
+                    f"origin mismatch: cred bound to {bound_origin!r} but page is {page_href!r}"
+                )
             for name, selector in fields.items():
                 value = material_for_field(name, unlocked)
                 triples.append((name, selector, value))
             filled = self._cdp_injector.fill_fields(cdp_http, triples)
         finally:
-            # Best-effort zero unlocked material
+            # ADV-008: overwrite + clear secret triples and unlocked material
+            for i, (n, s, v) in enumerate(triples):
+                if v:
+                    triples[i] = (n, s, "\0" * len(v))
+            triples.clear()
+            for k in list(unlocked.keys()):
+                val = unlocked.get(k)
+                if isinstance(val, str) and val:
+                    unlocked[k] = "\0" * len(val)
             unlocked.clear()
 
         return {"ok": True, "filled": filled, "cred_id": cred_id, "lease_id": lease_id}
