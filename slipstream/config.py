@@ -19,6 +19,7 @@ class PoolConfig:
     idle_ttl_seconds: int = 300
     lease_hard_ttl_seconds: int = 1800
     spaces_root: Path = field(default_factory=lambda: Path("./data/spaces"))
+    vault_root: Path = field(default_factory=lambda: Path("./data/vault"))
     cdp_base_port: int = 9222
     host: str = "127.0.0.1"
     port: int = 8755
@@ -64,6 +65,10 @@ class PoolConfig:
             cfg.chrome_binary = bin_path
         if root := os.environ.get("SLIPSTREAM_SPACES_ROOT"):
             cfg.spaces_root = Path(root)
+        # Vault MUST stay outside Space user-data-dir
+        vault = os.environ.get("SLIPSTREAM_VAULT_ROOT") or os.environ.get("VAULT_ROOT")
+        if vault:
+            cfg.vault_root = Path(vault)
         if k := os.environ.get("SLIPSTREAM_K"):
             cfg.K = int(k)
         if w := os.environ.get("SLIPSTREAM_W"):

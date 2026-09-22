@@ -205,3 +205,83 @@ def cmd_alert(
         _fail_http(status, payload)
     _print_json(payload)
     return 0
+
+
+def cmd_cred_bind(
+    *,
+    space_id: str,
+    label: str,
+    origin: str,
+    username: str,
+    secret: str,
+    url: str | None = None,
+) -> int:
+    """POST /v1/spaces/{space_id}/credentials/bind — captain/local only."""
+    base = resolve_base_url(url)
+    body = {
+        "label": label,
+        "origin": origin,
+        "username": username,
+        "secret": secret,
+    }
+    status, payload = _request(
+        "POST", f"{base}/v1/spaces/{space_id}/credentials/bind", body
+    )
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0
+
+
+def cmd_cred_unbind(
+    *,
+    space_id: str,
+    cred_id: str,
+    url: str | None = None,
+) -> int:
+    """POST /v1/spaces/{space_id}/credentials/{cred_id}/unbind."""
+    base = resolve_base_url(url)
+    status, payload = _request(
+        "POST",
+        f"{base}/v1/spaces/{space_id}/credentials/{cred_id}/unbind",
+        {},
+    )
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0
+
+
+def cmd_cred_list(*, space_id: str, url: str | None = None) -> int:
+    """GET /v1/spaces/{space_id}/credentials — metadata only."""
+    base = resolve_base_url(url)
+    status, payload = _request("GET", f"{base}/v1/spaces/{space_id}/credentials")
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0
+
+
+def cmd_cred_fill(
+    *,
+    lease_id: str,
+    cred_id: str,
+    fields_json: str,
+    url: str | None = None,
+) -> int:
+    """POST /v1/leases/{lease_id}/credentials/fill — selectors only, never secrets."""
+    base = resolve_base_url(url)
+    try:
+        fields = json.loads(fields_json)
+    except json.JSONDecodeError as e:
+        raise CliError(f"fields must be JSON object: {e}", exit_code=2) from e
+    if not isinstance(fields, dict):
+        raise CliError("fields must be a JSON object of name→selector", exit_code=2)
+    body = {"cred_id": cred_id, "fields": fields}
+    status, payload = _request(
+        "POST", f"{base}/v1/leases/{lease_id}/credentials/fill", body
+    )
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0

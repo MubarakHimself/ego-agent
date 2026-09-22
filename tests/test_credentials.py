@@ -1,0 +1,296 @@
+"""Credential vault + fill API — mock vault + mock CDP inject; no plaintext to agent."""
+
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.request
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+
+import pytest
+
+from slipstream import __main__ as mainmod
+from slipstream.api import PoolServer
+from slipstream.cdp_inject import MockCdpInjector
+from slipstream.config import PoolConfig
+from slipstream.pool import BrowserPool
+from slipstream.vault import (
+    CredNotFoundError,
+    CredVault,
+    VaultValidationError,
+    material_for_field,
+    parse_fill_body,
+)
+
+
+@pytest.fixture
+def api_server(tmp_path):
+    cfg = PoolConfig(
+        K=3,
+        W=1,
+        spaces_root=tmp_path / "spaces",
+        vault_root=tmp_path / "vault",
+        cdp_base_port=19622,
+        mock=True,
+        host="127.0.0.1",
+        port=18790,
+    )
+    pool = BrowserPool(cfg)
+    pool._cdp_injector = MockCdpInjector()
+    server = PoolServer(pool, port=18790)
+    server.start(background=True)
+    yield server
+    server.stop()
+
+
+def _req(method: str, url: str, body: dict | None = None) -> tuple[int, dict]:
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"} if data else {},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode("utf-8"))
+
+
+def test_vault_outside_spaces_root(tmp_path):
+    spaces = tmp_path / "spaces"
+    vault = tmp_path / "vault"
+    cfg = PoolConfig(spaces_root=spaces, vault_root=vault, mock=True, K=1)
+    pool = BrowserPool(cfg)
+    assert pool.config.vault_root.resolve() != pool.config.spaces_root.resolve()
+    space_path = pool.config.space_path("s1")
+    assert vault.resolve() not in space_path.resolve().parents
+
+
+def test_vault_bind_list_unbind_no_plaintext(tmp_path):
+    v = CredVault(tmp_path / "v", mock=True)
+    ack = v.bind(
+        "space-a",
+        label="work-gh",
+        origin="https://github.com",
+        username="alice",
+        secret="hunter2",
+    )
+    assert ack["bound"] is True
+    assert "secret" not in ack and "username" not in ack
+    listing = v.list_metadata("space-a")
+    assert listing["items"][0]["has_secret"] is True
+    assert "hunter2" not in json.dumps(listing)
+    assert "alice" not in json.dumps(listing)
+    unlocked = v.unlock_for_fill("space-a", ack["cred_id"])
+    assert unlocked["username"] == "alice" and unlocked["secret"] == "hunter2"
+    v.unbind("space-a", ack["cred_id"])
+    with pytest.raises(CredNotFoundError):
+        v.unlock_for_fill("space-a", ack["cred_id"])
+
+
+def test_vault_refuse_free_read(tmp_path):
+    v = CredVault(tmp_path / "v", mock=True)
+    with pytest.raises(VaultValidationError, match="free-read"):
+        v.refuse_free_read()
+    with pytest.raises(VaultValidationError, match="cookie"):
+        v.refuse_cookie_dump()
+
+
+def test_parse_fill_refuses_secret_in_body():
+    with pytest.raises(VaultValidationError, match="password"):
+        parse_fill_body(
+            {"cred_id": "c1", "password": "x", "fields": {"username": "#u"}}
+        )
+    parsed = parse_fill_body(
+        {"cred_id": "c1", "fields": {"username": "#user", "password": "#pass"}}
+    )
+    assert parsed["fields"]["password"] == "#pass"
+    assert material_for_field("password", {"username": "a", "secret": "b"}) == "b"
+
+
+def test_http_bind_list_fill_unbind(api_server: PoolServer):
+    base = api_server.base_url
+    code, bind = _req(
+        "POST",
+        f"{base}/v1/spaces/s1/credentials/bind",
+        {
+            "label": "gh",
+            "origin": "https://github.com",
+            "username": "bob",
+            "secret": "sekrit",
+        },
+    )
+    assert code == 200
+    assert bind["bound"] is True
+    assert "sekrit" not in json.dumps(bind)
+
+    code, listing = _req("GET", f"{base}/v1/spaces/s1/credentials")
+    assert code == 200
+    assert listing["items"][0]["cred_id"] == bind["cred_id"]
+    assert "sekrit" not in json.dumps(listing)
+    assert "bob" not in json.dumps(listing)
+
+    code, lease = _req(
+        "POST", f"{base}/v1/leases", {"agent_id": "agent-1", "space_id": "s1"}
+    )
+    assert code == 200
+    lid = lease["lease_id"]
+
+    code, fill = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/credentials/fill",
+        {
+            "cred_id": bind["cred_id"],
+            "fields": {"username": "#login_field", "password": "#pass_field"},
+        },
+    )
+    assert code == 200
+    assert fill["ok"] is True
+    assert fill["filled"] == ["username", "password"]
+    assert "sekrit" not in json.dumps(fill)
+
+    inj = api_server.pool._cdp_injector
+    assert isinstance(inj, MockCdpInjector)
+    assert len(inj.calls) == 2
+    assert inj.calls[0]["selector"] == "#login_field"
+    assert inj.calls[0]["value_len"] == 3  # bob
+    assert inj.calls[1]["value_len"] == 6  # sekrit
+    assert "sekrit" not in json.dumps(inj.calls)
+
+    code, refused = _req("POST", f"{base}/v1/spaces/s1/credentials/secret", {})
+    assert code == 404
+    assert refused["error"] == "refused"
+
+    code, cookies = _req("GET", f"{base}/v1/spaces/s1/credentials/cookies")
+    assert code == 404
+
+    code, ub = _req(
+        "POST",
+        f"{base}/v1/spaces/s1/credentials/{bind['cred_id']}/unbind",
+        {},
+    )
+    assert code == 200
+    assert ub["unbound"] is True
+
+
+def test_fill_unknown_cred_404(api_server: PoolServer):
+    base = api_server.base_url
+    code, lease = _req(
+        "POST", f"{base}/v1/leases", {"agent_id": "a", "space_id": "sx"}
+    )
+    assert code == 200
+    code, err = _req(
+        "POST",
+        f"{base}/v1/leases/{lease['lease_id']}/credentials/fill",
+        {"cred_id": "cred_missing", "fields": {"username": "#u"}},
+    )
+    assert code == 404
+    assert err["error"] == "cred_not_found"
+
+
+def test_cli_cred_bind_list_fill(api_server: PoolServer):
+    base = api_server.base_url
+
+    def run(argv: list[str]) -> tuple[int, str, str]:
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = mainmod.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    code, out, err = run(
+        [
+            "cred",
+            "bind",
+            "--url",
+            base,
+            "--space-id",
+            "cli-space",
+            "--label",
+            "l",
+            "--origin",
+            "https://example.com",
+            "--username",
+            "u",
+            "--secret",
+            "p",
+        ]
+    )
+    assert code == 0, err
+    bind = json.loads(out)
+    assert bind["bound"] is True
+
+    code, out, err = run(["cred", "list", "--url", base, "--space-id", "cli-space"])
+    assert code == 0, err
+    assert json.loads(out)["items"][0]["cred_id"] == bind["cred_id"]
+
+    code, out, err = run(
+        [
+            "lease",
+            "--url",
+            base,
+            "--agent-id",
+            "cli-agent",
+            "--space-id",
+            "cli-space",
+        ]
+    )
+    assert code == 0, err
+    lease = json.loads(out)
+
+    fields = json.dumps({"username": "#u", "password": "#p"})
+    code, out, err = run(
+        [
+            "cred",
+            "fill",
+            "--url",
+            base,
+            "--lease-id",
+            lease["lease_id"],
+            "--cred-id",
+            bind["cred_id"],
+            "--fields",
+            fields,
+        ]
+    )
+    assert code == 0, err
+    fill = json.loads(out)
+    assert fill["ok"] is True
+    assert fill["filled"] == ["username", "password"]
+
+    code, out, err = run(
+        [
+            "cred",
+            "unbind",
+            "--url",
+            base,
+            "--space-id",
+            "cli-space",
+            "--cred-id",
+            bind["cred_id"],
+        ]
+    )
+    assert code == 0, err
+    assert json.loads(out)["unbound"] is True
+
+
+def test_need_human_login_path(api_server: PoolServer):
+    """Login/2FA → need_human(reason=login); no secrets in alert payload."""
+    base = api_server.base_url
+    code, lease = _req(
+        "POST", f"{base}/v1/leases", {"agent_id": "a", "space_id": "login-space"}
+    )
+    assert code == 200
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lease['lease_id']}/alerts",
+        {"event": "need_human", "reason": "login", "detail": "2FA prompt visible"},
+    )
+    assert code == 200
+    assert env["alert"]["reason"] == "login"
+    assert env["harness"]["action"] == "pause"
+    blob = json.dumps(env).lower()
+    assert "password=" not in blob
+    assert "sekrit" not in blob

@@ -8,7 +8,7 @@ description: >
   browser). HTTP + this CLI/skill surface only — there is no MCP server.
   For video watch intents, compose a separate /watch skill (not Slipstream).
 metadata:
-  version: "0.3.0"
+  version: "0.4.0"
   date: "2026-09-22"
 ---
 
@@ -189,6 +189,34 @@ curl -s -X POST "$SLIPSTREAM_URL/v1/leases/$LEASE_ID/alerts" \
 
 Reasons for `need_human`: `captcha` | `login` | `ambiguous_ui` | `stuck` | `other`.
 
+## Credentials (vault + fill)
+
+Secrets live in a **vault outside** the Space profile (`SLIPSTREAM_VAULT_ROOT`).
+The Space `user-data-dir` keeps **session cookies only** after login — never a
+password dump. Agents **never** free-read secrets or cookie jars.
+
+| Call | Who | Notes |
+|------|-----|-------|
+| `cred bind` | Captain / local tool | Secret in request body to pool only — not chat |
+| `cred list` | Agent ok | Metadata (`cred_id`, label, origin, `has_secret`) |
+| `cred fill` | **Agent** | `cred_id` + CSS selectors only — pool CDP-injects |
+| `cred unbind` | Captain / local | Removes binding |
+
+```bash
+# Agent on a login form — fill with selectors; NEVER ask LLM for the password
+slipstream cred fill --lease-id "$LEASE_ID" --cred-id "$CRED_ID" \
+  --fields '{"username":"#login_field","password":"#password"}'
+# → {"ok":true,"filled":["username","password"]}
+```
+
+**Login / 2FA / CAPTCHA:** if fill is not enough (or no bind exists), raise
+`need_human` with `reason=login` (or `other`). Lease stays warm; pause CDP;
+captain uses Watch / Take-over. Prefer session reuse on later leases of the
+same Space after a successful human or fill login.
+
+**Refuse:** free-read secret endpoints, cookie/`storageState` dumps to the
+agent, secrets in alert payloads.
+
 ## Exclusivity and warm rules
 
 - **Space exclusivity:** a `space_id` may be leased by only one agent at a time.
@@ -264,10 +292,10 @@ slipstream doctor  [--url URL] [--json]
 - No Monid / paid marketplace.
 - No MCP server (skill+CLI+HTTP only).
 - No free-read of Space cookies / credential dumps.
-- Credentials vault, live pair-browse UI polish, optional stuck/captcha chips,
-  Take/Cede exclusive lock are **later** — not part of this skill yet.
-- Compose `/watch` remains upstream (see doctor warn). Alerts (`need_human` /
-  `task_done`) **are** on the CLI/HTTP surface (this section).
+- Live pair-browse UI polish, optional stuck/captcha chips, Take/Cede exclusive
+  lock are **later**.
+- Compose `/watch` remains upstream (see doctor warn). Alerts + credential
+  vault/fill **are** on the CLI/HTTP surface.
 
 ## Examples
 

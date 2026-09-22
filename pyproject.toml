@@ -17,6 +17,14 @@ dev = [
     "pytest>=8.0",
     "vulture>=2.11",
 ]
+vault = [
+    "keyring>=25.0",
+    "cryptography>=42.0",
+]
+# Real CDP fill over WebSocket (optional; mock used in tests)
+cdp = [
+    "websocket-client>=1.8",
+]
 
 [project.scripts]
 slipstream = "slipstream.__main__:main"

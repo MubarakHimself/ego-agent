@@ -136,6 +136,47 @@ Request must **not** include `watch_url` or `status` — both are server-derived
 
 **In-memory alert state:** `_alert_log` and `_task_done_envelopes` are **process-lifetime** maps (survive lease release for idempotent `task_done` replay; cleared on pool shutdown / process exit). Bounded LRU eviction is deferred.
 
+### Credential vault (bound to Space)
+
+Vault root is **outside** Space `user-data-dir` (`SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, default `./data/vault`). Space profiles keep **session cookies only** — never a password dump.
+
+Prefer OS keyring (`keyring` optional extra). Fallback: Fernet-encrypted blobs keyed by keyring master or `SLIPSTREAM_VAULT_KEY` (**tests / CI only**). Mock mode uses in-memory secrets.
+
+```http
+POST /v1/spaces/{space_id}/credentials/bind
+{"label":"work-github","origin":"https://github.com","username":"…","secret":"…"}
+→ {"cred_id":"cred_…","label":"…","origin":"…","bound":true}
+
+POST /v1/spaces/{space_id}/credentials/{cred_id}/unbind
+→ {"unbound":true,"cred_id":"…","space_id":"…"}
+
+GET  /v1/spaces/{space_id}/credentials
+→ {"items":[{"cred_id":"…","label":"…","origin":"…","has_secret":true}],"space_id":"…"}
+# metadata only — never secret, never username, never cookie jar
+
+POST /v1/leases/{lease_id}/credentials/fill
+{"cred_id":"…","fields":{"username":"#user","password":"#pass"}}
+→ {"ok":true,"filled":["username","password"],"cred_id":"…","lease_id":"…"}
+# pool unlocks vault + CDP inject; agent sees ok/labels only
+```
+
+**Refuse:** `GET/POST …/credentials/secret|cookies|storage_state|dump` → `404 refused`. Fill body must not include `password`/`secret`/`token`/`cookie` keys — only `cred_id` + selectors.
+
+**Login / 2FA:** if the agent cannot complete auth after fill (or before bind), raise `need_human` with `reason=login` (or `other` for CAPTCHA/2FA). Lease stays warm; captain Watch / Take-over. Never paste passwords into chat/alerts.
+
+CLI:
+
+```bash
+slipstream cred bind --space-id "$S" --label work-gh --origin https://github.com \
+  --username "$USER" --secret "$PASS"   # captain/local only
+slipstream cred list --space-id "$S"
+slipstream cred fill --lease-id "$L" --cred-id "$C" \
+  --fields '{"username":"#login","password":"#password"}'
+slipstream cred unbind --space-id "$S" --cred-id "$C"
+```
+
+Env: `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_VAULT_KEY` (tests only), optional extras `pip install 'slipstream[vault]'` / `'slipstream[cdp]'`.
+
 ### `DELETE /v1/leases/{lease_id}`
 
 Optional JSON body: `{"reason":"done"}`.
