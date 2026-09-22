@@ -272,6 +272,17 @@ def test_adv_watch_005_cross_lease_missing_unknown(api_server: PoolServer):
         "POST", f"{base}/v1/leases/{lid_a}/watch/confirm?token={token_b}", {}
     )
     assert code == 401, body
+    # ADV-PAIR-004: cross-lease on pair-browse endpoints → 401
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid_b}/watch/input?token={token_a}",
+        {"kind": "click", "x": 1, "y": 1},
+    )
+    assert code == 401, body
+    code, body = _req(
+        "POST", f"{base}/v1/leases/{lid_b}/watch/cede?token={token_a}", {}
+    )
+    assert code == 401, body
 
     # Missing token → 401
     code, body = _req("GET", f"{base}/v1/leases/{lid_a}/watch")
@@ -563,7 +574,10 @@ def test_pair_browse_confirm_click_type_scroll(api_server: PoolServer):
     kinds = [e["kind"] for e in log]
     assert kinds == ["click", "type", "scroll"]
     assert log[0]["x"] == 42 and log[0]["y"] == 84
-    assert log[1]["text"] == secretish  # mock recorder only
+    # ADV-PAIR-003: mock recorder stores text_len only — never full typed text
+    assert log[1].get("text_len") == len(secretish)
+    assert "text" not in log[1]
+    assert secretish not in json.dumps(log)
     assert log[2]["deltaY"] == -120
 
 
@@ -648,6 +662,7 @@ def test_pair_browse_bad_token_401(api_server: PoolServer):
 
 
 def test_pair_browse_ttl_expiry_blocks_input(api_server: PoolServer):
+    """Legacy: Watch TTL → input 410."""
     base = api_server.base_url
     lid = _lease(base, space="pb-ttl")
     code, env = _req(
@@ -666,3 +681,137 @@ def test_pair_browse_ttl_expiry_blocks_input(api_server: PoolServer):
         {"kind": "click", "x": 1, "y": 1},
     )
     assert code == 410, body
+
+
+def test_adv_pair_001_watch_ttl_returns_drive(api_server: PoolServer):
+    """ADV-PAIR-001: confirm → force expires_at past → lease leased + input 410 + hb 200."""
+    base = api_server.base_url
+    lid = _lease(base, space="pb-ttl-drive")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "stuck", "ttl_s": 60},
+    )
+    assert code == 200
+    token = _token_from_watch_url(env["alert"]["watch_url"])
+    code, conf = _req(
+        "POST", f"{base}/v1/leases/{lid}/watch/confirm?token={token}", {}
+    )
+    assert code == 200
+    assert conf["status"] == "awaiting_human"
+    assert api_server.pool._leases[lid].status == "awaiting_human"
+
+    sess = api_server.pool._watches[lid]
+    sess.expires_at = time.time() - 1
+
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/input?token={token}",
+        {"kind": "click", "x": 1, "y": 1},
+    )
+    assert code == 410, body
+    assert api_server.pool._leases[lid].status == "leased"
+    assert sess.input_enabled is False
+    assert sess.takeover_confirmed is False
+
+    code, hb = _req("POST", f"{base}/v1/leases/{lid}/heartbeat", {})
+    assert code == 200, hb
+
+
+def test_adv_pair_001_watch_ttl_sweep_returns_drive(api_server: PoolServer):
+    """ADV-PAIR-001: idle/TTL sweep also returns drive without waiting for watch hit."""
+    base = api_server.base_url
+    lid = _lease(base, space="pb-ttl-sweep")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "captcha", "ttl_s": 60},
+    )
+    assert code == 200
+    token = _token_from_watch_url(env["alert"]["watch_url"])
+    code, _ = _req("POST", f"{base}/v1/leases/{lid}/watch/confirm?token={token}", {})
+    assert code == 200
+    sess = api_server.pool._watches[lid]
+    sess.expires_at = time.time() - 1
+    api_server.pool.evict_idle()
+    assert api_server.pool._leases[lid].status == "leased"
+    assert sess.input_enabled is False
+    assert sess.takeover_confirmed is False
+    code, body = _req("GET", f"{base}/v1/leases/{lid}/watch?token={token}")
+    assert code == 410, body
+
+
+def test_adv_pair_002_cede_during_inflight_input_410(api_server: PoolServer, monkeypatch):
+    """ADV-PAIR-002: slow CDP + concurrent cede → input 410; lease leased; no dual success."""
+    from slipstream import watch as watch_mod
+
+    base = api_server.base_url
+    lid = _lease(base, space="pb-race")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "stuck"},
+    )
+    assert code == 200
+    token = _token_from_watch_url(env["alert"]["watch_url"])
+    code, _ = _req("POST", f"{base}/v1/leases/{lid}/watch/confirm?token={token}", {})
+    assert code == 200
+
+    release = threading.Event()
+    entered = threading.Event()
+    real = watch_mod.dispatch_cdp_input
+
+    def slow_dispatch(cdp_http_url, event, *, mock=False, mock_log=None):
+        entered.set()
+        assert release.wait(timeout=5), "cede did not unblock mock CDP"
+        return real(cdp_http_url, event, mock=mock, mock_log=mock_log)
+
+    monkeypatch.setattr(watch_mod, "dispatch_cdp_input", slow_dispatch)
+    # pool imported the symbol — patch on pool module too
+    import slipstream.pool as pool_mod
+
+    monkeypatch.setattr(pool_mod, "dispatch_cdp_input", slow_dispatch)
+
+    result: dict = {}
+
+    def do_input():
+        code, body = _req(
+            "POST",
+            f"{base}/v1/leases/{lid}/watch/input?token={token}",
+            {"kind": "click", "x": 9, "y": 9},
+        )
+        result["code"] = code
+        result["body"] = body
+
+    t = threading.Thread(target=do_input, daemon=True)
+    t.start()
+    assert entered.wait(timeout=5), "dispatch never entered slow CDP"
+    code, ceded = _req("POST", f"{base}/v1/leases/{lid}/watch/cede?token={token}", {})
+    assert code == 200, ceded
+    assert ceded["status"] == "leased"
+    release.set()
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert result["code"] == 410, result
+    assert api_server.pool._leases[lid].status == "leased"
+    assert api_server.pool._watches[lid].input_enabled is False
+
+
+def test_adv_pair_004_cede_without_confirm_400(api_server: PoolServer):
+    """ADV-PAIR-004: cede before confirm → 400 nothing to cede (not success no-op)."""
+    base = api_server.base_url
+    lid = _lease(base, space="pb-cede-early")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "login"},
+    )
+    assert code == 200
+    token = _token_from_watch_url(env["alert"]["watch_url"])
+    assert api_server.pool._leases[lid].status == "awaiting_human"
+    code, body = _req("POST", f"{base}/v1/leases/{lid}/watch/cede?token={token}", {})
+    assert code == 400, body
+    assert body.get("error") == "invalid_input"
+    assert "nothing to cede" in (body.get("detail") or "")
+    # Status unchanged — still awaiting_human (agent paused for human)
+    assert api_server.pool._leases[lid].status == "awaiting_human"

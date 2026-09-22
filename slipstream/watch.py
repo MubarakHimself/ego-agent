@@ -86,6 +86,8 @@ class WatchSession:
     revoked: bool = False
     takeover_confirmed: bool = False
     input_enabled: bool = False
+    # Bumped on cede / revoke / Watch TTL clear so in-flight CDP input cannot ack success.
+    input_epoch: int = 0
     created_at: float = 0.0
 
     def alive(self, now: float | None = None) -> bool:
@@ -487,13 +489,12 @@ def dispatch_cdp_input(
     kind = event["kind"]
     if mock or not cdp_http_url:
         if mock_log is not None:
-            # Record for tests; type stores text_len only in shared log shape,
-            # plus text under mock for assertion (never returned on wire).
+            # ADV-PAIR-003: never store full typed text — kind + text_len only.
             rec = {"kind": kind, "cdp_http_url": cdp_http_url}
             if kind == "click":
                 rec.update({"x": event["x"], "y": event["y"], "button": event["button"]})
             elif kind == "type":
-                rec.update({"text": event["text"], "text_len": len(event["text"])})
+                rec.update({"text_len": len(event["text"])})
             elif kind == "key":
                 rec.update({"key": event["key"], "code": event["code"], "type": event["type"]})
             else:
