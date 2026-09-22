@@ -1,0 +1,3 @@
+# MVP uses Python stdlib only for the pool service.
+# Test dependency:
+pytest>=8.0
