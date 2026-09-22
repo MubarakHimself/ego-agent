@@ -1,19 +1,20 @@
-"""Thin confirm-actions / permission ladder (v1).
+"""Thin confirm-actions / permission ladder (server-enforced).
 
-Gated categories: eval | download | upload | nav_irreversible.
+Gated categories: fill | eval | download | upload | nav_irreversible.
 Soft browse (snapshot/click/scroll/wait) is free — not gated here.
 
 Gated act → confirmation_required + sibling need_human on the same alerts bus
 (kind=confirmation_required + confirm_id). Confirm|deny within ~60s; auto-deny
 on expiry. Non-TTY interactive confirm → deny.
 
-Defer: once/always/never policy matrix, Comet UI. Domain allowlist +
-content-boundaries ship separately (pool navigate gate / boundaries helper).
-Pattern from agent-browser Security docs (no code theft).
+ADV-PL-001 (server-enforced): confirm grants a **one-shot** allowance for that
+category on the lease. CDP helpers for ``fill`` (credentials fill), ``eval``
+(Runtime.evaluate / script), and ``nav_irreversible`` (all pool navigates)
+**refuse** without a prior confirm for that category — no CDP side-effect.
+Deny / timeout stay fail-closed. Domain allowlist on navigate remains enforced.
 
-v1 honor-system (ADV-PL-001): POST /actions is an advisory pause — CDP fill /
-eval / nav are not server-enforced by this ladder yet. Server-enforced ladder
-is a later track. Domain allowlist on navigate IS enforced at the pool gate.
+Defer: once/always/never policy matrix, Comet UI.
+Pattern from agent-browser Security docs (no code theft).
 """
 
 from __future__ import annotations
@@ -30,7 +31,9 @@ from slipstream.alerts import AlertValidationError, reject_secret_fields, scrub_
 # Nairobi EAT timestamps for expires_at (box-local convention).
 _EAT = timezone(timedelta(hours=3), name="EAT")
 
-CATEGORIES = frozenset({"eval", "download", "upload", "nav_irreversible"})
+CATEGORIES = frozenset({"fill", "eval", "download", "upload", "nav_irreversible"})
+ENFORCED_CDP_CATEGORIES = frozenset({"fill", "eval", "nav_irreversible"})
+MAX_EVAL_EXPRESSION_CHARS = 4000
 KIND_CONFIRMATION_REQUIRED = "confirmation_required"
 DEFAULT_CONFIRM_TTL_S = 60
 
@@ -50,6 +53,14 @@ class ConfirmationNotFoundError(Exception):
 
 class ConfirmationGoneError(Exception):
     """Confirmation already resolved or expired."""
+
+
+class LadderGateError(Exception):
+    """CDP path refused — no one-shot confirmation allowance for category."""
+
+    def __init__(self, category: str):
+        self.category = category
+        super().__init__(f"confirmation required for category {category!r}")
 
 
 def confirm_ttl_seconds() -> int:
@@ -170,10 +181,12 @@ class PendingConfirmation:
 
 @dataclass
 class ConfirmationStore:
-    """In-memory pending confirmations (process-lifetime; cleared on shutdown)."""
+    """In-memory pending confirmations + one-shot CDP allowances."""
 
     _by_id: dict[str, PendingConfirmation] = field(default_factory=dict)
     _by_lease: dict[str, list[str]] = field(default_factory=dict)
+    # (lease_id, category) → remaining one-shot grants after confirm.
+    _allow_counts: dict[tuple[str, str], int] = field(default_factory=dict)
 
     def add(self, pending: PendingConfirmation) -> None:
         self._by_id[pending.confirm_id] = pending
@@ -200,3 +213,46 @@ class ConfirmationStore:
                 p.status = STATUS_EXPIRED
                 newly.append(p)
         return newly
+
+    def grant_once(self, lease_id: str, category: str) -> None:
+        """Captain confirm → one CDP act of this category may proceed."""
+        key = (lease_id, category)
+        self._allow_counts[key] = self._allow_counts.get(key, 0) + 1
+
+    def consume_once(self, lease_id: str, category: str) -> None:
+        """Consume one-shot allowance or raise LadderGateError (fail-closed)."""
+        key = (lease_id, category)
+        n = self._allow_counts.get(key, 0)
+        if n <= 0:
+            raise LadderGateError(category)
+        if n == 1:
+            del self._allow_counts[key]
+        else:
+            self._allow_counts[key] = n - 1
+
+    def clear_lease(self, lease_id: str) -> None:
+        """Drop allowances when a lease leaves the pool."""
+        for key in list(self._allow_counts):
+            if key[0] == lease_id:
+                del self._allow_counts[key]
+
+
+def parse_eval_request(body: dict[str, Any]) -> dict[str, Any]:
+    """Validate Runtime.evaluate body; return {expression}. Never keeps secrets."""
+    if not isinstance(body, dict):
+        raise ActionValidationError("body must be a JSON object")
+    try:
+        reject_secret_fields(body)
+    except AlertValidationError as e:
+        raise ActionValidationError(str(e)) from e
+    expression = body.get("expression")
+    if not isinstance(expression, str) or not expression.strip():
+        raise ActionValidationError("expression must be a non-empty string")
+    expression = expression.strip()
+    if len(expression) > MAX_EVAL_EXPRESSION_CHARS:
+        raise ActionValidationError(
+            f"expression too long (max {MAX_EVAL_EXPRESSION_CHARS})"
+        )
+    # Scrub for activity-feed summary only — expression itself is pool-side.
+    _ = scrub_text(expression[:200])
+    return {"expression": expression}

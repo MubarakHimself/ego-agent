@@ -26,6 +26,9 @@ from slipstream.metadata import MetadataValidationError, effective_metadata, val
 from slipstream.api import PoolServer
 from slipstream import __main__ as mainmod
 
+from tests.conftest import grant_ladder
+
+
 @pytest.fixture
 def api_server(tmp_path):
     from slipstream.config import PoolConfig
@@ -294,6 +297,7 @@ def test_navigate_refuse_outside_allowlist(api_server: PoolServer):
 def test_navigate_allow_listed_and_empty_unrestricted(api_server: PoolServer):
     base = api_server.base_url
     lid, _ = _lease(base, space="nav-ok", allowed_domains=["example.com"])
+    grant_ladder(base, lid, "nav_irreversible", "listed nav")
     code, body = _req(
         "POST",
         f"{base}/v1/leases/{lid}/navigate",
@@ -305,6 +309,7 @@ def test_navigate_allow_listed_and_empty_unrestricted(api_server: PoolServer):
 
     lid2, env2 = _lease(base, space="nav-free")
     assert env2["allowed_domains"] == []
+    grant_ladder(base, lid2, "nav_irreversible", "free nav")
     code, body = _req(
         "POST",
         f"{base}/v1/leases/{lid2}/navigate",
@@ -353,6 +358,7 @@ def test_adv_dom_001_empty_lease_inherits_space(api_server: PoolServer):
     )
     assert code == 403
     assert body["error"] == "domain_not_allowed"
+    grant_ladder(base, lid, "nav_irreversible", "space-only nav")
     code, body = _req(
         "POST",
         f"{base}/v1/leases/{lid}/navigate",

@@ -23,6 +23,7 @@ from slipstream.evidence import (
     store_evidence_jpeg,
 )
 from slipstream.pool import BrowserPool
+from tests.conftest import grant_ladder
 
 
 @pytest.fixture
@@ -143,6 +144,7 @@ def test_watch_evidence_api_auth_scrub_and_gone(api_server: PoolServer):
     assert b"/watch/evidence" in page
     assert b"Evidence" in page
 
+    grant_ladder(base, lid, "nav_irreversible", "evidence nav")
     code, nav = _req(
         "POST",
         f"{base}/v1/leases/{lid}/navigate",
@@ -259,6 +261,7 @@ def test_task_done_clears_evidence_and_inflight_revalidate(api_server: PoolServe
     base = api_server.base_url
     lid = _lease(base, space="ev-clear")
     token = _watch_token(base, lid)
+    grant_ladder(base, lid, "nav_irreversible", "evidence clear nav")
     code, nav = _req(
         "POST",
         f"{base}/v1/leases/{lid}/navigate",

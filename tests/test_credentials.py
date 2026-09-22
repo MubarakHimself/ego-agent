@@ -15,6 +15,7 @@ from slipstream.api import PoolServer
 from slipstream.cdp_inject import MockCdpInjector
 from slipstream.config import PoolConfig
 from slipstream.cli import _validate_api_request_url
+from tests.conftest import grant_ladder
 from slipstream.pool import BrowserPool
 from slipstream.vault import (
     CredNotFoundError,
@@ -142,6 +143,7 @@ def test_http_bind_list_fill_unbind(api_server: PoolServer):
     assert code == 200
     lid = lease["lease_id"]
 
+    grant_ladder(base, lid, "fill", "fill login fields")
     code, fill = _req(
         "POST",
         f"{base}/v1/leases/{lid}/credentials/fill",
@@ -186,9 +188,19 @@ def test_fill_unknown_cred_404(api_server: PoolServer):
         "POST", f"{base}/v1/leases", {"agent_id": "a", "space_id": "sx"}
     )
     assert code == 200
+    lid = lease["lease_id"]
+    # Ladder refuses before vault when no confirm
     code, err = _req(
         "POST",
-        f"{base}/v1/leases/{lease['lease_id']}/credentials/fill",
+        f"{base}/v1/leases/{lid}/credentials/fill",
+        {"cred_id": "cred_missing", "fields": {"username": "#u"}},
+    )
+    assert code == 403
+    assert err["error"] == "confirmation_required"
+    grant_ladder(base, lid, "fill", "attempt missing cred")
+    code, err = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/credentials/fill",
         {"cred_id": "cred_missing", "fields": {"username": "#u"}},
     )
     assert code == 404
@@ -246,6 +258,7 @@ def test_cli_cred_bind_list_fill(api_server: PoolServer):
     )
     assert code == 0, err
     lease = json.loads(out)
+    grant_ladder(base, lease["lease_id"], "fill", "cli fill")
 
     fields = json.dumps({"username": "#u", "password": "#p"})
     code, out, err = run(
@@ -385,6 +398,7 @@ def test_fill_origin_mismatch_400(api_server: PoolServer):
     )
     assert code == 200
     inj.current_url = "https://evil.example/phishing"
+    grant_ladder(base, lease["lease_id"], "fill", "origin mismatch attempt")
     code, err = _req(
         "POST",
         f"{base}/v1/leases/{lease['lease_id']}/credentials/fill",

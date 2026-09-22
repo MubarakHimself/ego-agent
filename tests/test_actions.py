@@ -75,9 +75,9 @@ def _lease(base: str, space: str = "act-space") -> str:
     return lease["lease_id"]
 
 
-def test_categories_are_four():
+def test_categories_are_five():
     assert CATEGORIES == frozenset(
-        {"eval", "download", "upload", "nav_irreversible"}
+        {"fill", "eval", "download", "upload", "nav_irreversible"}
     )
 
 

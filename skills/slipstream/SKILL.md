@@ -145,23 +145,29 @@ curl -s "$SLIPSTREAM_URL/healthz"
 (`SLIPSTREAM_URL` defaults to `http://127.0.0.1:8755` if unset.)
 
 
-## Permission ladder (confirm-actions)
+## Permission ladder (confirm-actions — server-enforced)
 
-Before irreversible CDP acts, call `slipstream act`. Soft browse (snapshot /
-click / scroll / wait) stays free. Gated categories:
+Before irreversible CDP acts, call `slipstream act`, wait for captain
+`confirm`, then call the CDP endpoint. Soft browse (snapshot / click /
+scroll / wait) stays free. Gated categories:
 
-- `eval` — script / `Runtime.evaluate`
+- `fill` — credentials fill (`cred fill`)
+- `eval` — script / `Runtime.evaluate` (`slipstream eval`)
 - `download` — file download
 - `upload` — file upload / set file input
-- `nav_irreversible` — destructive navigation / POST forms
+- `nav_irreversible` — all pool navigates (`slipstream navigate`)
 
 ```bash
 slipstream act --lease-id "$LEASE_ID" --category eval --summary "probe document.title"
 # → JSON status=confirmation_required + confirm_id; agent pauses
 #   (sibling need_human on alerts bus → Watch / Take-over URL)
 
-slipstream confirm c_…     # allow once; agent resumes
-slipstream deny c_…        # fail closed; agent resumes with error
+slipstream confirm c_…     # allow once; grants one-shot CDP allowance
+slipstream deny c_…        # fail closed; no allowance
+
+# After confirm, the matching CDP path may run once:
+slipstream eval --lease-id "$LEASE_ID" --expression "document.title"
+# Second eval without a fresh confirm → 403 confirmation_required
 ```
 
 Pending confirmations **auto-deny after ~60s** (`SLIPSTREAM_CONFIRM_TTL`).
@@ -170,11 +176,12 @@ Pending confirmations **auto-deny after ~60s** (`SLIPSTREAM_CONFIRM_TTL`).
 Never put secrets/cookies/passwords in `--summary` (scrub also redacts
 `jwt=` / `access_key=` / `private_key=` / `api_key=` / `passwd=`).
 
-**Honor-system (ADV-PL-001):** `act` is an advisory pause — CDP fill/eval/nav
-are **not** server-enforced by the ladder yet. Prefer always calling `act`
-before irreversible work. Domain allowlist on `navigate` **is** enforced when set.
+**Server-enforced (ADV-PL-001):** pool **refuses** fill / eval / navigate without
+a prior confirm for that category (403 `confirmation_required`, no CDP
+side-effect). Confirm is one-shot then re-gate. Domain allowlist on navigate
+still applies when set.
 
-Defer: once/always/never policy matrix, full server-enforced ladder, Comet UI.
+Defer: once/always/never policy matrix, Comet UI.
 
 ## Domain allowlist (top-frame)
 
@@ -550,7 +557,7 @@ slipstream uploads   list|put …
 - Compose `/watch` remains upstream (see **Compose /watch**; doctor WARN if
   missing). Alerts, credential vault/fill, confirm-actions, domain allowlist
   navigate, and content-boundary helpers **are** on the CLI/HTTP surface.
-  Once-always-never / full server-enforced ladder
+  Once-always-never domain modes
   are **later**.
 
 ## Examples

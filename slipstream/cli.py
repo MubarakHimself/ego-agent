@@ -456,7 +456,7 @@ def cmd_act(
     url: str | None = None,
     confirm_interactive: bool = False,
 ) -> int:
-    """POST /v1/leases/{id}/actions — gate eval|download|upload|nav_irreversible.
+    """POST /v1/leases/{id}/actions — gate fill|eval|download|upload|nav_irreversible.
 
     On confirmation_required (HTTP 202): print JSON and exit 0 (orchestrator
     mode). With --confirm-interactive: prompt on TTY; Non-TTY → auto-deny.
@@ -570,7 +570,7 @@ def cmd_navigate(
     page_url: str,
     url: str | None = None,
 ) -> int:
-    """POST /v1/leases/{id}/navigate — top-frame nav; refused outside allowlist."""
+    """POST /v1/leases/{id}/navigate — top-frame nav; ladder + domain allowlist."""
     base = resolve_base_url(url)
     status, payload = _request(
         "POST",
@@ -578,7 +578,10 @@ def cmd_navigate(
         {"url": page_url},
     )
     if status == 403:
+        err = payload.get("error") if isinstance(payload, dict) else None
         detail = payload.get("detail") if isinstance(payload, dict) else payload
+        if err == "confirmation_required":
+            raise CliError(f"confirmation_required: {detail}", exit_code=3)
         raise CliError(f"domain_not_allowed: {detail}", exit_code=3)
     if status != 200:
         _fail_http(status, payload)
@@ -590,6 +593,28 @@ def cmd_navigate(
         if "title" in payload and isinstance(payload["title"], str):
             payload = dict(payload)
             payload["title"] = wrap_page_content(payload["title"], origin=origin)
+    _print_json(payload)
+    return 0
+
+
+def cmd_evaluate(
+    *,
+    lease_id: str,
+    expression: str,
+    url: str | None = None,
+) -> int:
+    """POST /v1/leases/{id}/eval — Runtime.evaluate; requires prior eval confirm."""
+    base = resolve_base_url(url)
+    status, payload = _request(
+        "POST",
+        f"{base}{_PATH_LEASES}{lease_id}/eval",
+        {"expression": expression},
+    )
+    if status == 403:
+        detail = payload.get("detail") if isinstance(payload, dict) else payload
+        raise CliError(f"confirmation_required: {detail}", exit_code=3)
+    if status != 200:
+        _fail_http(status, payload)
     _print_json(payload)
     return 0
 

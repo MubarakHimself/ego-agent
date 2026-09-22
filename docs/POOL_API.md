@@ -204,17 +204,18 @@ Thin evidence-first Watch side panel (no video):
 - Annotations are scrubbed (never cookies / passwords / tokens / vault / CDP). Env: `SLIPSTREAM_EVIDENCE_AUTO` (kinds or `0`), `SLIPSTREAM_EVIDENCE_MAX` (default 32)
 
 
-### Permission ladder (confirm-actions v1)
+### Permission ladder (confirm-actions — server-enforced)
 
-Gate irreversible/sensitive acts **before** the agent proceeds with CDP. Soft browse
+Gate irreversible/sensitive acts **before** CDP. Soft browse
 (snapshot / click / scroll / wait) stays free. Categories:
 
-| Category | Intent |
-|----------|--------|
-| `eval` | `Runtime.evaluate` / script inject |
-| `download` | file download |
-| `upload` | file upload / `DOM.setFileInputFiles` |
-| `nav_irreversible` | open/back/forward/reload that leave allowlist or POST/destructive forms |
+| Category | Intent | CDP enforcement |
+|----------|--------|-----------------|
+| `fill` | credentials fill (`POST …/credentials/fill`) | **refused** without prior confirm |
+| `eval` | `Runtime.evaluate` / script (`POST …/eval`) | **refused** without prior confirm |
+| `download` | file download | act/confirm (artifact paths separately gated) |
+| `upload` | file upload / `DOM.setFileInputFiles` | act/confirm (upload drop separately gated) |
+| `nav_irreversible` | all pool `POST …/navigate` (top-frame) | **refused** without prior confirm |
 
 ```http
 POST /v1/leases/{lease_id}/actions
@@ -252,13 +253,21 @@ CLI convenience (same resolve): `POST /v1/confirmations/{confirm_id}` with `{act
 **Non-TTY:** `slipstream act … --confirm-interactive` auto-denies when stdin is not a TTY.
 **Secrets:** reuse alerts denylist/scrub (incl. `jwt=` / `access_key=` / `private_key=` / `api_key=` / `passwd=` — ADV-PL-002) — never put passwords/cookies/tokens in `summary`.
 
-**Honor-system (ADV-PL-001):** permission-ladder v1 is **advisory**. `POST /actions` pauses the agent and emits `need_human`, but **CDP fill / eval / nav are not server-enforced** by this ladder yet — a client that skips `act` and talks to CDP directly is not blocked. Server-enforced ladder = later track. (Domain allowlist on `POST …/navigate` **is** enforced at the pool gate when set.)
+**Server-enforced (ADV-PL-001):** `POST /actions` → captain `confirm` grants a **one-shot** allowance for that category on the lease. Pool CDP helpers for **fill / eval / navigate** consume that allowance or return **403** `confirmation_required` with **no CDP side-effect**. A second gated act without a fresh confirm is refused (re-gate). Deny / TTL expiry stay fail-closed (no allowance). Soft browse remains free. Domain allowlist on navigate still applies when set.
 
-**Defer:** once/always/never policy matrix, Comet UI, full server-enforced ladder.
+```http
+POST /v1/leases/{id}/credentials/fill   # needs fill confirm
+POST /v1/leases/{id}/eval {"expression":"document.title"}  # needs eval confirm
+POST /v1/leases/{id}/navigate {"url":"https://…"}  # needs nav_irreversible confirm
+→ 403 {"error":"confirmation_required","category":"fill|eval|nav_irreversible",…}
+```
+
+**Defer:** once/always/never policy matrix, Comet UI.
 
 CLI:
 
 ```bash
+slipstream act --lease-id "$L" --category fill --summary "fill login form"
 slipstream act --lease-id "$L" --category eval --summary "probe title"
 # → confirmation_required JSON (exit 0); then:
 slipstream confirm c_…
