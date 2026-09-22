@@ -109,6 +109,8 @@ class ChromiumLauncher:
         args = [
             self._binary,
             f"--remote-debugging-port={cdp_port}",
+            # Required for pool-side CDP WebSocket (Watch screenshot, cred fill).
+            "--remote-allow-origins=*",
             f"--user-data-dir={user_data}",
             "--no-first-run",
             "--no-default-browser-check",

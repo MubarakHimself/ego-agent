@@ -168,14 +168,28 @@ def reject_secret_fields(obj: Any, *, path: str = "") -> None:
             reject_secret_fields(item, path=f"{path}[{i}]")
 
 
-def default_watch_url(lease_id: str, *, base_url: str = "http://127.0.0.1:8755") -> str:
-    """Local placeholder Watch URL until live pair-browse UI ships."""
-    return f"{base_url.rstrip('/')}/v1/leases/{lease_id}/watch"
+def default_watch_url(
+    lease_id: str,
+    *,
+    token: str,
+    base_url: str = "http://127.0.0.1:8755",
+) -> str:
+    """Short-TTL tokenized Watch URL (observe-only JPEG/HTML stream)."""
+    from slipstream.watch import build_watch_url
+
+    return build_watch_url(lease_id, token, base_url=base_url)
 
 
-def default_takeover_url(lease_id: str, *, base_url: str = "http://127.0.0.1:8755") -> str:
-    """Local placeholder Take-over URL (observe → interactive later)."""
-    return f"{base_url.rstrip('/')}/v1/leases/{lease_id}/watch?mode=takeover"
+def default_takeover_url(
+    lease_id: str,
+    *,
+    token: str,
+    base_url: str = "http://127.0.0.1:8755",
+) -> str:
+    """Take-over URL = same watch stream with confirm-pause UI (not pair-browse)."""
+    from slipstream.watch import build_takeover_url
+
+    return build_takeover_url(lease_id, token, base_url=base_url)
 
 
 def format_captain_one_liner(
@@ -300,10 +314,21 @@ def build_alert_payload(
     base_url: str = "http://127.0.0.1:8755",
     event_id: str | None = None,
     ts: str | None = None,
+    watch_token: str | None = None,
 ) -> dict[str, Any]:
-    """Assemble the public alert payload (never includes secrets)."""
+    """Assemble the public alert payload (never includes secrets).
+
+    ``watch_token`` is required for need_human (minted by the pool); omitted from
+    the JSON body — only embedded in server-derived ``watch_url``.
+    """
     event = parsed["event"]
-    watch = default_watch_url(lease_id, base_url=base_url)
+    if event == EVENT_NEED_HUMAN:
+        if not watch_token:
+            raise AlertValidationError("watch_token required for need_human")
+        watch = default_watch_url(lease_id, token=watch_token, base_url=base_url)
+    else:
+        # task_done: no live watch (revoked); keep a non-token path for shape stability
+        watch = f"{base_url.rstrip('/')}/v1/leases/{lease_id}/watch"
     if event == EVENT_NEED_HUMAN:
         status = "awaiting_human"
         outcome = None
