@@ -14,6 +14,7 @@ from slipstream.activity_feed import (
     safe_url_summary,
     scrub_feed_detail,
 )
+from slipstream.alerts import key_looks_secret
 from slipstream.api import PoolServer
 from slipstream.boundaries import (
     reset_boundary_nonce_for_tests,
@@ -202,3 +203,71 @@ def test_activity_feed_on_watch(api_server: PoolServer):
     assert code == 200
     code, bad = _req("GET", f"{base}/v1/leases/{lid2}/watch/events?token=wrong")
     assert code == 401
+
+def test_adv_feed_001_key_echo_uses_key_len_allowlist(api_server: PoolServer):
+    """ADV-FEED-001: printable key names must not appear in feed (reconstruct 'sekrit')."""
+    base = api_server.base_url
+    lid = _lease(base, space="af-feed001")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "login", "detail": "please", "ttl_s": 120},
+    )
+    assert code == 200, env
+    watch = env["alert"]["watch_url"]
+    token = _token_from_watch_url(watch)
+    code, conf = _req(
+        "POST", f"{base}/v1/leases/{lid}/watch/confirm?token={token}", {}
+    )
+    assert code == 200, conf
+    for ch in "sekrit":
+        code, inp = _req(
+            "POST",
+            f"{base}/v1/leases/{lid}/watch/input?token={token}",
+            {"kind": "key", "key": ch, "code": f"Key{ch.upper()}", "type": "keyDown"},
+        )
+        assert code == 200, inp
+    # Allowlisted navigation key may appear by name.
+    code, inp = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/input?token={token}",
+        {"kind": "key", "key": "Enter", "code": "Enter", "type": "keyDown"},
+    )
+    assert code == 200, inp
+    code, feed = _req("GET", f"{base}/v1/leases/{lid}/watch/events?token={token}")
+    assert code == 200, feed
+    blob = json.dumps(feed)
+    assert "sekrit" not in blob
+    for ch in "sekrit":
+        # summary must not be "key s" / "key e" …
+        assert f'"summary": "key {ch}"' not in blob
+    type_ev = [e for e in feed["events"] if e["kind"] == "type"]
+    assert type_ev
+    # last printable key event: summary "key", detail key_len=1
+    printable = [e for e in type_ev if e["summary"] == "key"]
+    assert printable
+    assert printable[-1]["detail"].get("key_len") == 1
+    enter_ev = [e for e in type_ev if e["summary"] == "key Enter"]
+    assert enter_ev
+
+
+def test_adv_feed_003_scrub_aligns_alerts_and_list_values():
+    """ADV-FEED-003: alerts denylist + scrub list string values."""
+    assert key_looks_secret("accessToken")
+    assert key_looks_secret("client_secret")
+    out = scrub_feed_detail(
+        {
+            "accessToken": "leak",
+            "client_secret": "x",
+            "fields": ["user", "password=hunter2", "ok"],
+            "text_len": 3,
+        }
+    )
+    assert "accessToken" not in out
+    assert "client_secret" not in out
+    assert out.get("text_len") == 3
+    fields = out.get("fields") or []
+    assert fields[0] == "user"
+    assert "hunter2" not in fields[1]
+    assert "[REDACTED]" in fields[1] or "password" in fields[1].lower()
+

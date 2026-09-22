@@ -181,6 +181,14 @@ def _key_segments(key: str) -> list[str]:
     return [seg for seg in re.split(r"[_.\-]", lowered) if seg]
 
 
+def key_looks_secret(key: str) -> bool:
+    """True if key looks secret-bearing (exact / token-boundary; not bare substring).
+
+    Public alias used by activity-feed scrub (ADV-FEED-003) so denylists stay aligned.
+    """
+    return _key_forbidden(key)
+
+
 def _key_forbidden(key: str) -> bool:
     """True if key looks secret-bearing (exact / token-boundary; not bare substring)."""
     if _FORBIDDEN_KEY_RE.match(key):
