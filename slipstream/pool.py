@@ -1402,7 +1402,7 @@ class BrowserPool:
             raise DomainAllowlistError("lease has no cdp_http_url")
         from slipstream.cdp_http import navigate_via_json_new
 
-        result = navigate_via_json_new(cdp_http, url)
+        result = navigate_via_json_new(cdp_http, url, allowed_domains=patterns)
         return {
             "ok": bool(result.get("matched")),
             "url": url,
@@ -1454,9 +1454,16 @@ class BrowserPool:
                     lease.user_metadata = effective_metadata(
                         space_meta, lease.user_metadata_override
                     )
-                    lease.allowed_domains = self._effective_domains_for(
-                        space_id, lease.allowed_domains_override
-                    )
+                    try:
+                        lease.allowed_domains = self._effective_domains_for(
+                            space_id, lease.allowed_domains_override
+                        )
+                    except DomainAllowlistError:
+                        # Space tightened past lease override — drop override, inherit.
+                        lease.allowed_domains_override = None
+                        lease.allowed_domains = self._effective_domains_for(
+                            space_id, None
+                        )
             out: dict[str, Any] = {
                 "space_id": space_id,
                 "user_metadata": dict(self._space_metadata.get(space_id, {})),

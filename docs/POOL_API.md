@@ -23,7 +23,7 @@ MVP is always **isolated** mode (one process tree per Space). There is no `mode`
 | `cdp_base_port` | 9222 | Slot *i* uses port `9222 + i` |
 | `host` / `port` | `127.0.0.1` / `8755` | API bind |
 
-Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm seconds, default 60), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers).
+Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm seconds, default 60), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted unless Space/lease lockdown applies), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers).
 
 ## Endpoints
 
@@ -235,9 +235,11 @@ slipstream act --lease-id "$L" --category eval --summary "…" --confirm-interac
 
 Pattern-steal Browserbase `allowedDomains` / agent-browser domain allowlist.
 
-When an allowlist is set, **top-frame** `http(s)` navigations outside the list are **refused** (`403 domain_not_allowed`). **Empty allowlist = unrestricted.**
+When an allowlist is set, **top-frame** navigations outside the list are **refused** (`403 domain_not_allowed`). **No allowlist configured anywhere = unrestricted.**
 
-Sources (first set wins): lease `allowed_domains` → Space `allowed_domains` → `SLIPSTREAM_ALLOWED_DOMAINS` / pool config.
+Sources (narrowing only): effective = **Space ∩ config**, then lease may only **narrow** further. Lease `allowed_domains=[]` **inherits** parent (does **not** clear Space/config lockdown). Lease patterns outside Space∩config are **rejected** (`400 invalid_allowed_domains`).
+
+When allowlist is active: only `http`/`https` with a host; `file:` / `javascript:` / `data:` / scheme-relative `//…` refused. Backslash / `%5C` in authority and userinfo are refused (parser differential).
 
 ```http
 PUT /v1/spaces/{space_id}
@@ -252,7 +254,7 @@ POST /v1/leases/{lease_id}/navigate
 → 403 {"error":"domain_not_allowed","host":"evil.example",…}
 ```
 
-Patterns: bare `example.com` matches itself + subdomains (Browserbase-style); `*.example.com` matches bare + subdomains. Non-`http(s)` (`about:blank`, `chrome://`, …) are not gated.
+Patterns: bare `example.com` matches itself + subdomains (Browserbase-style); `*.example.com` matches bare + subdomains. Non-`http(s)` schemes are **not** allowed when an allowlist is active (fail-closed).
 
 **v1 limitation (like BB experimental):** iframe / subframe loads and subresource requests (scripts, XHR, images) are **not** blocked. WebRTC/UDP containment deferred.
 
