@@ -28,6 +28,11 @@ Endpoints:
   GET    /v1/leases/{id}/watch
   GET    /v1/leases/{id}/watch/frame
   GET    /v1/leases/{id}/watch/events
+  GET    /v1/leases/{id}/downloads
+  GET    /v1/leases/{id}/downloads/{artifact_id}
+  GET    /v1/leases/{id}/uploads
+  GET    /v1/leases/{id}/uploads/{artifact_id}
+  POST   /v1/leases/{id}/uploads
   DELETE /v1/leases/{id}
   GET    /v1/pool/status
   GET    /healthz
@@ -65,6 +70,13 @@ from slipstream.pool import (
     PoolFullError,
     SpaceInUseError,
 )
+from slipstream.downloads import (
+    KIND_DOWNLOADS,
+    KIND_UPLOADS,
+    ArtifactNotFoundError,
+    DownloadForbiddenError,
+    DownloadValidationError,
+)
 from slipstream.vault import CredNotFoundError, VaultUnavailableError, VaultValidationError
 from slipstream.metadata import MetadataValidationError
 from slipstream.signed_in import SignedInValidationError
@@ -79,6 +91,8 @@ _PART_LEASES = "leases"
 _PART_SPACES = "spaces"
 _PART_WATCH = "watch"
 _PART_CREDENTIALS = "credentials"
+_PART_DOWNLOADS = "downloads"
+_PART_UPLOADS = "uploads"
 _ERR_NOT_FOUND = "not_found"
 _ERR_LEASE_NOT_FOUND = "lease_not_found"
 _ERR_BAD_REQUEST = "bad_request"
@@ -87,6 +101,8 @@ _ERR_INVALID_ACTION = "invalid_action"
 _ERR_INVALID_CREDENTIALS = "invalid_credentials"
 _ERR_INVALID_SIGNED_IN = "invalid_signed_in"
 _ERR_ALERT_CONFLICT = "alert_conflict"
+_ERR_FORBIDDEN = "forbidden"
+_QS_AGENT_ID = "agent_id"
 _QS_WATCH_AUTH = "token"  # skylos: ignore[SKY-L014,SKY-L032] query param name, not a secret
 _FIELD_ALLOWED_DOMAINS = "allowed_domains"
 _FIELD_USER_METADATA = "user_metadata"
@@ -241,7 +257,7 @@ def _watch_error(handler: BaseHTTPRequestHandler, exc: Exception) -> bool:
         return True
     if isinstance(exc, WatchForbiddenError):
         _json_response(
-            handler, 403, {"error": "forbidden", "detail": str(exc.detail)}
+            handler, 403, {"error": _ERR_FORBIDDEN, "detail": str(exc.detail)}
         )
         return True
     if isinstance(exc, WatchInputError):
@@ -414,6 +430,10 @@ def make_handler(pool: BrowserPool):
                 return
 
 
+
+            if _handle_lease_artifacts_get(self, pool, parts):
+                return
+
             _json_response(self, 404, {"error": _ERR_NOT_FOUND, "path": path})
 
         def do_POST(self) -> None:  # noqa: N802
@@ -510,7 +530,7 @@ def make_handler(pool: BrowserPool):
                 return
 
             if path == "/v1/leases":
-                agent_id = body.get("agent_id")
+                agent_id = body.get(_QS_AGENT_ID)
                 space_id = body.get("space_id")
                 if not agent_id or not space_id:
                     _json_response(self, 400, {"error": "agent_id and space_id required"})
@@ -623,6 +643,24 @@ def make_handler(pool: BrowserPool):
                         self,
                         404,
                         {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id},
+                    )
+                return
+
+
+            # POST /v1/leases/{lease_id}/uploads — thin upload drop
+            lease_id = _v1_lease_tail(parts, _PART_UPLOADS)
+            if lease_id is not None:
+                agent_id = body.get(_QS_AGENT_ID) if isinstance(body, dict) else None
+                try:
+                    result = pool.put_upload(lease_id, body, agent_id=agent_id)
+                    _json_response(self, 201, result)
+                except DownloadForbiddenError as e:
+                    _json_response(self, 403, {"error": _ERR_FORBIDDEN, "detail": str(e)})
+                except DownloadValidationError as e:
+                    _json_response(self, 400, {"error": "invalid_upload", "detail": str(e)})
+                except LeaseNotFoundError:
+                    _json_response(
+                        self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id}
                     )
                 return
 
@@ -770,7 +808,7 @@ def make_handler(pool: BrowserPool):
             space_id = _v1_space_tail(parts, "login-once")
             if space_id is not None:
                 try:
-                    agent_id = body.get("agent_id") if isinstance(body, dict) else None
+                    agent_id = body.get(_QS_AGENT_ID) if isinstance(body, dict) else None
                     if not agent_id:
                         _json_response(
                             self,
@@ -943,6 +981,63 @@ def make_handler(pool: BrowserPool):
             _json_response(self, 404, {"error": _ERR_NOT_FOUND, "path": path})
 
     return PoolHandler
+
+
+
+def _handle_lease_artifacts_get(handler, pool, parts) -> bool:
+    """GET downloads|uploads list/get. Return True if path handled."""
+    if not (
+        len(parts) in (4, 5)
+        and parts[0] == _PART_V1
+        and parts[1] == _PART_LEASES
+        and parts[3] in (_PART_DOWNLOADS, _PART_UPLOADS)
+    ):
+        return False
+    lease_id = parts[2]
+    kind = parts[3]
+    qs = parse_qs(urlparse(handler.path).query)
+    agent_id = (qs.get(_QS_AGENT_ID) or [None])[0]
+    rel = (qs.get("rel_path") or ["0"])[0] in ("1", "true", "yes")
+    try:
+        if len(parts) == 4:
+            result = pool.list_lease_artifacts(
+                lease_id, kind, agent_id=agent_id, include_rel_path=rel
+            )
+            _json_response(handler, 200, result)
+            return True
+        meta, raw = pool.get_lease_artifact(
+            lease_id, parts[4], kind, agent_id=agent_id, include_rel_path=rel
+        )
+    except ArtifactNotFoundError:
+        aid = parts[4] if len(parts) == 5 else None
+        _json_response(handler, 404, {"error": "artifact_not_found", "artifact_id": aid})
+        return True
+    except DownloadForbiddenError as e:
+        _json_response(handler, 403, {"error": _ERR_FORBIDDEN, "detail": str(e)})
+        return True
+    except DownloadValidationError as e:
+        err = "invalid_download" if kind == KIND_DOWNLOADS else "invalid_upload"
+        _json_response(handler, 400, {"error": err, "detail": str(e)})
+        return True
+    except LeaseNotFoundError:
+        _json_response(handler, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id})
+        return True
+    accept = (handler.headers.get("Accept") or "").lower()
+    key = "download" if kind == KIND_DOWNLOADS else "upload"
+    if "application/json" in accept and "octet" not in accept:
+        _json_response(handler, 200, {"lease_id": lease_id, key: meta})
+    else:
+        _bytes_response(
+            handler,
+            200,
+            raw,
+            "application/octet-stream",
+            extra_headers={
+                "Content-Disposition": f'attachment; filename="{meta["filename"]}"',
+                "X-Slipstream-Sha256": meta["sha256"],
+            },
+        )
+    return True
 
 
 class PoolServer:

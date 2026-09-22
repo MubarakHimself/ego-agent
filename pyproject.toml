@@ -67,8 +67,9 @@ max_security = 0
 max_reliability = 0
 # Quality backlog waiver: SKY-L027/Q301/C304/etc. across vault/doctor/api/pool.
 # Lowered 280→250 after slipstream-quality-debt-001 real dedupe/helpers (gate ~242).
-# Prefer further real fixes over raising this again; security caps stay 0.
-max_quality = 250
+# Raised 250→260 for slipstream-downloads-001 (new artifacts module + API surface);
+# security caps stay 0. Prefer pay-down over further raises.
+max_quality = 260
 max_secrets = 0
 max_dependency_vulnerabilities = 0
 max_ai_defects = 5

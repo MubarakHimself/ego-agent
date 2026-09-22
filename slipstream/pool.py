@@ -32,6 +32,21 @@ from slipstream.captcha import (
     mark_escalated,
     parse_captcha_request,
 )
+_ERR_BODY_MUST_JSON = "body must be a JSON object"
+
+from slipstream.downloads import (
+    KIND_DOWNLOADS,
+    KIND_UPLOADS,
+    DownloadForbiddenError,
+    DownloadValidationError,
+    MockDownloadRecorder,
+    configure_chrome_download_behavior,
+    ensure_lease_artifact_dirs,
+    list_artifacts,
+    read_artifact,
+    write_upload,
+)
+
 
 # ADV-FEED-001: key names safe to echo in feed summary (non-printable secret path).
 _FEED_SAFE_KEY_NAMES = frozenset(
@@ -186,6 +201,9 @@ class BrowserPool:
         self._activity_feeds: dict[str, LeaseActivityFeed] = {}
         # CAPTCHA chip state (ui-peers §5.11); cleared on lease detach.
         self._captcha: dict[str, CaptchaState] = {}
+        # Lease-scoped download/upload dirs + mock CDP recorder.
+        self._download_recorder = MockDownloadRecorder()
+        self.config.artifacts_root.mkdir(parents=True, exist_ok=True)
         self._api_base_url: str = f"http://{self.config.host}:{self.config.port}"
         # Ensure spaces root exists
         self.config.spaces_root.mkdir(parents=True, exist_ok=True)
@@ -220,6 +238,7 @@ class BrowserPool:
                 "mock": self.config.mock,
                 "spaces_root": str(self.config.spaces_root),
                 "vault_root": str(self.config.vault_root),
+                "artifacts_root": str(self.config.artifacts_root),
                 "cdp_base_port": self.config.cdp_base_port,
                 "chrome_binary": self.launcher.binary,
                 "slots": [s.to_dict() for s in self._slots],
@@ -445,6 +464,7 @@ class BrowserPool:
             user_metadata=user_metadata,
             allowed_domains=allowed_domains,
         )
+        self._prepare_lease_downloads(result["lease_id"], handle.cdp_http_url)
         slot.chromium_pid = handle.pid
         slot.cdp_port = handle.cdp_port
         slot.cdp_http_url = handle.cdp_http_url
@@ -557,6 +577,9 @@ class BrowserPool:
                                 cdp_ws_url=matching_warm.cdp_ws_url,
                                 user_metadata=meta_override,
                                 allowed_domains=domains_override,
+                            )
+                            self._prepare_lease_downloads(
+                                early_result["lease_id"], matching_warm.cdp_http_url
                             )
                         else:
                             port, h = self._reserve_starting_locked(
@@ -716,7 +739,7 @@ class BrowserPool:
         """Bind a secret to space_id. Response never echoes secret."""
         safe = PoolConfig.normalize_space_id(space_id)
         if not isinstance(body, dict):
-            raise VaultValidationError("body must be a JSON object")
+            raise VaultValidationError(_ERR_BODY_MUST_JSON)
         return self.vault.bind(
             safe,
             label=body.get("label"),
@@ -952,6 +975,95 @@ class BrowserPool:
             self._escalate_captcha_timeout_if_needed(lease_id)
         except (LeaseNotFoundError, AlertConflictError):
             pass
+
+    def _prepare_lease_downloads(self, lease_id: str, cdp_http_url: str | None) -> None:
+        """Create lease artifact dirs; configure Chrome download path (or mock)."""
+        dirs = ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)
+        if not cdp_http_url:
+            return
+        try:
+            configure_chrome_download_behavior(
+                cdp_http_url,
+                dirs[KIND_DOWNLOADS],
+                mock=self.config.mock,
+                recorder=self._download_recorder if self.config.mock else None,
+            )
+        except Exception:
+            if self.config.mock:
+                raise
+
+    def _require_lease_agent(self, lease_id: str, agent_id: str | None):
+        lease = self._require_leased(lease_id)
+        if agent_id is not None and agent_id != lease.agent_id:
+            raise DownloadForbiddenError("agent_id does not own this lease")
+        return lease
+
+    def list_lease_artifacts(
+        self,
+        lease_id: str,
+        kind: str,
+        *,
+        agent_id: str | None = None,
+        include_rel_path: bool = False,
+    ) -> dict[str, Any]:
+        self._require_lease_agent(lease_id, agent_id)
+        if kind not in (KIND_DOWNLOADS, KIND_UPLOADS):
+            raise DownloadValidationError("invalid artifact kind")
+        d = ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)[kind]
+        items = list_artifacts(d, kind=kind, include_rel_path=include_rel_path)
+        key = KIND_DOWNLOADS if kind == KIND_DOWNLOADS else KIND_UPLOADS
+        return {"lease_id": lease_id, key: items, "total": len(items)}
+
+    def get_lease_artifact(
+        self,
+        lease_id: str,
+        artifact_id: str,
+        kind: str,
+        *,
+        agent_id: str | None = None,
+        include_rel_path: bool = False,
+    ) -> tuple[dict[str, Any], bytes]:
+        self._require_lease_agent(lease_id, agent_id)
+        if kind not in (KIND_DOWNLOADS, KIND_UPLOADS):
+            raise DownloadValidationError("invalid artifact kind")
+        d = ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)[kind]
+        return read_artifact(
+            d, artifact_id, kind=kind, include_rel_path=include_rel_path
+        )
+
+    def put_upload(
+        self,
+        lease_id: str,
+        body: dict[str, Any],
+        *,
+        agent_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Thin upload drop — JSON filename + content_b64 (size-capped)."""
+        import base64
+
+        self._require_lease_agent(lease_id, agent_id)
+        if not isinstance(body, dict):
+            raise DownloadValidationError(_ERR_BODY_MUST_JSON)
+        b64 = body.get("content_b64")
+        if not isinstance(b64, str) or not b64.strip():
+            raise DownloadValidationError("content_b64 required")
+        try:
+            data = base64.b64decode(b64, validate=True)
+        except Exception as e:
+            raise DownloadValidationError("content_b64 invalid") from e
+        d = ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)[KIND_UPLOADS]
+        meta = write_upload(d, filename=body.get("filename"), data=data)
+        return {"lease_id": lease_id, "upload": meta}
+
+    def record_mock_download(
+        self, lease_id: str, filename: str, content: bytes
+    ) -> dict[str, Any]:
+        """Test helper — drop a file into the lease downloads dir (mock only)."""
+        if not self.config.mock:
+            raise DownloadValidationError("record_mock_download requires mock")
+        self._require_leased(lease_id)
+        d = ensure_lease_artifact_dirs(self.config.artifacts_root, lease_id)[KIND_DOWNLOADS]
+        return write_upload(d, filename=filename, data=content, kind=KIND_DOWNLOADS)
 
     def report_captcha(self, lease_id: str, body: dict[str, Any]) -> dict[str, Any]:
         """Client/stub CAPTCHA lifecycle → activity feed + optional need_human.
@@ -1762,7 +1874,7 @@ class BrowserPool:
         Empty effective allowlist = unrestricted. iframe/subresource not gated (v1).
         """
         if not isinstance(body, dict):
-            raise DomainAllowlistError("body must be a JSON object")
+            raise DomainAllowlistError(_ERR_BODY_MUST_JSON)
         url = body.get("url")
         if not isinstance(url, str) or not url.strip():
             raise DomainAllowlistError("url must be a non-empty string")

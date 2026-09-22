@@ -20,6 +20,8 @@ class PoolConfig:
     lease_hard_ttl_seconds: int = 1800
     spaces_root: Path = field(default_factory=lambda: Path("./data/spaces"))
     vault_root: Path = field(default_factory=lambda: Path("./data/vault"))
+    # Lease session artifacts (downloads/uploads) — outside spaces + vault.
+    artifacts_root: Path = field(default_factory=lambda: Path("./data/artifacts"))
     cdp_base_port: int = 9222
     host: str = "127.0.0.1"
     port: int = 8755
@@ -71,11 +73,34 @@ class PoolConfig:
         try:
             vault.relative_to(spaces)
         except ValueError:
-            return  # vault is not under spaces — OK
-        raise ValueError(
-            f"vault_root must be outside spaces_root "
-            f"(vault={vault} is under spaces={spaces})"
+            pass  # vault is not under spaces — OK
+        else:
+            raise ValueError(
+                f"vault_root must be outside spaces_root "
+                f"(vault={vault} is under spaces={spaces})"
+            )
+        self.ensure_artifacts_outside()
+
+    def ensure_artifacts_outside(self) -> None:
+        """Fail closed if artifacts_root sits inside spaces or vault."""
+        from slipstream.downloads import ensure_artifacts_outside
+
+        ensure_artifacts_outside(
+            self.artifacts_root,
+            spaces_root=self.spaces_root,
+            vault_root=self.vault_root,
         )
+
+
+    def _apply_storage_roots_from_env(self) -> None:
+        """Apply SLIPSTREAM_* root path overrides from the environment."""
+        if root := os.environ.get("SLIPSTREAM_SPACES_ROOT"):
+            self.spaces_root = Path(root)
+        vault = os.environ.get("SLIPSTREAM_VAULT_ROOT") or os.environ.get("VAULT_ROOT")
+        if vault:
+            self.vault_root = Path(vault)
+        if art := os.environ.get("SLIPSTREAM_ARTIFACTS_ROOT"):
+            self.artifacts_root = Path(art)
 
     @classmethod
     def from_env(cls) -> PoolConfig:
@@ -86,12 +111,8 @@ class PoolConfig:
             cfg.headless = False
         if bin_path := os.environ.get("SLIPSTREAM_CHROME"):
             cfg.chrome_binary = bin_path
-        if root := os.environ.get("SLIPSTREAM_SPACES_ROOT"):
-            cfg.spaces_root = Path(root)
-        # Vault MUST stay outside Space user-data-dir
-        vault = os.environ.get("SLIPSTREAM_VAULT_ROOT") or os.environ.get("VAULT_ROOT")
-        if vault:
-            cfg.vault_root = Path(vault)
+        # Vault/artifacts MUST stay outside Space user-data-dir
+        cfg._apply_storage_roots_from_env()
         if k := os.environ.get("SLIPSTREAM_K"):
             cfg.K = int(k)
         if w := os.environ.get("SLIPSTREAM_W"):

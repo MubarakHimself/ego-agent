@@ -287,6 +287,23 @@ curl -sS -X POST "$SLIPSTREAM_URL/v1/leases/$LEASE_ID/captcha" \
 Timeout: `SLIPSTREAM_CAPTCHA_TIMEOUT` (default 60s) while `solving` → escalate on
 heartbeat / Watch. Secrets refused; captcha detail also scrubs unlabeled JWT-like tokens. Chip/banner HTML escapes dynamic fields. Late `failed` after `finished` does not escalate. No Monid / 2captcha / anti-captcha wiring.
 
+## Downloads / uploads (session artifacts)
+
+Lease-scoped files (Browserbase-style). Chrome downloads go to a pool-owned
+dir under `SLIPSTREAM_ARTIFACTS_ROOT` (outside Space + vault). List/fetch by
+artifact id — **no absolute paths** to the agent by default.
+
+```bash
+slipstream downloads list --lease-id "$LEASE_ID"
+slipstream downloads get --lease-id "$LEASE_ID" --artifact-id dl_… -o ./out.bin
+# thin upload drop
+slipstream uploads put --lease-id "$LEASE_ID" --filename drop.bin --file ./local.bin
+slipstream uploads list --lease-id "$LEASE_ID"
+```
+
+Optional `?agent_id=` ownership check. Symlink/path escape refused; secret
+filenames denylisted. No cloud storage in MVP.
+
 ## Alerts (need_human + task_done)
 
 Ship-now takeover / done signals on the lease HTTP spine. **Never** put cookies,
@@ -512,6 +529,8 @@ slipstream status  [--url URL]
 slipstream doctor  [--url URL] [--json]
 slipstream watch-status [--json]
 slipstream cred    bind|unbind|list|fill …
+slipstream downloads list|get …
+slipstream uploads   list|put …
 ```
 
 `python -m slipstream <subcommand> …` is equivalent to `slipstream …`.
@@ -522,8 +541,8 @@ slipstream cred    bind|unbind|list|fill …
 - No Monid / paid marketplace.
 - No MCP server (skill+CLI+HTTP only).
 - No free-read of Space cookies / credential dumps.
-- Simultaneous human+agent drive, pair-browse UI polish, downloads-as-session-artifacts
-  lock are **later**.
+- Simultaneous human+agent drive / pair-browse UI polish are **later**.
+  Downloads/uploads as session artifacts **are** on the CLI/HTTP surface.
 - Compose `/watch` remains upstream (see **Compose /watch**; doctor WARN if
   missing). Alerts, credential vault/fill, confirm-actions, domain allowlist
   navigate, and content-boundary helpers **are** on the CLI/HTTP surface.

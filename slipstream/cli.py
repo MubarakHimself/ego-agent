@@ -134,6 +134,28 @@ def _fail_http(status: int, payload: dict[str, Any]) -> None:
     raise CliError(msg, exit_code=1)
 
 
+
+def _request_bytes(
+    method: str,
+    url: str,
+    timeout: float = 30.0,
+) -> tuple[int, bytes, dict[str, str]]:
+    """HTTP request returning raw bytes (for artifact fetch)."""
+    safe_url = _validate_api_request_url(url)
+    req = urllib.request.Request(safe_url)
+    req.method = method
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            headers = {k.lower(): v for k, v in resp.headers.items()}
+            return resp.status, resp.read(), headers  # skylos: ignore[SKY-P401] bounded HTTP body
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        headers = {k.lower(): v for k, v in e.headers.items()} if e.headers else {}
+        return e.code, raw, headers
+    except urllib.error.URLError as e:
+        raise CliError(f"connection failed: {e.reason}", exit_code=1) from e
+
+
 def cmd_lease(
     *,
     agent_id: str,
@@ -724,3 +746,118 @@ def cmd_spaces_login_once(
         _fail_http(status, payload)
     _print_json(payload)
     return 0
+
+def cmd_downloads_list(
+    *,
+    lease_id: str,
+    url: str | None = None,
+    agent_id: str | None = None,
+    rel_path: bool = False,
+) -> int:
+    """GET /v1/leases/{id}/downloads — list session download artifacts."""
+    base = resolve_base_url(url)
+    q = []
+    if agent_id:
+        q.append(f"agent_id={quote(agent_id, safe='')}")
+    if rel_path:
+        q.append("rel_path=1")
+    qs = ("?" + "&".join(q)) if q else ""
+    status, payload = _request(
+        "GET", f"{base}{_PATH_LEASES}{lease_id}/downloads{qs}"
+    )
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0
+
+
+def cmd_downloads_get(
+    *,
+    lease_id: str,
+    artifact_id: str,
+    output: str | None = None,
+    url: str | None = None,
+    agent_id: str | None = None,
+) -> int:
+    """GET /v1/leases/{id}/downloads/{artifact_id} — fetch bytes to file or stdout."""
+    base = resolve_base_url(url)
+    q = f"?agent_id={quote(agent_id, safe='')}" if agent_id else ""
+    status, raw, headers = _request_bytes(
+        "GET", f"{base}{_PATH_LEASES}{lease_id}/downloads/{artifact_id}{q}"
+    )
+    if status != 200:
+        try:
+            payload = json.loads(raw.decode(_UTF8)) if raw else {}
+        except json.JSONDecodeError:
+            payload = {"error": "http_error", "detail": raw[:200]}
+        _fail_http(status, payload if isinstance(payload, dict) else {"error": str(payload)})
+    if output:
+        # Operator-supplied output path: resolve + O_NOFOLLOW create (no symlink follow).
+        out_path = _resolve_policy_path(Path(output))
+        if out_path.is_symlink():
+            raise CliError("--output must not be a symlink", exit_code=2)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(  # skylos: ignore[SKY-D215,SKY-D324] O_NOFOLLOW; operator --output
+            os.fspath(out_path), flags, 0o600
+        )
+        try:
+            os.write(fd, raw)
+        finally:
+            os.close(fd)
+        meta = {
+            "ok": True,
+            "bytes": len(raw),
+            "sha256": headers.get("x-slipstream-sha256"),
+            "path": str(out_path),
+        }
+        _print_json(meta)
+    else:
+        sys.stdout.buffer.write(raw)
+    return 0
+
+
+def cmd_uploads_list(
+    *,
+    lease_id: str,
+    url: str | None = None,
+    agent_id: str | None = None,
+) -> int:
+    base = resolve_base_url(url)
+    q = f"?agent_id={quote(agent_id, safe='')}" if agent_id else ""
+    status, payload = _request("GET", f"{base}{_PATH_LEASES}{lease_id}/uploads{q}")
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0
+
+
+def cmd_uploads_put(
+    *,
+    lease_id: str,
+    filename: str,
+    file_path: str,
+    url: str | None = None,
+    agent_id: str | None = None,
+) -> int:
+    """POST /v1/leases/{id}/uploads — thin drop from local file."""
+    import base64
+
+    base = resolve_base_url(url)
+    path = _resolve_policy_path(Path(file_path))
+    if path.is_symlink() or not path.is_file():
+        raise CliError("--file must be a regular non-symlink file", exit_code=2)
+    data = path.read_bytes()
+    body: dict[str, Any] = {
+        "filename": filename or path.name,
+        "content_b64": base64.b64encode(data).decode("ascii"),
+    }
+    if agent_id:
+        body["agent_id"] = agent_id
+    status, payload = _request("POST", f"{base}{_PATH_LEASES}{lease_id}/uploads", body)
+    if status not in (200, 201):
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0
+
