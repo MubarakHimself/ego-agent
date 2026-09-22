@@ -28,6 +28,7 @@ Endpoints:
   GET    /v1/leases/{id}/watch
   GET    /v1/leases/{id}/watch/frame
   GET    /v1/leases/{id}/watch/events
+  GET    /v1/leases/{id}/watch/timeline
   GET    /v1/leases/{id}/downloads
   GET    /v1/leases/{id}/downloads/{artifact_id}
   GET    /v1/leases/{id}/uploads
@@ -430,8 +431,18 @@ def make_handler(pool: BrowserPool):
                         return
                     raise
                 return
-
-
+            lease_id = _v1_lease_tail(parts, _PART_WATCH, "timeline")
+            if lease_id is not None:
+                try:
+                    result = pool.get_watch_timeline(lease_id, token)
+                    _json_response(
+                        self, 200, result, extra_headers=WATCH_CLICKJACK_HEADERS
+                    )
+                except Exception as e:
+                    if _watch_error(self, e):
+                        return
+                    raise
+                return
 
             if _handle_lease_artifacts_get(self, pool, parts):
                 return

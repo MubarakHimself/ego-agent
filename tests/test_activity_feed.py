@@ -151,6 +151,9 @@ def test_activity_feed_on_watch(api_server: PoolServer):
     body = html.decode() if isinstance(html, (bytes, bytearray)) else html
     assert "Activity" in body
     assert "/watch/events" in body
+    assert "/watch/timeline" in body
+    assert "dual-clocks" in body
+    assert "scrub-range" in body
 
     code, feed = _req("GET", f"{base}/v1/leases/{lid}/watch/events?token={token}")
     assert code == 200, feed
@@ -271,3 +274,63 @@ def test_adv_feed_003_scrub_aligns_alerts_and_list_values():
     assert "hunter2" not in fields[1]
     assert "[REDACTED]" in fields[1] or "password" in fields[1].lower()
 
+
+def test_feed_timeline_markers_unit():
+    feed = LeaseActivityFeed(capacity=10)
+    feed.append("navigate", "https://ex.test/a", ts=100.0)
+    feed.append("click", "btn", ts=101.5)
+    tl = feed.timeline()
+    assert tl["count"] == 2
+    assert tl["first_ts"] == 100.0
+    assert tl["last_ts"] == 101.5
+    assert tl["latest_seq"] == 2
+    assert [m["kind"] for m in tl["markers"]] == ["navigate", "click"]
+    for m in tl["markers"]:
+        assert set(m) == {"seq", "ts", "kind", "summary"}
+    limited = feed.timeline(limit=1)
+    assert limited["count"] == 1
+    assert limited["markers"][0]["kind"] == "click"
+
+
+def test_watch_timeline_api_auth_and_scrub(api_server: PoolServer):
+    base = api_server.base_url
+    lid = _lease(base, space="af-timeline")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "login", "detail": "please", "ttl_s": 120},
+    )
+    assert code == 200, env
+    watch = env["alert"]["watch_url"]
+    token = _token_from_watch_url(watch)
+
+    code, nav = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/navigate",
+        {"url": "https://example.com/path?tok=sekrit"},
+    )
+    assert code == 200, nav
+
+    code, tl = _req("GET", f"{base}/v1/leases/{lid}/watch/timeline?token={token}")
+    assert code == 200, tl
+    assert tl["lease_id"] == lid
+    assert tl["count"] >= 1
+    kinds = [m["kind"] for m in tl["markers"]]
+    assert "alert" in kinds
+    assert "navigate" in kinds
+    blob = json.dumps(tl)
+    assert "sekrit" not in blob
+    for m in tl["markers"]:
+        assert set(m.keys()) == {"seq", "ts", "kind", "summary"}
+
+    code, bad = _req("GET", f"{base}/v1/leases/{lid}/watch/timeline?token=wrong")
+    assert code == 401
+
+    code, done = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "task_done", "outcome": {"ok": True, "summary": "done"}},
+    )
+    assert code == 200, done
+    code, gone = _req("GET", f"{base}/v1/leases/{lid}/watch/timeline?token={token}")
+    assert code == 410

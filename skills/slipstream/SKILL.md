@@ -227,6 +227,8 @@ Watch JPEG/HTML (`need_human`) — that is **not** the Claude `/watch` skill.
 
 **Activity feed (Watch dock):** the Watch page shows a chronological lease-scoped action feed beside the live JPEG (`navigate` / `click` / `type` / `fill` / `alert` / `confirm` / `captcha`). Poll `GET …/watch/events?token=…` (same token TTL/revoke as Watch → 410). Entries are scrubbed — never cookies, passwords, typed text, vault, or CDP auth (`type`/`fill` → length/labels only). Soft browse remains free; feed is captain observe opacity. Reuses the alerts bus for `need_human` / `task_done` (no second notification path).
 
+**Dual timeline / thin session scrubber:** Watch shows a live viewport clock beside an event-clock driven by activity-feed timestamps, plus a thin scrubber over `GET …/watch/timeline?token=…` markers (`[{seq,ts,kind,summary}]`). Seeking highlights the matching feed row; the JPEG stays the live frame (no ffmpeg / video recording). Same token TTL/revoke → 410.
+
 
 ### Install upstream `/watch`
 
