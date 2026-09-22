@@ -294,14 +294,14 @@ dir under `SLIPSTREAM_ARTIFACTS_ROOT` (outside Space + vault). List/fetch by
 artifact id — **no absolute paths** to the agent by default.
 
 ```bash
-slipstream downloads list --lease-id "$LEASE_ID"
-slipstream downloads get --lease-id "$LEASE_ID" --artifact-id dl_… -o ./out.bin
+slipstream downloads list --lease-id "$LEASE_ID" --agent-id "$AGENT_ID"
+slipstream downloads get --lease-id "$LEASE_ID" --artifact-id dl_… --agent-id "$AGENT_ID" -o ./out.bin
 # thin upload drop
 slipstream uploads put --lease-id "$LEASE_ID" --filename drop.bin --file ./local.bin
 slipstream uploads list --lease-id "$LEASE_ID"
 ```
 
-Optional `?agent_id=` ownership check. Symlink/path escape refused; secret
+Required `?agent_id=` must match lease owner (omit → 401/403). Symlink/path escape refused; secret
 filenames denylisted. No cloud storage in MVP.
 
 ## Alerts (need_human + task_done)

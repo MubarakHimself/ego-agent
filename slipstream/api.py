@@ -76,6 +76,7 @@ from slipstream.downloads import (
     ArtifactNotFoundError,
     DownloadForbiddenError,
     DownloadValidationError,
+    content_disposition_attachment,
 )
 from slipstream.vault import CredNotFoundError, VaultUnavailableError, VaultValidationError
 from slipstream.metadata import MetadataValidationError
@@ -102,6 +103,7 @@ _ERR_INVALID_CREDENTIALS = "invalid_credentials"
 _ERR_INVALID_SIGNED_IN = "invalid_signed_in"
 _ERR_ALERT_CONFLICT = "alert_conflict"
 _ERR_FORBIDDEN = "forbidden"
+_ERR_LAUNCH_FAILED = "launch_failed"
 _QS_AGENT_ID = "agent_id"
 _QS_WATCH_AUTH = "token"  # skylos: ignore[SKY-L014,SKY-L032] query param name, not a secret
 _FIELD_ALLOWED_DOMAINS = "allowed_domains"
@@ -572,10 +574,10 @@ def make_handler(pool: BrowserPool):
                 except ValueError as e:
                     _json_response(self, 400, {"error": _ERR_BAD_REQUEST, "detail": str(e)})
                 except (RuntimeError, OSError) as e:
-                    _json_response(self, 503, {"error": "launch_failed", "detail": str(e)})
+                    _json_response(self, 503, {"error": _ERR_LAUNCH_FAILED, "detail": str(e)})
                 except Exception as e:
                     # Other launch / unexpected failures → same 503 (not bare 500)
-                    _json_response(self, 503, {"error": "launch_failed", "detail": str(e)})
+                    _json_response(self, 503, {"error": _ERR_LAUNCH_FAILED, "detail": str(e)})
                 return
 
             # /v1/leases/{id}/heartbeat  OR  /v1/leases/{id}/alerts
@@ -837,7 +839,7 @@ def make_handler(pool: BrowserPool):
                 except SpaceInUseError as e:
                     _json_response(self, 409, {"error": "space_in_use", "detail": str(e)})
                 except (RuntimeError, OSError) as e:
-                    _json_response(self, 503, {"error": "launch_failed", "detail": str(e)})
+                    _json_response(self, 503, {"error": _ERR_LAUNCH_FAILED, "detail": str(e)})
                 except ValueError as e:
                     _json_response(self, 400, {"error": _ERR_BAD_REQUEST, "detail": str(e)})
                 return
@@ -1033,7 +1035,7 @@ def _handle_lease_artifacts_get(handler, pool, parts) -> bool:
             raw,
             "application/octet-stream",
             extra_headers={
-                "Content-Disposition": f'attachment; filename="{meta["filename"]}"',
+                "Content-Disposition": content_disposition_attachment(meta["filename"]),
                 "X-Slipstream-Sha256": meta["sha256"],
             },
         )

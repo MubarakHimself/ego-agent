@@ -20,6 +20,8 @@ from typing import Any
 
 DEFAULT_URL = "http://127.0.0.1:8755"
 _PATH_LEASES = "/v1/leases/"
+_ERR_AGENT_ID_REQUIRED = "agent_id required"
+_ACTION_CONFIRM = "confirm"
 _PATH_SPACES = "/v1/spaces/"
 _PATH_CONFIRMATIONS = "/v1/confirmations/"
 _UTF8 = "utf-8"
@@ -491,7 +493,7 @@ def cmd_act(
             answer = sys.stdin.readline().strip().lower()
         except EOFError:
             answer = ""
-        action = "confirm" if answer in ("y", "yes") else "deny"
+        action = _ACTION_CONFIRM if answer in ("y", "yes") else "deny"
         r_status, r_payload = _request(
             "POST",
             f"{base}{_PATH_CONFIRMATIONS}{confirm_id}",
@@ -500,7 +502,7 @@ def cmd_act(
         if r_status != 200:
             _fail_http(r_status, r_payload)
         _print_json(r_payload)
-        return 0 if action == "confirm" else 1
+        return 0 if action == _ACTION_CONFIRM else 1
 
     _print_json(payload)
     return 0
@@ -510,7 +512,7 @@ def cmd_confirm(*, confirm_id: str, url: str | None = None) -> int:
     """POST /v1/confirmations/{confirm_id} {action: confirm}."""
     base = resolve_base_url(url)
     status, payload = _request(
-        "POST", f"{base}{_PATH_CONFIRMATIONS}{confirm_id}", {"action": "confirm"}
+        "POST", f"{base}{_PATH_CONFIRMATIONS}{confirm_id}", {"action": _ACTION_CONFIRM}
     )
     if status != 200:
         _fail_http(status, payload)
@@ -751,14 +753,15 @@ def cmd_downloads_list(
     *,
     lease_id: str,
     url: str | None = None,
-    agent_id: str | None = None,
+    agent_id: str,
     rel_path: bool = False,
 ) -> int:
     """GET /v1/leases/{id}/downloads — list session download artifacts."""
     base = resolve_base_url(url)
     q = []
-    if agent_id:
-        q.append(f"agent_id={quote(agent_id, safe='')}")
+    if not agent_id:
+        raise SystemExit(_ERR_AGENT_ID_REQUIRED)
+    q.append(f"agent_id={quote(agent_id, safe='')}")
     if rel_path:
         q.append("rel_path=1")
     qs = ("?" + "&".join(q)) if q else ""
@@ -781,7 +784,9 @@ def cmd_downloads_get(
 ) -> int:
     """GET /v1/leases/{id}/downloads/{artifact_id} — fetch bytes to file or stdout."""
     base = resolve_base_url(url)
-    q = f"?agent_id={quote(agent_id, safe='')}" if agent_id else ""
+    if not agent_id:
+        raise SystemExit(_ERR_AGENT_ID_REQUIRED)
+    q = f"?agent_id={quote(agent_id, safe='')}"
     status, raw, headers = _request_bytes(
         "GET", f"{base}{_PATH_LEASES}{lease_id}/downloads/{artifact_id}{q}"
     )
@@ -822,10 +827,12 @@ def cmd_uploads_list(
     *,
     lease_id: str,
     url: str | None = None,
-    agent_id: str | None = None,
+    agent_id: str,
 ) -> int:
     base = resolve_base_url(url)
-    q = f"?agent_id={quote(agent_id, safe='')}" if agent_id else ""
+    if not agent_id:
+        raise SystemExit(_ERR_AGENT_ID_REQUIRED)
+    q = f"?agent_id={quote(agent_id, safe='')}"
     status, payload = _request("GET", f"{base}{_PATH_LEASES}{lease_id}/uploads{q}")
     if status != 200:
         _fail_http(status, payload)
@@ -839,7 +846,7 @@ def cmd_uploads_put(
     filename: str,
     file_path: str,
     url: str | None = None,
-    agent_id: str | None = None,
+    agent_id: str,
 ) -> int:
     """POST /v1/leases/{id}/uploads — thin drop from local file."""
     import base64
@@ -853,8 +860,9 @@ def cmd_uploads_put(
         "filename": filename or path.name,
         "content_b64": base64.b64encode(data).decode("ascii"),
     }
-    if agent_id:
-        body["agent_id"] = agent_id
+    if not agent_id:
+        raise SystemExit(_ERR_AGENT_ID_REQUIRED)
+    body["agent_id"] = agent_id
     status, payload = _request("POST", f"{base}{_PATH_LEASES}{lease_id}/uploads", body)
     if status not in (200, 201):
         _fail_http(status, payload)
