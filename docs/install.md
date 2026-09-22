@@ -104,7 +104,7 @@ Lifecycle: `lease → drive CDP → heartbeat → release` (or `alert need-human
 |--------|-------|
 | Interactive web / forms / QA in Chromium | Slipstream lease + peer CDP driver |
 | Video URL or local media path (“watch / summarize / what’s on screen”) | Installed `/watch` skill (`bradautomates/claude-video`) |
-| Human takeover of a live leased page | Slipstream `need_human` → tokenized Watch JPEG/HTML (observe-only) |
+| Human takeover of a live leased page | Slipstream `need_human` → tokenized Watch; Confirm → exclusive pair-browse; Cede returns drive |
 
 ### Quick reference
 

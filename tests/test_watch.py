@@ -165,6 +165,7 @@ def test_takeover_confirm_pauses(api_server: PoolServer):
     assert result["agent_paused"] is True
     assert result["action"] == "pause"
     assert result["takeover_confirmed"] is True
+    assert result["input_enabled"] is True
     assert result["status"] == "awaiting_human"
     # Lease still alive
     code, hb = _req("POST", f"{base}/v1/leases/{lid}/heartbeat", {})
@@ -198,6 +199,14 @@ def test_task_done_revokes_watch_410(api_server: PoolServer):
     code, body = _req("GET", f"{base}/v1/leases/{lid}/watch/frame?token={token}")
     assert code == 410
     code, body = _req("POST", f"{base}/v1/leases/{lid}/watch/confirm?token={token}", {})
+    assert code == 410
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/input?token={token}",
+        {"kind": "click", "x": 1, "y": 1},
+    )
+    assert code == 410
+    code, body = _req("POST", f"{base}/v1/leases/{lid}/watch/cede?token={token}", {})
     assert code == 410
 
 
@@ -310,6 +319,24 @@ def test_adv_watch_003_clickjack_headers(api_server: PoolServer):
     assert code == 200
     assert headers.get("X-Frame-Options") == "DENY"
     assert "frame-ancestors" in (headers.get("Content-Security-Policy") or "")
+
+    code, headers, _body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/input?token={token}",
+        {"kind": "click", "x": 1, "y": 1},
+        raw=True,
+    )
+    assert code == 200
+    assert headers.get("X-Frame-Options") == "DENY"
+
+    code, headers, _body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/cede?token={token}",
+        {},
+        raw=True,
+    )
+    assert code == 200
+    assert headers.get("X-Frame-Options") == "DENY"
 
 
 def test_adv_watch_001_frame_inflight_vs_revoke_410(api_server: PoolServer, monkeypatch):
@@ -452,3 +479,190 @@ def test_adv_watch_006_reject_bad_ws_debugger_url():
             raise AssertionError(f"expected cdp refuse for {bad}")
         except CdpInjectError:
             pass
+
+
+def test_pair_browse_observe_only_blocks_input(api_server: PoolServer):
+    """Before Take-over confirm, /watch/input is 403."""
+    base = api_server.base_url
+    lid = _lease(base, space="pb-obs")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "stuck"},
+    )
+    assert code == 200
+    token = _token_from_watch_url(env["alert"]["watch_url"])
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/input?token={token}",
+        {"kind": "click", "x": 10, "y": 20},
+    )
+    assert code == 403, body
+    assert body.get("error") == "forbidden"
+    assert api_server.pool._watch_input_log == []
+
+
+def test_pair_browse_confirm_click_type_scroll(api_server: PoolServer):
+    """After confirm, click/type/scroll reach CDP mock bridge; ack never echoes text."""
+    base = api_server.base_url
+    lid = _lease(base, space="pb-drive")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "captcha", "detail": "need eyes"},
+    )
+    assert code == 200
+    token = _token_from_watch_url(env["alert"]["watch_url"])
+    code, conf = _req(
+        "POST", f"{base}/v1/leases/{lid}/watch/confirm?token={token}", {}
+    )
+    assert code == 200
+    assert conf["input_enabled"] is True
+    assert conf["agent_paused"] is True
+
+    # HTML should enable pair-browse + Cede (no secrets)
+    code, html = _req(
+        "GET", f"{base}/v1/leases/{lid}/watch?token={token}&mode=takeover"
+    )
+    assert code == 200
+    text = html.decode("utf-8")
+    assert "pair-browse" in text.lower() or "Pair-browse" in text
+    assert "Cede" in text
+    assert "/watch/input" in text
+    for forbidden in ("password=", "set-cookie", "cdp_http", "authorization:"):
+        assert forbidden not in text.lower()
+
+    code, click = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/input?token={token}",
+        {"kind": "click", "x": 42, "y": 84, "button": "left"},
+    )
+    assert code == 200, click
+    assert click == {"ok": True, "kind": "click", "input_enabled": True}
+
+    secretish = "hunter2-not-a-real-secret"
+    code, typed = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/input?token={token}",
+        {"kind": "type", "text": secretish},
+    )
+    assert code == 200, typed
+    assert typed == {"ok": True, "kind": "type", "input_enabled": True}
+    # Must not echo typed text in response
+    assert secretish not in json.dumps(typed)
+
+    code, scroll = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/input?token={token}",
+        {"kind": "scroll", "x": 10, "y": 10, "deltaX": 0, "deltaY": -120},
+    )
+    assert code == 200, scroll
+    assert scroll["kind"] == "scroll"
+
+    log = api_server.pool._watch_input_log
+    kinds = [e["kind"] for e in log]
+    assert kinds == ["click", "type", "scroll"]
+    assert log[0]["x"] == 42 and log[0]["y"] == 84
+    assert log[1]["text"] == secretish  # mock recorder only
+    assert log[2]["deltaY"] == -120
+
+
+def test_pair_browse_cede_disables_input_clears_pause(api_server: PoolServer):
+    base = api_server.base_url
+    lid = _lease(base, space="pb-cede")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "login"},
+    )
+    assert code == 200
+    token = _token_from_watch_url(env["alert"]["watch_url"])
+    code, _ = _req("POST", f"{base}/v1/leases/{lid}/watch/confirm?token={token}", {})
+    assert code == 200
+
+    code, ceded = _req("POST", f"{base}/v1/leases/{lid}/watch/cede?token={token}", {})
+    assert code == 200, ceded
+    assert ceded["ok"] is True
+    assert ceded["agent_paused"] is False
+    assert ceded["input_enabled"] is False
+    assert ceded["action"] == "continue"
+    assert ceded["status"] == "leased"
+    assert ceded["lease_kept"] is True
+
+    # Input blocked after cede
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/input?token={token}",
+        {"kind": "click", "x": 1, "y": 1},
+    )
+    assert code == 403, body
+
+    # Lease still alive (heartbeat)
+    code, hb = _req("POST", f"{base}/v1/leases/{lid}/heartbeat", {})
+    assert code == 200
+
+    # Watch page still observe-able; Confirm available again
+    code, html = _req("GET", f"{base}/v1/leases/{lid}/watch?token={token}&mode=takeover")
+    assert code == 200
+    assert b"Confirm Take-over" in html
+    assert b"pair-browse" not in html.lower() or b"until then" in html.lower()
+
+
+def test_pair_browse_refuses_secret_fields(api_server: PoolServer):
+    base = api_server.base_url
+    lid = _lease(base, space="pb-sec")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "other"},
+    )
+    assert code == 200
+    token = _token_from_watch_url(env["alert"]["watch_url"])
+    _req("POST", f"{base}/v1/leases/{lid}/watch/confirm?token={token}", {})
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/input?token={token}",
+        {"kind": "type", "text": "x", "password": "nope"},
+    )
+    assert code == 400, body
+    assert body.get("error") == "invalid_input"
+
+
+def test_pair_browse_bad_token_401(api_server: PoolServer):
+    base = api_server.base_url
+    lid = _lease(base, space="pb-auth")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "stuck"},
+    )
+    assert code == 200
+    token = _token_from_watch_url(env["alert"]["watch_url"])
+    _req("POST", f"{base}/v1/leases/{lid}/watch/confirm?token={token}", {})
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/input?token=wrong-token-value-xxxxxxxx",
+        {"kind": "click", "x": 1, "y": 1},
+    )
+    assert code == 401, body
+
+
+def test_pair_browse_ttl_expiry_blocks_input(api_server: PoolServer):
+    base = api_server.base_url
+    lid = _lease(base, space="pb-ttl")
+    code, env = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/alerts",
+        {"event": "need_human", "reason": "other", "ttl_s": 60},
+    )
+    assert code == 200
+    token = _token_from_watch_url(env["alert"]["watch_url"])
+    _req("POST", f"{base}/v1/leases/{lid}/watch/confirm?token={token}", {})
+    sess = api_server.pool._watches[lid]
+    sess.expires_at = time.time() - 1
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/watch/input?token={token}",
+        {"kind": "click", "x": 1, "y": 1},
+    )
+    assert code == 410, body

@@ -133,22 +133,28 @@ Request must **not** include `watch_url` or `status` — both are server-derived
 
 **Trust boundary (free-text):** `detail` and `outcome.summary` are caller-controlled strings. Callers must not put secrets there. The server lightly scrubs `password=` / `cookie=` / `token=` / `secret=` / `authorization=` / `bearer=` patterns to `[REDACTED]` but this is defense-in-depth, not a guarantee — treat alert text as untrusted for secret storage.
 
-**Server-derived fields:** `status` (`awaiting_human` / `done` / `failed`) and `watch_url` (short-TTL **tokenized** local Watch — observe-only JPEG/HTML). Soft-idle eviction is skipped while `lease.status == awaiting_human` (hard TTL still applies).
+**Server-derived fields:** `status` (`awaiting_human` / `done` / `failed`) and `watch_url` (short-TTL **tokenized** local Watch — observe-only until Take-over confirm enables pair-browse). Soft-idle eviction is skipped while `lease.status == awaiting_human` (hard TTL still applies).
 
-### Live Watch v1 (observe-only)
+### Live Watch + thin pair-browse v1
 
 On `need_human` the pool mints an unguessable token and returns:
 
 - `watch_url` = `/v1/leases/{id}/watch?token=…` (TTL from `ttl_s`, default 300s)
-- `takeover_url` = same + `&mode=takeover` (Confirm Take-over → pause only; **no** pair-browse)
+- `takeover_url` = same + `&mode=takeover` (Confirm Take-over → pause agent + enable exclusive pair-browse)
 
 | Method | Path | Result |
 |--------|------|--------|
-| `GET` | `/v1/leases/{id}/watch?token=…` | HTML shell (meta-refresh) embedding JPEG frame; observe-only |
+| `GET` | `/v1/leases/{id}/watch?token=…` | HTML shell embedding JPEG frame; observe-only until confirm |
 | `GET` | `/v1/leases/{id}/watch/frame?token=…` | `image/jpeg` viewport via CDP `Page.captureScreenshot` (mock JPEG under `SLIPSTREAM_MOCK`) |
-| `POST` | `/v1/leases/{id}/watch/confirm?token=…` | Confirm Take-over → `{action: pause, agent_paused: true, lease_kept: true}` |
+| `POST` | `/v1/leases/{id}/watch/confirm?token=…` | Confirm Take-over → `{action: pause, agent_paused: true, input_enabled: true, lease_kept: true}` |
+| `POST` | `/v1/leases/{id}/watch/input?token=…` | Bridge click/type/key/scroll into leased CDP (requires confirm; exclusive pause) |
+| `POST` | `/v1/leases/{id}/watch/cede?token=…` | Disable input, clear pause → `{action: continue, agent_paused: false, input_enabled: false}`; lease stays until `task_done` |
 
-→ `401` missing/wrong/cross-lease token · `410` after `task_done`, lease release, Watch TTL expiry, or revoke/identity race mid-frame · `404` unknown lease / no watch session.
+**Input body (JSON):** `{ "kind": "click"|"type"|"key"|"scroll", … }` — click needs `x,y`; type needs `text` (≤64); key needs `key`; scroll needs `deltaX`/`deltaY`. Response is a scrubbed ack (`ok` + `kind`) — **never** echoes typed text. Secret-like fields (`password`, `cookie`, `token`, …) are refused (`400`).
+
+**Gate:** observe-only / post-cede / unpaused → `403` on `/watch/input`. Agent stays `awaiting_human` (paused exclusive) from confirm until Cede or Watch TTL / cancel.
+
+→ `401` missing/wrong/cross-lease token · `403` input while observe-only / after Cede · `400` bad input · `410` after `task_done`, lease release, Watch TTL expiry, or revoke/identity race mid-frame · `404` unknown lease / no watch session.
 
 **Credential-in-URL (v1):** `watch_url` carries `?token=…` — treat the whole URL as a **screen-share secret** (anyone with the link can see live viewport screenshots for the TTL). Do not paste into group chat / tickets / logs. **HttpOnly cookie migration** (token out of the URL / HTML) is deferred — wait for Firstmate / captain before implementing.
 
@@ -158,7 +164,7 @@ On `need_human` the pool mints an unguessable token and returns:
 
 **Chromium `--remote-allow-origins=*` (v1 residual risk):** pool launch still passes `*` so localhost CDP WebSockets (Watch screenshot + cred fill) work. On a shared host this widens who may attach to the debugging port if they can reach loopback. **Tighten** (explicit origin allowlist) is deferred — wait for Firstmate. Mitigations today: loopback-only CDP bind, pool API on `127.0.0.1`, WS debugger URL allowlist (loopback ws/wss only).
 
-**Defer:** pair-browse, replay, WS dashboard, iframe embed product, Take/Cede exclusive lock, token→HttpOnly cookie, `--remote-allow-origins` tighten.
+**Defer:** simultaneous human+agent drive, session replay, cloud overflow, MCP wrapper, full WS dashboard polish, token→HttpOnly cookie, `--remote-allow-origins` tighten.
 
 **In-memory alert state:** `_alert_log`, `_task_done_envelopes`, and `_watches` are **process-lifetime** maps (survive lease release for idempotent `task_done` / revoked-watch `410`; cleared on pool shutdown / process exit). Bounded LRU eviction is deferred.
 

@@ -231,8 +231,9 @@ slipstream alert done --lease-id "$LEASE_ID" --fail --summary "Blocked by paywal
 Harness JSON (`alert` + `harness`) tells the caller to `pause` or `continue`.
 Fields include `captain_message`, `watch_url`, `takeover_url`, `lease_kept` /
 `lease_released`. Server-derived `watch_url` is a short-TTL **tokenized** local
-Watch (observe-only JPEG/HTML). Open it for live frames; Take-over confirms
-pause only (no pair-browse yet). Revoked on `task_done` / TTL (`401`/`410`).
+Watch (JPEG/HTML). Open it for live frames; Take-over confirm pauses the
+agent and enables exclusive pair-browse (click/type/scroll into leased CDP).
+Cede returns drive; revoked on `task_done` / TTL (`401`/`410`).
 Never put secrets on the page. No client override of `watch_url`.
 
 curl:
@@ -371,7 +372,7 @@ slipstream cred    bind|unbind|list|fill …
 - No Monid / paid marketplace.
 - No MCP server (skill+CLI+HTTP only).
 - No free-read of Space cookies / credential dumps.
-- Live pair-browse UI polish, optional stuck/captcha chips, Take/Cede exclusive
+- Simultaneous human+agent drive, pair-browse UI polish, optional stuck/captcha chips
   lock are **later**.
 - Compose `/watch` remains upstream (see **Compose /watch**; doctor WARN if
   missing). Alerts + credential vault/fill **are** on the CLI/HTTP surface.

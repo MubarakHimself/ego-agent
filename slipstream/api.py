@@ -8,6 +8,8 @@ Endpoints:
   POST   /v1/leases/{id}/alerts
   POST   /v1/leases/{id}/credentials/fill
   POST   /v1/leases/{id}/watch/confirm
+  POST   /v1/leases/{id}/watch/input
+  POST   /v1/leases/{id}/watch/cede
   POST   /v1/spaces/{space_id}/credentials/bind
   POST   /v1/spaces/{space_id}/credentials/{cred_id}/unbind
   GET    /v1/spaces/{space_id}/credentials
@@ -31,7 +33,9 @@ from slipstream.watch import (
     WATCH_CLICKJACK_HEADERS,
     WatchAuthError,
     WatchCaptureError,
+    WatchForbiddenError,
     WatchGoneError,
+    WatchInputError,
     WatchNotFoundError,
 )
 from slipstream.cdp_inject import CdpInjectError
@@ -108,6 +112,16 @@ def _watch_error(handler: BaseHTTPRequestHandler, exc: Exception) -> bool:
     if isinstance(exc, WatchAuthError):
         _json_response(
             handler, 401, {"error": "unauthorized", "detail": str(exc.detail)}
+        )
+        return True
+    if isinstance(exc, WatchForbiddenError):
+        _json_response(
+            handler, 403, {"error": "forbidden", "detail": str(exc.detail)}
+        )
+        return True
+    if isinstance(exc, WatchInputError):
+        _json_response(
+            handler, 400, {"error": "invalid_input", "detail": str(exc.detail)}
         )
         return True
     if isinstance(exc, WatchGoneError):
@@ -279,6 +293,73 @@ def make_handler(pool: BrowserPool):
                             self.send_header(hk, hv)
                         self.end_headers()
                         return
+                    _json_response(
+                        self, 200, result, extra_headers=WATCH_CLICKJACK_HEADERS
+                    )
+                except Exception as e:
+                    if _watch_error(self, e):
+                        return
+                    raise
+                return
+
+            # Pair-browse Cede may be an HTML form POST (not JSON).
+            if (
+                len(parts_early) == 5
+                and parts_early[0] == "v1"
+                and parts_early[1] == "leases"
+                and parts_early[3] == "watch"
+                and parts_early[4] == "cede"
+            ):
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > 0:
+                    self.rfile.read(length)
+                lease_id = parts_early[2]
+                qs = parse_qs(urlparse(self.path).query)
+                token = (qs.get("token") or [None])[0]
+                try:
+                    result = pool.cede_watch_control(lease_id, token)
+                    content_type = (self.headers.get("Content-Type") or "").lower()
+                    if "application/x-www-form-urlencoded" in content_type:
+                        from urllib.parse import urlencode
+
+                        loc = (
+                            f"/v1/leases/{lease_id}/watch?"
+                            + urlencode({"token": token or "", "mode": "takeover"})
+                        )
+                        self.send_response(303)
+                        self.send_header("Location", loc)
+                        self.send_header("Content-Length", "0")
+                        for hk, hv in WATCH_CLICKJACK_HEADERS.items():
+                            self.send_header(hk, hv)
+                        self.end_headers()
+                        return
+                    _json_response(
+                        self, 200, result, extra_headers=WATCH_CLICKJACK_HEADERS
+                    )
+                except Exception as e:
+                    if _watch_error(self, e):
+                        return
+                    raise
+                return
+
+            # Pair-browse input (JSON only).
+            if (
+                len(parts_early) == 5
+                and parts_early[0] == "v1"
+                and parts_early[1] == "leases"
+                and parts_early[3] == "watch"
+                and parts_early[4] == "input"
+            ):
+                lease_id = parts_early[2]
+                qs = parse_qs(urlparse(self.path).query)
+                token = (qs.get("token") or [None])[0]
+                try:
+                    body = self._read_json()
+                except json.JSONDecodeError:
+                    _json_response(self, 400, {"error": "invalid_json"})
+                    return
+                try:
+                    result = pool.dispatch_watch_input(lease_id, token, body)
                     _json_response(
                         self, 200, result, extra_headers=WATCH_CLICKJACK_HEADERS
                     )

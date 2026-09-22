@@ -19,13 +19,18 @@ from slipstream.alerts import (
 from slipstream.watch import (
     WatchAuthError,
     WatchCaptureError,
+    WatchForbiddenError,
     WatchGoneError,
     WatchNotFoundError,
     WatchSession,
     capture_jpeg_frame,
+    cede_path,
     confirm_path,
+    dispatch_cdp_input,
     frame_path,
+    input_path,
     mint_watch_token,
+    parse_watch_input,
     render_watch_html,
 )
 from slipstream.config import PoolConfig
@@ -92,6 +97,8 @@ class BrowserPool:
         self.config.ensure_vault_outside_spaces()
         self.vault = CredVault(self.config.vault_root, mock=self.config.mock)
         self._cdp_injector: CdpInjector = default_injector(mock=self.config.mock)
+        # Pair-browse mock recorder (tests); never returned on the wire.
+        self._watch_input_log: list[dict[str, Any]] = []
 
     # --- introspection -------------------------------------------------
 
@@ -667,6 +674,7 @@ class BrowserPool:
                     detail=parsed.get("detail") or "",
                     revoked=False,
                     takeover_confirmed=False,
+                    input_enabled=False,
                     created_at=now,
                 )
 
@@ -816,7 +824,7 @@ class BrowserPool:
     def get_watch_page(
         self, lease_id: str, token: str | None, *, mode: str | None = None
     ) -> tuple[str, str]:
-        """Return (content_type, html_body) for observe-only Watch UI."""
+        """Return (content_type, html_body) for Watch UI (+ pair-browse when enabled)."""
         with self._lock:
             sess = self._get_watch_session_locked(lease_id, token)
             # Lease must still be live for streaming; revoked already handled.
@@ -828,9 +836,12 @@ class BrowserPool:
             reason = sess.reason
             detail = sess.detail
             confirmed = sess.takeover_confirmed
+            enabled = sess.input_enabled
             tok = sess.token
         frame = frame_path(lease_id, tok)
         confirm = confirm_path(lease_id, tok) if mode == "takeover" else None
+        in_url = input_path(lease_id, tok) if enabled else None
+        cede = cede_path(lease_id, tok) if (mode == "takeover" and enabled) else None
         body = render_watch_html(
             lease_id=lease_id,
             reason=reason,
@@ -840,6 +851,9 @@ class BrowserPool:
             mode=mode,
             expires_in_s=expires_in,
             takeover_confirmed=confirmed,
+            input_enabled=enabled,
+            input_url=in_url,
+            cede_url=cede,
         )
         return "text/html; charset=utf-8", body
 
@@ -907,7 +921,7 @@ class BrowserPool:
     def confirm_watch_takeover(
         self, lease_id: str, token: str | None
     ) -> dict[str, Any]:
-        """Confirm Take-over → keep agent paused / lease warm (no pair-browse)."""
+        """Confirm Take-over → pause agent, enable exclusive pair-browse input."""
         with self._lock:
             sess = self._get_watch_session_locked(lease_id, token)
             lease = self._leases.get(lease_id)
@@ -919,6 +933,7 @@ class BrowserPool:
             if slot is not None:
                 slot.last_heartbeat = time.time()
             sess.takeover_confirmed = True
+            sess.input_enabled = True
             return {
                 "ok": True,
                 "lease_id": lease_id,
@@ -926,7 +941,86 @@ class BrowserPool:
                 "agent_paused": True,
                 "lease_kept": True,
                 "takeover_confirmed": True,
+                "input_enabled": True,
                 "action": "pause",
+                "expires_in_s": max(0, int(sess.expires_at - time.time())),
+            }
+
+    def dispatch_watch_input(
+        self, lease_id: str, token: str | None, body: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Bridge human click/type/scroll into leased CDP after Take-over confirm.
+
+        Observe-only (pre-confirm / post-cede) → WatchForbiddenError (403).
+        Revoked / TTL → WatchGoneError (410). Never echoes typed text.
+        """
+        event = parse_watch_input(body)
+        with self._lock:
+            sess = self._get_watch_session_locked(lease_id, token)
+            if not sess.input_enabled or not sess.takeover_confirmed:
+                raise WatchForbiddenError(
+                    "input disabled — observe-only until Take-over confirm "
+                    "(or after Cede)"
+                )
+            lease = self._leases.get(lease_id)
+            if not lease:
+                sess.revoked = True
+                raise WatchGoneError("lease no longer active")
+            if lease.status != "awaiting_human":
+                raise WatchForbiddenError("agent not paused for pair-browse")
+            cdp = lease.cdp_http_url or ""
+            slot_id = lease.slot_id
+            mock = self.config.mock
+            # Heartbeat warm while human drives
+            slot = self._find_slot_by_lease(lease_id)
+            if slot is not None:
+                slot.last_heartbeat = time.time()
+
+        try:
+            result = dispatch_cdp_input(
+                cdp, event, mock=mock, mock_log=self._watch_input_log
+            )
+        except WatchCaptureError:
+            with self._lock:
+                self._revalidate_watch_after_capture(
+                    lease_id, slot_id=slot_id, cdp_http_url=cdp
+                )
+            raise
+        with self._lock:
+            self._revalidate_watch_after_capture(
+                lease_id, slot_id=slot_id, cdp_http_url=cdp
+            )
+            sess = self._lookup_watch(lease_id)
+            if sess is None or not sess.input_enabled:
+                raise WatchForbiddenError("input disabled during dispatch")
+        # Scrubbed ack only
+        return {"ok": True, "kind": result["kind"], "input_enabled": True}
+
+    def cede_watch_control(
+        self, lease_id: str, token: str | None
+    ) -> dict[str, Any]:
+        """Cede pair-browse: disable input, clear pause; lease stays until task_done."""
+        with self._lock:
+            sess = self._get_watch_session_locked(lease_id, token)
+            lease = self._leases.get(lease_id)
+            if not lease:
+                sess.revoked = True
+                raise WatchGoneError("lease no longer active")
+            sess.input_enabled = False
+            sess.takeover_confirmed = False  # back to observe-only; Confirm re-enables
+            lease.status = "leased"
+            slot = self._find_slot_by_lease(lease_id)
+            if slot is not None:
+                slot.last_heartbeat = time.time()
+            return {
+                "ok": True,
+                "lease_id": lease_id,
+                "status": "leased",
+                "agent_paused": False,
+                "lease_kept": True,
+                "input_enabled": False,
+                "takeover_confirmed": False,
+                "action": "continue",
                 "expires_in_s": max(0, int(sess.expires_at - time.time())),
             }
 
@@ -943,5 +1037,6 @@ class BrowserPool:
                 slot.status = SlotStatus.FREE_COLD
             self._leases.clear()
             self._watches.clear()
+            self._watch_input_log.clear()
         for h in pending_stops:
             self.launcher.stop(h)
