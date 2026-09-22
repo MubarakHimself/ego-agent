@@ -8,8 +8,8 @@ description: >
   browser). HTTP + this CLI/skill surface only — there is no MCP server.
   For video watch intents, compose a separate /watch skill (not Slipstream).
 metadata:
-  version: "0.6.0"
-  date: "2026-09-22"
+  version: "0.6.1"
+  date: "2026-09-23"
 ---
 
 # slipstream
@@ -93,10 +93,22 @@ Use **one Space** per user goal. Print `lease_id`; reuse it in later rounds.
 Heartbeat every ~15–30s (including during LLM think). Always release when done
 (or on hard failure after you stop retrying).
 
+**keepAlive (optional):** `slipstream lease … --keep-alive` or body
+`keep_alive: true` only (omit → false; no server env defaults it on). Soft-idle
+is skipped while age since last heartbeat ≤ `keep_alive_ttl` (default 600s =
+2× idle_ttl, clamped ≤ hard TTL); past that window the lease tears down like
+soft-idle. **Hard TTL** and explicit `release` / `task_done` always win.
+`--no-keep-alive` sends `keep_alive: false` (clears survival on re-lease).
+Create/reconnect examples omit the field. Status / lease JSON shows
+`keep_alive`. No Monid / Electron / MCP.
+
 ```bash
 # 1) Lease
 slipstream lease --agent-id "$AGENT_ID" --space-id "task-42"
-# → JSON: lease_id, slot_id, expires_at, … (no cdp_* / chromium_pid by default;
+# Optional: --keep-alive  (survive until keep_alive_ttl; hard TTL still)
+#           --no-keep-alive (send keep_alive:false; clears survival on re-lease)
+# Omit keep_alive on create/reconnect unless flipping the flag.
+# → JSON: lease_id, slot_id, expires_at, keep_alive, … (no cdp_* / chromium_pid by default;
 #    do not derive CDP from public JSON or slot_id)
 
 # 2) Drive via pool HTTP (ladder-enforced) — do NOT spawn Chrome

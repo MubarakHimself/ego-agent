@@ -55,6 +55,7 @@ def session_row(
     signed_in: bool,
     signed_in_host: str | None = None,
     watch_url: str | None = None,
+    keep_alive: bool = False,
     now: float | None = None,
 ) -> dict[str, Any]:
     """One ops session row (safe for JSON; omit watch_url when absent)."""
@@ -65,6 +66,7 @@ def session_row(
         "duration_s": duration_seconds(leased_at, now=now),
         "user_metadata": dict(user_metadata or {}),
         "signed_in": bool(signed_in),
+        "keep_alive": bool(keep_alive),
     }
     if lease_id:
         row["lease_id"] = lease_id

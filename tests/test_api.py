@@ -182,3 +182,35 @@ def test_oserror_launch_failure_returns_503(api_server: PoolServer, monkeypatch)
     code, body = _req("POST", f"{base}/v1/leases", {"agent_id": "a1", "space_id": "s1"})
     assert code == 503
     assert body["error"] == "launch_failed"
+
+
+def test_lease_keep_alive_http_and_invalid(api_server: PoolServer):
+    base = api_server.base_url
+    code, lease = _req(
+        "POST",
+        f"{base}/v1/leases",
+        {"agent_id": "a1", "space_id": "ka-http", "keep_alive": True},
+    )
+    assert code == 200
+    assert lease["keep_alive"] is True
+    lid = lease["lease_id"]
+
+    # Soft-idle past idle_ttl must not evict keep_alive lease
+    slot = api_server.pool._find_slot_by_lease(lid)
+    assert slot is not None
+    import time
+
+    slot.last_heartbeat = time.time() - (api_server.pool.config.idle_ttl_seconds + 30)
+    assert lid not in api_server.pool.evict_idle()
+
+    code, rel = _req("DELETE", f"{base}/v1/leases/{lid}")
+    assert code == 200 and rel["released"] is True
+
+    for bad in (1, "true", [], {}):
+        code, body = _req(
+            "POST",
+            f"{base}/v1/leases",
+            {"agent_id": "a1", "space_id": f"bad-{bad!r}", "keep_alive": bad},
+        )
+        assert code == 400, f"keep_alive={bad!r}"
+        assert body["error"] == "invalid_keep_alive"

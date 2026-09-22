@@ -263,6 +263,7 @@ class BrowserPool:
                 "K": self.config.K,
                 "W": self.config.W,
                 "idle_ttl_seconds": self.config.idle_ttl_seconds,
+                "keep_alive_ttl_seconds": self.config.effective_keep_alive_ttl(),
                 "live": live,
                 "warm": warm,
                 "leased": leased,
@@ -365,6 +366,7 @@ class BrowserPool:
         cdp_ws_url: str | None,
         user_metadata: dict[str, Any] | None = None,
         allowed_domains: list[str] | None = None,
+        keep_alive: bool = False,
     ) -> dict[str, Any]:
         """Wire Lease + slot lease fields; caller sets process/CDP fields as needed."""
         now = time.time()
@@ -394,6 +396,7 @@ class BrowserPool:
             allowed_domains=self._effective_domains_for(space_id, domains_override),
             signed_in=bool(badge.get("signed_in")),
             signed_in_host=badge.get(_KEY_SIGNED_IN_HOST),
+            keep_alive=bool(keep_alive),
         )
         self._leases[lease_id] = lease
         slot.status = SlotStatus.LEASED
@@ -487,6 +490,7 @@ class BrowserPool:
         *,
         user_metadata: dict[str, Any] | None = None,
         allowed_domains: list[str] | None = None,
+        keep_alive: bool = False,
     ) -> dict[str, Any]:
         """Under lock: attach lease after a successful launch outside the lock."""
         self._handles[slot.slot_id] = handle
@@ -499,6 +503,7 @@ class BrowserPool:
             cdp_ws_url=handle.cdp_ws_url,
             user_metadata=user_metadata,
             allowed_domains=allowed_domains,
+            keep_alive=keep_alive,
         )
         self._prepare_lease_downloads(result["lease_id"], handle.cdp_http_url)
         slot.chromium_pid = handle.pid
@@ -519,6 +524,7 @@ class BrowserPool:
         ttl_seconds: int | None = None,
         user_metadata: dict[str, Any] | None = None,
         allowed_domains: list[str] | None = None,
+        keep_alive: bool | None = None,
     ) -> dict[str, Any]:
         # Validate early (rejects ".", "..", "/", NULs, empty, unsafe)
         space_id = self.config.normalize_space_id(space_id)
@@ -528,6 +534,11 @@ class BrowserPool:
         domains_override = (
             parse_allowed_domains(allowed_domains) if allowed_domains is not None else None
         )
+        # None on *new* leases → keep_alive false (ADV-KA-002: no server env default).
+        # Explicit bool only via body JSON or CLI --keep-alive / --no-keep-alive.
+        # On idempotent re-lease, omit leaves existing keep_alive unchanged.
+        ka_explicit = keep_alive is not None
+        ka = bool(keep_alive) if ka_explicit else False
 
         # Handles that must be stopped outside the lock (released/replaced trees).
         pending_stops: list[LaunchHandle] = []
@@ -576,6 +587,10 @@ class BrowserPool:
                             space_id, existing.allowed_domains_override
                         )
                         self._sync_lease_signed_in(existing)
+                        # Idempotent re-lease: only flip keep_alive when body/arg
+                        # set it explicitly (omit preserves prior flag).
+                        if ka_explicit:
+                            existing.keep_alive = ka
                         early_result = existing.to_dict()
                         break
 
@@ -613,6 +628,7 @@ class BrowserPool:
                                 cdp_ws_url=matching_warm.cdp_ws_url,
                                 user_metadata=meta_override,
                                 allowed_domains=domains_override,
+                                keep_alive=ka,
                             )
                             self._prepare_lease_downloads(
                                 early_result["lease_id"], matching_warm.cdp_http_url
@@ -698,6 +714,7 @@ class BrowserPool:
                     handle,
                     user_metadata=meta_override,
                     allowed_domains=domains_override,
+                    keep_alive=ka,
                 )
 
         self.launcher.stop(orphan)
@@ -1528,7 +1545,11 @@ class BrowserPool:
         """Soft-evict idle leases and hard-TTL-expired leases.
 
         Soft-idle eviction is skipped while ``lease.status == 'awaiting_human'``
-        (need_human pause keeps Chromium); hard TTL still tears down.
+        (need_human pause keeps Chromium) **or** while ``lease.keep_alive``
+        **and** ``(now - last_heartbeat) <= keep_alive_ttl`` (same heartbeat clock
+        as soft-idle; default 600s = 2× idle_ttl, clamped ≤ hard TTL). Past
+        ``keep_alive_ttl`` since last heartbeat → tear down like soft-idle.
+        Hard TTL still tears down first in all cases.
         Re-checks staleness / expiry under the lock immediately before teardown
         so a concurrent heartbeat cannot be raced into an eviction.
         Evictions never keep warm (always stop Chromium).
@@ -1566,15 +1587,22 @@ class BrowserPool:
                         pass
                     continue
 
-                # Soft-idle: skip while awaiting human (lease/Chromium kept).
-                # Hard TTL above still applies.
+                # Soft-idle / keep_alive window (same last_heartbeat clock).
+                # awaiting_human: skip soft-idle entirely (hard TTL still applies).
+                # keep_alive: skip soft-idle until keep_alive_ttl since last heartbeat;
+                # past that window → tear down like soft-idle (ADV-KA-001).
                 if lease.status == _STATE_AWAITING_HUMAN:
                     continue
 
-                # Idle soft-evict: re-check heartbeat freshness under lock
                 if slot.last_heartbeat is None:
                     continue
-                if (now - slot.last_heartbeat) <= self.config.idle_ttl_seconds:
+                age = now - slot.last_heartbeat
+                if lease.keep_alive:
+                    ka_ttl = self.config.effective_keep_alive_ttl()
+                    if age <= ka_ttl:
+                        continue
+                    # keep_alive_ttl expired → fall through to soft-idle teardown
+                elif age <= self.config.idle_ttl_seconds:
                     # Heartbeat refreshed after any stale snapshot — skip
                     continue
                 try:
@@ -2690,6 +2718,7 @@ class BrowserPool:
                         signed_in=bool(lease.signed_in),
                         signed_in_host=lease.signed_in_host,
                         watch_url=watch.get(_KEY_WATCH_URL),
+                        keep_alive=bool(lease.keep_alive),
                         now=now,
                     )
                 )

@@ -166,6 +166,7 @@ def cmd_lease(
     url: str | None = None,
     user_metadata: dict[str, Any] | None = None,
     allowed_domains: list[str] | None = None,
+    keep_alive: bool | None = None,
 ) -> int:
     base = resolve_base_url(url)
     body: dict[str, Any] = {"agent_id": agent_id, "space_id": space_id}
@@ -175,6 +176,8 @@ def cmd_lease(
         body["user_metadata"] = user_metadata
     if allowed_domains is not None:
         body["allowed_domains"] = allowed_domains
+    if keep_alive is not None:
+        body["keep_alive"] = bool(keep_alive)
     status, payload = _request("POST", f"{base}/v1/leases", body)
     if status != 200:
         _fail_http(status, payload)
