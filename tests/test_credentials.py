@@ -159,10 +159,13 @@ def test_http_bind_list_fill_unbind(api_server: PoolServer):
 
     inj = api_server.pool._cdp_injector
     assert isinstance(inj, MockCdpInjector)
-    assert len(inj.calls) == 2
-    assert inj.calls[0]["selector"] == "#login_field"
-    assert inj.calls[0]["value_len"] == 3  # bob
-    assert inj.calls[1]["value_len"] == 6  # sekrit
+    # page_url (origin check) + two field fills
+    fill_calls = [c for c in inj.calls if "field" in c]
+    assert any(c.get("purpose") == "page_url" for c in inj.calls)
+    assert len(fill_calls) == 2
+    assert fill_calls[0]["selector"] == "#login_field"
+    assert fill_calls[0]["value_len"] == 3  # bob
+    assert fill_calls[1]["value_len"] == 6  # sekrit
     assert "sekrit" not in json.dumps(inj.calls)
 
     code, refused = _req("POST", f"{base}/v1/spaces/s1/credentials/secret", {})

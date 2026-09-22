@@ -24,7 +24,7 @@ MVP is always **isolated** mode (one process tree per Space). There is no `mode`
 | `cdp_base_port` | 9222 | Slot *i* uses port `9222 + i` |
 | `host` / `port` | `127.0.0.1` / `8755` | API bind |
 
-Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_ARTIFACTS_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm seconds, default 60), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted unless Space/lease lockdown applies), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers).
+Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_ARTIFACTS_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm + unused grant seconds, default 60), `SLIPSTREAM_EXPOSE_RAW_CDP=1` (include cdp_* URLs on lease/status JSON; raw CDP nav/eval honor-system), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted unless Space/lease lockdown applies), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers).
 
 ## Endpoints
 
@@ -47,12 +47,12 @@ Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT
   "agent_id": "agent-1",
   "space_id": "task-42",
   "status": "leased",
-  "cdp_http_url": "http://127.0.0.1:9222",
-  "cdp_ws_url": "ws://…",
   "created_at": 0,
   "expires_at": 0
 }
 ```
+
+**Raw CDP URLs:** omitted by default (Firstmate B). Set `SLIPSTREAM_EXPOSE_RAW_CDP=1` to include `cdp_http_url` / `cdp_ws_url` on lease (and status slot) JSON. Prefer pool HTTP `navigate` / `eval` / `credentials/fill` + act/confirm so the ladder is server-enforced. With the escape hatch, raw CDP nav/eval is **honor-system** (vault fill stays pool-only).
 
 → `400` for invalid `space_id` (empty / `.` / `..` / path separators `/` `\` / NULs / unsafe) or non-integer `ttl_seconds`. Distinct ids are never rewritten — bad ids are rejected.
 
@@ -249,11 +249,13 @@ POST /v1/leases/{lease_id}/confirmations/{confirm_id}
 
 CLI convenience (same resolve): `POST /v1/confirmations/{confirm_id}` with `{action}`.
 
-**TTL:** pending confirmations auto-deny after ~60s (`SLIPSTREAM_CONFIRM_TTL`, default 60).
+**TTL:** pending confirmations auto-deny after ~60s (`SLIPSTREAM_CONFIRM_TTL`, default 60). Unused one-shot **grants** use the same TTL (confirm then long delay does not allow forever).
 **Non-TTY:** `slipstream act … --confirm-interactive` auto-denies when stdin is not a TTY.
 **Secrets:** reuse alerts denylist/scrub (incl. `jwt=` / `access_key=` / `private_key=` / `api_key=` / `passwd=` — ADV-PL-002) — never put passwords/cookies/tokens in `summary`.
 
-**Server-enforced (ADV-PL-001):** `POST /actions` → captain `confirm` grants a **one-shot** allowance for that category on the lease. Pool CDP helpers for **fill / eval / navigate** consume that allowance or return **403** `confirmation_required` with **no CDP side-effect**. A second gated act without a fresh confirm is refused (re-gate). Deny / TTL expiry stay fail-closed (no allowance). Soft browse remains free. Domain allowlist on navigate still applies when set.
+**Server-enforced (ADV-PL-001) on pool HTTP:** `POST /actions` → captain `confirm` grants a **one-shot** allowance for that category on the lease. Pool helpers for **fill / eval / navigate** check preconditions (cdp present, origin for fill, domain allowlist for nav) **before** consuming; they consume that allowance or return **403** `confirmation_required` with **no CDP side-effect**. Post-consume CDP failure **refunds** the grant. A second gated act without a fresh confirm is refused (re-gate). Deny / pending TTL / unused-grant TTL stay fail-closed. Soft browse remains free. Domain allowlist on navigate still applies when set.
+
+**Raw CDP escape hatch:** `SLIPSTREAM_EXPOSE_RAW_CDP=1` puts `cdp_http_url` / `cdp_ws_url` back on lease JSON. On that path, Playwright/`connect_over_cdp` nav/eval are **honor-system** (not consume_once). Vault credential materialization remains pool `credentials/fill` only.
 
 ```http
 POST /v1/leases/{id}/credentials/fill   # needs fill confirm
@@ -551,9 +553,9 @@ Uses stdlib `urllib`. Env: `SLIPSTREAM_URL` for base URL. Non-zero exit + stderr
 
 ## Driver notes
 
-- Drive leased browsers via CDP (`cdp_http_url` / DevTools WebSocket).
-- Playwright `connectOverCDP` is fine for tests.
-- Thin in-house CDP client is the intended production driver (not shipped in this scaffold).
+- **Default:** drive via pool HTTP — `POST …/navigate`, `POST …/eval`, `POST …/credentials/fill`, plus `act` / `confirm` (ladder server-enforced).
+- **Escape hatch:** `SLIPSTREAM_EXPOSE_RAW_CDP=1` restores lease `cdp_http_url` / `cdp_ws_url` for Playwright `connectOverCDP` / agent-browser. Ladder is honor-system for raw CDP nav/eval; vault fill stays pool-only.
+- Thin in-house `slipstream.cdp_http` helpers remain for smoke/bench when raw CDP is exposed.
 
 ## RSS sampling hook
 

@@ -81,7 +81,7 @@ Pasteable install (incl. compose `/watch`): [`docs/install.md`](docs/install.md)
 export SLIPSTREAM_URL=http://127.0.0.1:8755   # optional; this is the default
 
 slipstream lease --agent-id a1 --space-id task-1
-# → prints lease JSON (lease_id, cdp_http_url, cdp_ws_url, …)
+# → prints lease JSON (lease_id, slot_id, …; cdp_* only if SLIPSTREAM_EXPOSE_RAW_CDP=1)
 
 slipstream heartbeat --lease-id <lease_id>
 slipstream alert need-human --lease-id <lease_id> --reason captcha
@@ -125,7 +125,7 @@ curl -s -X DELETE http://127.0.0.1:8755/v1/leases/<lease_id>
 
 Spaces are exclusive while leased (second agent gets HTTP 409). Warm slots (from explicit DELETE only) with a matching live `space_id` are reused without relaunch. Idle / hard-TTL always stop Chromium.
 
-Drive a leased browser via CDP (`cdp_http_url` / DevTools WebSocket) or Playwright `connectOverCDP`. Smoke/bench use thin HTTP helpers in `slipstream.cdp_http` (PUT `/json/new`).
+Drive a leased browser via **pool HTTP** (`navigate` / `eval` / `cred fill` + act/confirm — ladder server-enforced). Raw CDP URLs are omitted from lease JSON by default; set `SLIPSTREAM_EXPOSE_RAW_CDP=1` for Playwright `connectOverCDP` / agent-browser (honor-system for nav/eval; vault fill stays pool-only). Smoke/bench may use `slipstream.cdp_http` when raw CDP is exposed.
 
 ## Tests & quality gates
 

@@ -46,6 +46,15 @@ class MockCdpInjector:
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def page_url(self, cdp_http_url: str) -> str:
+        with self._lock:
+            self.calls.append(
+                {
+                    "cdp_http_url": cdp_http_url,
+                    "method": "Runtime.evaluate",
+                    "expression_len": len("location.href"),
+                    "purpose": "page_url",
+                }
+            )
         return self.current_url
 
     def fill_fields(

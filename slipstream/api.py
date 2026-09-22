@@ -792,6 +792,8 @@ def make_handler(pool: BrowserPool):
                     )
                 except LadderGateError as e:
                     _ladder_gate_response(self, e)
+                except CdpInjectError as e:
+                    _json_response(self, 502, {"error": "cdp_inject_failed", "detail": str(e)})
                 except LeaseNotFoundError:
                     _json_response(
                         self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id}

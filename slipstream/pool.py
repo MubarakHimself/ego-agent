@@ -151,6 +151,7 @@ from slipstream.actions import (
     ConfirmationGoneError,
     ConfirmationNotFoundError,
     ConfirmationStore,
+    LadderGateError,
     PendingConfirmation,
     confirm_ttl_seconds,
     mint_confirm_id,
@@ -779,8 +780,10 @@ class BrowserPool:
         """Unlock vault + CDP-inject into leased browser. Agent sees ok/labels only.
 
         ADV-PL-001: requires a prior one-shot ``fill`` confirmation on this lease.
-        On login/2FA walls the agent cannot clear, raise need_human(reason=login)
-        via the alerts API — do not ask the LLM for passwords.
+        Preconditions (cdp present, origin match) run before consume; post-consume
+        CDP failure refunds the grant. On login/2FA walls the agent cannot clear,
+        raise need_human(reason=login) via the alerts API — do not ask the LLM
+        for passwords.
         """
         parsed = parse_fill_body(body)
         cred_id = parsed["cred_id"]
@@ -793,18 +796,21 @@ class BrowserPool:
             slot = self._find_slot_by_lease(lease_id)
             if not slot or slot.status != SlotStatus.LEASED:
                 raise LeaseNotFoundError(lease_id)
-            # Fail-closed before vault unlock / CDP side-effect.
-            self._confirmations.consume_once(lease_id, "fill")
             space_id = lease.space_id
             cdp_http = slot.cdp_http_url
             if not cdp_http:
                 raise CdpInjectError("lease has no cdp_http_url")
+            # Fail-closed before vault unlock / CDP — peek only (no burn yet).
+            if not self._confirmations.has_allowance(lease_id, "fill"):
+                raise LadderGateError("fill")
 
         unlocked = self.vault.unlock_for_fill(space_id, cred_id)
         filled: list[str] = []
         triples: list[tuple[str, str, str]] = []
+        consumed = False
         try:
-            # ADV-010: refuse fill when page origin != bound cred.origin
+            # ADV-010 + ADV-PL-001-CONSUME: origin check BEFORE burning grant
+            # (page_url uses Runtime.evaluate — must not run after consume-on-fail).
             bound_origin = unlocked.get("origin", "")
             try:
                 page_href = self._cdp_injector.page_url(cdp_http)
@@ -816,10 +822,22 @@ class BrowserPool:
                 raise VaultValidationError(
                     f"origin mismatch: cred bound to {bound_origin!r} but page is {page_href!r}"
                 )
+            with self._lock:
+                if lease_id not in self._leases:
+                    raise LeaseNotFoundError(lease_id)
+                self._confirmations.consume_once(lease_id, "fill")
+                consumed = True
             for name, selector in fields.items():
                 value = material_for_field(name, unlocked)
                 triples.append((name, selector, value))
-            filled = self._cdp_injector.fill_fields(cdp_http, triples)
+            try:
+                filled = self._cdp_injector.fill_fields(cdp_http, triples)
+            except Exception:
+                if consumed:
+                    with self._lock:
+                        self._confirmations.refund_once(lease_id, "fill")
+                    consumed = False
+                raise
         finally:
             # ADV-008: overwrite + clear secret triples and unlocked material
             for i, (n, s, v) in enumerate(triples):
@@ -2042,7 +2060,8 @@ class BrowserPool:
         """Pool-side Runtime.evaluate. Requires one-shot ``eval`` confirmation.
 
         Soft browse stays free. Expression is never echoed back with secrets;
-        mock records length only.
+        mock records length only. Preconditions (cdp present) before consume;
+        CDP failure after consume refunds the grant.
         """
         parsed = parse_eval_request(body)
         expression = parsed["expression"]
@@ -2054,12 +2073,17 @@ class BrowserPool:
             slot = self._find_slot_by_lease(lease_id)
             if not slot or slot.status != SlotStatus.LEASED:
                 raise LeaseNotFoundError(lease_id)
-            self._confirmations.consume_once(lease_id, "eval")
             cdp_http = slot.cdp_http_url
             if not cdp_http:
                 raise CdpInjectError("lease has no cdp_http_url")
+            self._confirmations.consume_once(lease_id, "eval")
 
-        value = self._cdp_injector.evaluate(cdp_http, expression)
+        try:
+            value = self._cdp_injector.evaluate(cdp_http, expression)
+        except Exception:
+            with self._lock:
+                self._confirmations.refund_once(lease_id, "eval")
+            raise
         self._record_activity(
             lease_id,
             "confirm",
@@ -2077,6 +2101,8 @@ class BrowserPool:
         ADV-PL-001: requires one-shot ``nav_irreversible`` confirmation (all pool
         navigates). Empty effective allowlist = unrestricted domain-wise.
         iframe/subresource not gated (v1). Soft browse (click/scroll/wait) free.
+        Domain allowlist + cdp presence checked before consume; CDP/mock failure
+        after consume refunds the grant.
         """
         if not isinstance(body, dict):
             raise DomainAllowlistError(_ERR_BODY_MUST_JSON)
@@ -2098,54 +2124,58 @@ class BrowserPool:
 
         check_navigate_url(url, patterns)
 
-        # ADV-PL-001: all pool navigates classified as nav_irreversible — consume
-        # one-shot confirm before any CDP / mock side-effect.
+        # ADV-PL-001: preconditions before burn; consume then side-effect.
         with self._lock:
             if lease_id not in self._leases:
                 raise LeaseNotFoundError(lease_id)
+            if not mock and not cdp_http:
+                raise CdpInjectError("lease has no cdp_http_url")
             self._confirmations.consume_once(lease_id, "nav_irreversible")
 
-        if mock:
-            with self._lock:
-                self._nav_log.append(
-                    {"lease_id": lease_id, "url": url, "allowed_domains": patterns}
+        try:
+            if mock:
+                with self._lock:
+                    self._nav_log.append(
+                        {"lease_id": lease_id, "url": url, "allowed_domains": patterns}
+                    )
+                self._record_activity(
+                    lease_id,
+                    "navigate",
+                    safe_url_summary(url),
+                    outcome="ok",
+                    detail={"mock": True},
                 )
+                return {
+                    "ok": True,
+                    "url": url,
+                    "matched": True,
+                    "mock": True,
+                    "allowed_domains": patterns,
+                }
+
+            from slipstream.cdp_http import navigate_via_json_new
+
+            result = navigate_via_json_new(cdp_http, url, allowed_domains=patterns)
+            ok = bool(result.get("matched"))
             self._record_activity(
                 lease_id,
                 "navigate",
                 safe_url_summary(url),
-                outcome="ok",
-                detail={"mock": True},
+                outcome="ok" if ok else "error",
+                detail={"matched": ok},
             )
             return {
-                "ok": True,
+                "ok": ok,
                 "url": url,
-                "matched": True,
-                "mock": True,
+                "matched": ok,
+                "title": (result.get("title") or "")[:200],
+                "observed_url": result.get("url") or "",
                 "allowed_domains": patterns,
             }
-
-        if not cdp_http:
-            raise DomainAllowlistError("lease has no cdp_http_url")
-        from slipstream.cdp_http import navigate_via_json_new
-
-        result = navigate_via_json_new(cdp_http, url, allowed_domains=patterns)
-        ok = bool(result.get("matched"))
-        self._record_activity(
-            lease_id,
-            "navigate",
-            safe_url_summary(url),
-            outcome="ok" if ok else "error",
-            detail={"matched": ok},
-        )
-        return {
-            "ok": ok,
-            "url": url,
-            "matched": ok,
-            "title": (result.get("title") or "")[:200],
-            "observed_url": result.get("url") or "",
-            "allowed_domains": patterns,
-        }
+        except Exception:
+            with self._lock:
+                self._confirmations.refund_once(lease_id, "nav_irreversible")
+            raise
 
 
     def _sync_lease_signed_in(self, lease: Lease) -> None:

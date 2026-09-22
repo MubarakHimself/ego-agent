@@ -7,11 +7,17 @@ Gated act → confirmation_required + sibling need_human on the same alerts bus
 (kind=confirmation_required + confirm_id). Confirm|deny within ~60s; auto-deny
 on expiry. Non-TTY interactive confirm → deny.
 
-ADV-PL-001 (server-enforced): confirm grants a **one-shot** allowance for that
-category on the lease. CDP helpers for ``fill`` (credentials fill), ``eval``
-(Runtime.evaluate / script), and ``nav_irreversible`` (all pool navigates)
-**refuse** without a prior confirm for that category — no CDP side-effect.
-Deny / timeout stay fail-closed. Domain allowlist on navigate remains enforced.
+ADV-PL-001 (server-enforced on pool HTTP): confirm grants a **one-shot**
+allowance for that category on the lease. Pool helpers for ``fill``
+(credentials fill), ``eval`` (Runtime.evaluate / script), and
+``nav_irreversible`` (all pool navigates) **refuse** without a prior confirm
+for that category — no CDP side-effect. Unused grants TTL with the same
+confirm window (``SLIPSTREAM_CONFIRM_TTL``). Deny / timeout stay fail-closed.
+Domain allowlist on navigate remains enforced.
+
+Raw CDP: lease responses omit ``cdp_http_url`` / ``cdp_ws_url`` by default
+(Firstmate B). ``SLIPSTREAM_EXPOSE_RAW_CDP=1`` restores them; on that path
+navigation/eval are agent-trust / honor-system (vault fill stays pool-only).
 
 Defer: once/always/never policy matrix, Comet UI.
 Pattern from agent-browser Security docs (no code theft).
@@ -75,6 +81,16 @@ def confirm_ttl_seconds() -> int:
     if n <= 0:
         return DEFAULT_CONFIRM_TTL_S
     return min(n, 3600)
+
+
+def expose_raw_cdp() -> bool:
+    """When True, lease/status wire JSON includes cdp_http_url / cdp_ws_url.
+
+    Default False (Firstmate B): agents drive via pool HTTP so consume_once is
+    real. Escape hatch ``SLIPSTREAM_EXPOSE_RAW_CDP=1`` restores raw CDP URLs;
+    ladder is honor-system for nav/eval on that path (vault fill stays pool-only).
+    """
+    return os.environ.get("SLIPSTREAM_EXPOSE_RAW_CDP", "").strip() == "1"
 
 
 def mint_confirm_id() -> str:
@@ -187,6 +203,8 @@ class ConfirmationStore:
     _by_lease: dict[str, list[str]] = field(default_factory=dict)
     # (lease_id, category) → remaining one-shot grants after confirm.
     _allow_counts: dict[tuple[str, str], int] = field(default_factory=dict)
+    # (lease_id, category) → unix expiry for unused grants (confirm TTL).
+    _allow_expires: dict[tuple[str, str], float] = field(default_factory=dict)
 
     def add(self, pending: PendingConfirmation) -> None:
         self._by_id[pending.confirm_id] = pending
@@ -204,37 +222,63 @@ class ConfirmationStore:
                 out.append(p)
         return out
 
+    def _purge_expired_grants(self, now: float) -> None:
+        """Drop unused allowances past confirm TTL (ADV-PL-001-IMMORTAL-GRANT)."""
+        for key in list(self._allow_expires):
+            if now >= self._allow_expires[key]:
+                self._allow_expires.pop(key, None)
+                self._allow_counts.pop(key, None)
+
     def expire_due(self, now: float | None = None) -> list[PendingConfirmation]:
-        """Mark overdue pending as expired; return those newly expired."""
+        """Mark overdue pending as expired; TTL unused grants; return newly expired pending."""
         now = time.time() if now is None else now
         newly: list[PendingConfirmation] = []
         for p in list(self._by_id.values()):
             if p.status == STATUS_PENDING and now >= p.expires_at:
                 p.status = STATUS_EXPIRED
                 newly.append(p)
+        self._purge_expired_grants(now)
         return newly
 
-    def grant_once(self, lease_id: str, category: str) -> None:
-        """Captain confirm → one CDP act of this category may proceed."""
+    def grant_once(self, lease_id: str, category: str, *, now: float | None = None) -> None:
+        """Captain confirm → one CDP act of this category may proceed (TTL'd)."""
+        now = time.time() if now is None else now
+        self._purge_expired_grants(now)
         key = (lease_id, category)
         self._allow_counts[key] = self._allow_counts.get(key, 0) + 1
+        # Fresh confirm refreshes the unused-grant window (same as pending TTL).
+        self._allow_expires[key] = now + float(confirm_ttl_seconds())
 
-    def consume_once(self, lease_id: str, category: str) -> None:
+    def has_allowance(self, lease_id: str, category: str, *, now: float | None = None) -> bool:
+        """True if a non-expired one-shot grant remains (does not consume)."""
+        now = time.time() if now is None else now
+        self._purge_expired_grants(now)
+        return self._allow_counts.get((lease_id, category), 0) > 0
+
+    def consume_once(self, lease_id: str, category: str, *, now: float | None = None) -> None:
         """Consume one-shot allowance or raise LadderGateError (fail-closed)."""
+        now = time.time() if now is None else now
+        self._purge_expired_grants(now)
         key = (lease_id, category)
         n = self._allow_counts.get(key, 0)
         if n <= 0:
             raise LadderGateError(category)
         if n == 1:
             del self._allow_counts[key]
+            self._allow_expires.pop(key, None)
         else:
             self._allow_counts[key] = n - 1
+
+    def refund_once(self, lease_id: str, category: str, *, now: float | None = None) -> None:
+        """Restore one allowance after post-consume failure (ADV-PL-001-CONSUME)."""
+        self.grant_once(lease_id, category, now=now)
 
     def clear_lease(self, lease_id: str) -> None:
         """Drop allowances when a lease leaves the pool."""
         for key in list(self._allow_counts):
             if key[0] == lease_id:
                 del self._allow_counts[key]
+                self._allow_expires.pop(key, None)
 
 
 def parse_eval_request(body: dict[str, Any]) -> dict[str, Any]:
