@@ -8,7 +8,7 @@ description: >
   browser). HTTP + this CLI/skill surface only — there is no MCP server.
   For video watch intents, compose a separate /watch skill (not Slipstream).
 metadata:
-  version: "0.4.1"
+  version: "0.5.0"
   date: "2026-09-22"
 ---
 
@@ -38,11 +38,9 @@ register a skill named `browser` (collides with Hermes built-in).
 
 **Do not use when:**
 - A plain HTTP fetch/`curl` is enough for a static public page.
-- The intent is “watch / summarize this video” — **compose** upstream
-  Claude `/watch` (`bradautomates/claude-video`; e.g.
-  `npx skills add bradautomates/claude-video -g`). Route the intent; do
-  **not** invent a Slipstream video API and do **not** vendor watch scripts.
-  `slipstream doctor` warns (not fails) if `/watch` is missing.
+- The intent is "watch / summarize this video" (URL or local path) — **compose**
+  upstream Claude `/watch` (see **Compose /watch** below). Route the intent;
+  do **not** invent a Slipstream video API and do **not** vendor watch scripts.
 - You are looking for an MCP tool — there is none; use this CLI (or HTTP).
 
 Do **not** launch `google-chrome` / `chromium` yourself.
@@ -62,8 +60,10 @@ slipstream doctor --json
 
 `doctor` checks: Chrome binary, ephemeral CDP probe (`/json/version`), pool
 `GET /healthz`, Spaces root writable, this skill file present, and optional
-composed `/watch` (`watch_compose` — **warn** only if missing; never fails;
-never vendored). Exit 0 if no failures (warnings/skips allowed).
+composed `/watch` (`watch_compose` — **PASS** if found at a known path,
+**WARN** if missing; never fails; never vendored). Also:
+`slipstream watch-status` (thin compose-only status). Exit 0 if no failures
+(warnings/skips allowed). Pasteable agent install: [`docs/install.md`](../../docs/install.md).
 
 **Versions:** package `slipstream.__version__` is `0.1.0`. Skill
 `metadata.version` (`0.2.0`) is the skill-doc revision and may differ —
@@ -143,6 +143,64 @@ curl -s "$SLIPSTREAM_URL/healthz"
 ```
 
 (`SLIPSTREAM_URL` defaults to `http://127.0.0.1:8755` if unset.)
+
+
+## Compose /watch (video intents — do not reimplement)
+
+**Rule:** Slipstream **routes** video intents to an installed upstream `/watch`
+skill. It does **not** embed or vendor `bradautomates/claude-video` scripts
+(no yt-dlp / ffmpeg / Whisper reimplementation here).
+
+### When to route
+
+Hand off to `/watch` when the user or agent intent is about a **video URL or
+local media path**, for example:
+
+- YouTube / Vimeo / Loom / TikTok / X / Twitch clip / other yt-dlp URLs
+- Local `.mp4` / `.mov` / `.mkv` / `.webm` (or similar)
+- Asks like “what’s in this video”, “summarize this clip”, “what happens at
+  0:42”, “bug repro from this screen recording”
+
+Keep **interactive web** (forms, QA, login, CDP automation) on a Slipstream
+**Space lease**. Live human observe of a leased page is Slipstream’s tokenized
+Watch JPEG/HTML (`need_human`) — that is **not** the Claude `/watch` skill.
+
+### Install upstream `/watch`
+
+```bash
+# Agent Skills CLI (Codex / Cursor / Gemini / 50+ hosts)
+npx skills add bradautomates/claude-video -g
+
+# Claude Code marketplace
+#   /plugin marketplace add bradautomates/claude-video
+#   /plugin install watch@claude-video
+```
+
+Override detection: `SLIPSTREAM_WATCH_SKILL=/path/to/watch/SKILL.md`.
+
+Doctor known paths include `~/.claude|codex|cursor|agents|openclaw|gemini|slipstream/skills/watch/SKILL.md`
+and Claude Code plugin cache. Missing `/watch` → `watch_compose` **WARN** only.
+
+```bash
+slipstream doctor            # watch_compose OK|WARN
+slipstream watch-status      # compose-only
+slipstream watch-status --json
+```
+
+### How to invoke (after install)
+
+1. Confirm skill present (`doctor` / `watch-status`).
+2. Read the installed `/watch` `SKILL.md` (harness shows the path).
+3. Follow that skill’s contract (user-invocable `/watch`, or
+   `python3 "$SKILL_DIR/scripts/watch.py" "<url-or-path>" …` after setup).
+4. Prefer **native captions** (free). Whisper keys are optional upstream —
+   Slipstream never requires paid Whisper.
+
+### Non-goals
+
+- Do **not** copy `watch.py` / `download.py` / `frames.py` into this repo
+- Do **not** call Monid or paid tool marketplaces for video
+- Do **not** treat Slipstream pool HTTP as a video API
 
 ## Alerts (need_human + task_done)
 
@@ -301,6 +359,7 @@ slipstream alert   need-human|done --lease-id ID [options] [--url URL]
 slipstream release --lease-id ID [--reason REASON] [--url URL]
 slipstream status  [--url URL]
 slipstream doctor  [--url URL] [--json]
+slipstream watch-status [--json]
 slipstream cred    bind|unbind|list|fill …
 ```
 
@@ -314,8 +373,8 @@ slipstream cred    bind|unbind|list|fill …
 - No free-read of Space cookies / credential dumps.
 - Live pair-browse UI polish, optional stuck/captcha chips, Take/Cede exclusive
   lock are **later**.
-- Compose `/watch` remains upstream (see doctor warn). Alerts + credential
-  vault/fill **are** on the CLI/HTTP surface.
+- Compose `/watch` remains upstream (see **Compose /watch**; doctor WARN if
+  missing). Alerts + credential vault/fill **are** on the CLI/HTTP surface.
 
 ## Examples
 
@@ -344,6 +403,7 @@ SLIPSTREAM_MOCK=1 slipstream serve --port 8755
 
 ## References
 
+- [Install (agent paste)](../../docs/install.md)
 - [Pool HTTP API](../../docs/POOL_API.md)
 - [Architecture lock](../../docs/ARCHITECTURE.md)
 - [README](../../README.md)

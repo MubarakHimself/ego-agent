@@ -50,6 +50,7 @@ benches/             # Sample benchmark outputs (committed samples)
 docs/
   ARCHITECTURE.md    # Captain lock
   POOL_API.md        # HTTP endpoints (+ CLI as another client)
+  install.md         # Agent-pasteable install + compose /watch
 data/spaces/         # Runtime Space profiles (gitignored)
 ```
 
@@ -72,6 +73,7 @@ slipstream serve --port 8755
 
 Base URL: `http://127.0.0.1:8755` — see [`docs/POOL_API.md`](docs/POOL_API.md).
 Agent skill: [`skills/slipstream/SKILL.md`](skills/slipstream/SKILL.md).
+Pasteable install (incl. compose `/watch`): [`docs/install.md`](docs/install.md).
 
 ### Agent CLI (against a running pool)
 
@@ -96,6 +98,10 @@ slipstream status
 # optional composed /watch (watch_compose WARN if missing — never fails).
 slipstream doctor
 slipstream doctor --json
+
+# Compose /watch detection only (WARN if missing — never fails the process)
+slipstream watch-status
+slipstream watch-status --json
 ```
 
 Exit 0 if no failures (warnings/skips allowed, e.g. pool not yet started or
