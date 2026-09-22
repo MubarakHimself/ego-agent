@@ -14,6 +14,14 @@ Human output by default; --json for machines. Exit 0 if no failures
 
 from __future__ import annotations
 
+_SKILL_MD = "SKILL.md"
+_LABEL_SKILLS = "skills"
+_LABEL_WATCH = "watch"
+_LABEL_CDP_PROBE = "cdp_probe"
+_LABEL_POOL_HEALTHZ = "pool_healthz"
+_ENV_MOCK = "SLIPSTREAM_MOCK"
+_UTF8 = "utf-8"
+
 import json
 import os
 import shutil
@@ -104,7 +112,7 @@ def _read_skill_head_nofollow(path: Path, *, limit: int = 4096) -> str | None:
         data = os.read(fd, limit)
     finally:
         os.close(fd)
-    return data.decode("utf-8", errors="replace")
+    return data.decode(_UTF8, errors="replace")
 
 
 def _frontmatter_name(head: str) -> str | None:
@@ -148,7 +156,7 @@ def _looks_like_watch_skill(path: Path) -> bool:
         return False
     name = _frontmatter_name(head)
     if name is not None:
-        return name == "watch"
+        return name == _LABEL_WATCH
     lower = head.lower()
     markers = ("/watch", "claude-video", "bradautomates", "yt-dlp", "watch_detail")
     return sum(1 for m in markers if m in lower) >= 2
@@ -213,11 +221,11 @@ def _iter_plugin_cache_watch_skills(cache_root: Path) -> list[Path]:
                             if depth < _PLUGIN_CACHE_MAX_DEPTH:
                                 stack.append((Path(ent.path), depth + 1))
                             continue
-                        if ent.name != "SKILL.md":
+                        if ent.name != _SKILL_MD:
                             continue
                         leaf = Path(ent.path)
                         # Only …/skills/watch/SKILL.md
-                        if leaf.parent.name != "watch" or leaf.parent.parent.name != "skills":
+                        if leaf.parent.name != _LABEL_WATCH or leaf.parent.parent.name != _LABEL_SKILLS:
                             continue
                         # Containment after lstat (do not resolve the leaf).
                         try:
@@ -243,17 +251,17 @@ def _watch_skill_candidates() -> list[Path]:
         candidates.append(Path(env).expanduser())
     # Explicit skill dirs used by Claude Code / Codex / Cursor / Agent Skills CLI
     for root in (
-        Path.cwd() / "skills" / "watch",
-        home / ".claude" / "skills" / "watch",
-        home / ".codex" / "skills" / "watch",
-        home / ".cursor" / "skills" / "watch",
-        home / ".agents" / "skills" / "watch",
-        home / ".openclaw" / "skills" / "watch",
-        home / ".gemini" / "skills" / "watch",
+        Path.cwd() / _LABEL_SKILLS / _LABEL_WATCH,
+        home / ".claude" / _LABEL_SKILLS / _LABEL_WATCH,
+        home / ".codex" / _LABEL_SKILLS / _LABEL_WATCH,
+        home / ".cursor" / _LABEL_SKILLS / _LABEL_WATCH,
+        home / ".agents" / _LABEL_SKILLS / _LABEL_WATCH,
+        home / ".openclaw" / _LABEL_SKILLS / _LABEL_WATCH,
+        home / ".gemini" / _LABEL_SKILLS / _LABEL_WATCH,
         # Firstmate / EgoRuntime convention (relative to $HOME)
-        home / ".slipstream" / "skills" / "watch",
+        home / ".slipstream" / _LABEL_SKILLS / _LABEL_WATCH,
     ):
-        candidates.append(root / "SKILL.md")
+        candidates.append(root / _SKILL_MD)
     # Claude Code marketplace plugin cache: …/claude-video/watch/<ver>/skills/watch/SKILL.md
     for cache_root in (
         home / ".claude" / "plugins" / "cache" / "claude-video",
@@ -336,16 +344,16 @@ def find_skill_path() -> Path | None:
     try:
         import skills.slipstream as _skill_pkg  # type: ignore[import-not-found]
 
-        bundled = Path(_skill_pkg.__file__).resolve().parent / "SKILL.md"
+        bundled = Path(_skill_pkg.__file__).resolve().parent / _SKILL_MD
         candidates.append(bundled)
     except Exception:  # noqa: BLE001 — optional import path
         pass
     pkg_root = Path(__file__).resolve().parent.parent  # repo root when editable
     candidates.extend(
         [
-            pkg_root / "skills" / "slipstream" / "SKILL.md",
-            Path.cwd() / "skills" / "slipstream" / "SKILL.md",
-            Path.cwd() / "skills" / "slipstream-browser" / "SKILL.md",
+            pkg_root / _LABEL_SKILLS / "slipstream" / _SKILL_MD,
+            Path.cwd() / _LABEL_SKILLS / "slipstream" / _SKILL_MD,
+            Path.cwd() / _LABEL_SKILLS / "slipstream-browser" / _SKILL_MD,
         ]
     )
     for path in candidates:
@@ -355,19 +363,19 @@ def find_skill_path() -> Path | None:
 
 
 def _check_mock() -> CheckResult:
-    mock = os.environ.get("SLIPSTREAM_MOCK", "") == "1"
+    mock = os.environ.get(_ENV_MOCK, "") == "1"
     if mock:
         return CheckResult(
             name="mock",
             status="warn",
             message="SLIPSTREAM_MOCK=1 — mock ON; real out-of-box path expects mock OFF",
-            detail={"SLIPSTREAM_MOCK": "1"},
+            detail={_ENV_MOCK: "1"},
         )
     return CheckResult(
         name="mock",
         status="ok",
         message="mock OFF (real Chrome path)",
-        detail={"SLIPSTREAM_MOCK": os.environ.get("SLIPSTREAM_MOCK", "")},
+        detail={_ENV_MOCK: os.environ.get(_ENV_MOCK, "")},
     )
 
 
@@ -443,14 +451,14 @@ def _probe_cdp_with_chrome(binary: str, *, timeout: float = 12.0) -> CheckResult
                 time.sleep(0.15)
         if version is None:
             return CheckResult(
-                name="cdp_probe",
+                name=_LABEL_CDP_PROBE,
                 status="fail",
                 message=f"CDP probe failed at {url}: {last_err}",
                 detail={"port": port, "binary": binary, "error": last_err},
             )
         browser = version.get("Browser") or version.get("Product") or "unknown"
         return CheckResult(
-            name="cdp_probe",
+            name=_LABEL_CDP_PROBE,
             status="ok",
             message=f"CDP ready ({browser})",
             detail={
@@ -462,7 +470,7 @@ def _probe_cdp_with_chrome(binary: str, *, timeout: float = 12.0) -> CheckResult
         )
     except OSError as e:
         return CheckResult(
-            name="cdp_probe",
+            name=_LABEL_CDP_PROBE,
             status="fail",
             message=f"Failed to launch Chrome for CDP probe: {e}",
             detail={"binary": binary, "error": str(e)},
@@ -489,14 +497,14 @@ def _probe_cdp_with_chrome(binary: str, *, timeout: float = 12.0) -> CheckResult
 def _check_cdp_probe(chrome: CheckResult) -> CheckResult:
     if chrome.status != "ok":
         return CheckResult(
-            name="cdp_probe",
+            name=_LABEL_CDP_PROBE,
             status="skip",
             message="Skipped — Chrome binary missing",
             detail={},
         )
-    if os.environ.get("SLIPSTREAM_MOCK") == "1":
+    if os.environ.get(_ENV_MOCK) == "1":
         return CheckResult(
-            name="cdp_probe",
+            name=_LABEL_CDP_PROBE,
             status="skip",
             message="Skipped — SLIPSTREAM_MOCK=1 (no real CDP)",
             detail={},
@@ -504,7 +512,7 @@ def _check_cdp_probe(chrome: CheckResult) -> CheckResult:
     binary = chrome.detail.get("binary")
     if not isinstance(binary, str):
         return CheckResult(
-            name="cdp_probe",
+            name=_LABEL_CDP_PROBE,
             status="fail",
             message="Internal error: chrome check missing binary path",
             detail={},
@@ -516,40 +524,40 @@ def _check_pool_healthz(base_url: str) -> CheckResult:
     url = _validate_api_request_url(f"{base_url.rstrip('/')}/healthz")
     try:
         with urllib.request.urlopen(url, timeout=3.0) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
+            raw = resp.read().decode(_UTF8, errors="replace")
             try:
                 payload: Any = json.loads(raw) if raw else {}
             except json.JSONDecodeError:
                 payload = {"raw": raw}
             if resp.status == 200:
                 return CheckResult(
-                    name="pool_healthz",
+                    name=_LABEL_POOL_HEALTHZ,
                     status="ok",
                     message=f"Pool healthy at {url}",
                     detail={"url": url, "status": resp.status, "body": payload},
                 )
             return CheckResult(
-                name="pool_healthz",
+                name=_LABEL_POOL_HEALTHZ,
                 status="fail",
                 message=f"Pool healthz HTTP {resp.status}",
                 detail={"url": url, "status": resp.status, "body": payload},
             )
     except urllib.error.HTTPError as e:
         # HTTPError is a URLError subclass — catch first so 4xx/5xx fail doctor
-        raw = e.read().decode("utf-8", errors="replace") if e.fp is not None else ""
+        raw = e.read().decode(_UTF8, errors="replace") if e.fp is not None else ""
         try:
             payload = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
             payload = {"raw": raw or e.reason}
         return CheckResult(
-            name="pool_healthz",
+            name=_LABEL_POOL_HEALTHZ,
             status="fail",
             message=f"Pool healthz HTTP {e.code}",
             detail={"url": url, "status": e.code, "body": payload},
         )
     except urllib.error.URLError as e:
         return CheckResult(
-            name="pool_healthz",
+            name=_LABEL_POOL_HEALTHZ,
             status="warn",
             message=(
                 f"Pool not reachable at {url} ({e.reason}). "
@@ -559,7 +567,7 @@ def _check_pool_healthz(base_url: str) -> CheckResult:
         )
     except TimeoutError:
         return CheckResult(
-            name="pool_healthz",
+            name=_LABEL_POOL_HEALTHZ,
             status="warn",
             message=f"Pool healthz timed out at {url}. Start with: slipstream serve",
             detail={"url": url},
@@ -572,7 +580,7 @@ def _check_spaces_root() -> CheckResult:
     try:
         root.mkdir(parents=True, exist_ok=True)
         probe = root / ".slipstream-doctor-write"
-        probe.write_text("ok", encoding="utf-8")
+        probe.write_text("ok", encoding=_UTF8)
         probe.unlink(missing_ok=True)
         return CheckResult(
             name="spaces_root",
@@ -637,7 +645,7 @@ def _check_skill_path() -> CheckResult:
 
 def run_doctor(*, url: str | None = None) -> DoctorReport:
     base = resolve_base_url(url)
-    mock = os.environ.get("SLIPSTREAM_MOCK", "") == "1"
+    mock = os.environ.get(_ENV_MOCK, "") == "1"
     checks: list[CheckResult] = []
     checks.append(_check_mock())
     chrome = _check_chrome()

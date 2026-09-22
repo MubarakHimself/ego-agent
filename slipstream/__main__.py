@@ -19,6 +19,11 @@ HTTP remains the primary surface — there is no MCP server.
 
 from __future__ import annotations
 
+_STORE_TRUE = "store_true"
+_OPT_LEASE_ID = "--lease-id"
+_OPT_SPACE_ID = "--space-id"
+_OPT_TAG = "--tag"
+
 import argparse
 import signal
 import sys
@@ -112,12 +117,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_serve.add_argument(
         "--mock",
-        action="store_true",
+        action=_STORE_TRUE,
         help="Mock Chromium launches (same as SLIPSTREAM_MOCK=1)",
     )
     p_serve.add_argument(
         "--headed",
-        action="store_true",
+        action=_STORE_TRUE,
         help="Run Chromium headed (not headless)",
     )
     p_serve.set_defaults(_handler="serve")
@@ -134,7 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_lease = sub.add_parser("lease", help="Acquire a lease (prints lease JSON)")
     _add_url(p_lease)
     p_lease.add_argument("--agent-id", required=True, help="Calling agent id")
-    p_lease.add_argument("--space-id", required=True, help="Space / user-data-dir id")
+    p_lease.add_argument(_OPT_SPACE_ID, required=True, help="Space / user-data-dir id")
     p_lease.add_argument(
         "--ttl-seconds",
         type=int,
@@ -147,7 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
         help='Optional user_metadata JSON object, e.g. \'{"env":"staging"}\'',
     )
     p_lease.add_argument(
-        "--tag",
+        _OPT_TAG,
         action="append",
         default=None,
         help="Lease metadata tag key=value (repeatable; overrides/extends --metadata)",
@@ -162,13 +167,13 @@ def build_parser() -> argparse.ArgumentParser:
     # --- heartbeat ---
     p_hb = sub.add_parser("heartbeat", help="Renew a lease soft-idle window")
     _add_url(p_hb)
-    p_hb.add_argument("--lease-id", required=True, help="Lease id from lease JSON")
+    p_hb.add_argument(_OPT_LEASE_ID, required=True, help="Lease id from lease JSON")
     p_hb.set_defaults(_handler="heartbeat")
 
     # --- release ---
     p_rel = sub.add_parser("release", help="Release a lease (DELETE)")
     _add_url(p_rel)
-    p_rel.add_argument("--lease-id", required=True, help="Lease id from lease JSON")
+    p_rel.add_argument(_OPT_LEASE_ID, required=True, help="Lease id from lease JSON")
     p_rel.add_argument(
         "--reason",
         default=None,
@@ -192,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["need-human", "done"],
         help="need-human: pause agent, keep Chromium; done: notify once then release",
     )
-    p_alert.add_argument("--lease-id", required=True, help="Lease id from lease JSON")
+    p_alert.add_argument(_OPT_LEASE_ID, required=True, help="Lease id from lease JSON")
     p_alert.add_argument(
         "--reason",
         default=None,
@@ -208,7 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_alert.add_argument(
         "--fail",
-        action="store_true",
+        action=_STORE_TRUE,
         help="task_done: outcome.ok=false (default is success)",
     )
     p_alert.add_argument(
@@ -228,7 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_bind = cred_sub.add_parser("bind", help="Bind secret to a Space (captain/local)")
     _add_url(p_bind)
-    p_bind.add_argument("--space-id", required=True)
+    p_bind.add_argument(_OPT_SPACE_ID, required=True)
     p_bind.add_argument("--label", required=True)
     p_bind.add_argument("--origin", required=True)
     p_bind.add_argument("--username", required=True)
@@ -249,20 +254,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_bind.add_argument(
         "--prompt",
-        action="store_true",
+        action=_STORE_TRUE,
         help="Prompt for secret via getpass (no echo)",
     )
     p_bind.set_defaults(_handler="cred_bind")
 
     p_unbind = cred_sub.add_parser("unbind", help="Unbind a credential from a Space")
     _add_url(p_unbind)
-    p_unbind.add_argument("--space-id", required=True)
+    p_unbind.add_argument(_OPT_SPACE_ID, required=True)
     p_unbind.add_argument("--cred-id", required=True)
     p_unbind.set_defaults(_handler="cred_unbind")
 
     p_clist = cred_sub.add_parser("list", help="List credential metadata (no secrets)")
     _add_url(p_clist)
-    p_clist.add_argument("--space-id", required=True)
+    p_clist.add_argument(_OPT_SPACE_ID, required=True)
     p_clist.set_defaults(_handler="cred_list")
 
     p_fill = cred_sub.add_parser(
@@ -270,7 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Pool-side CDP fill (cred_id + selectors only; agent never sees secret)",
     )
     _add_url(p_fill)
-    p_fill.add_argument("--lease-id", required=True)
+    p_fill.add_argument(_OPT_LEASE_ID, required=True)
     p_fill.add_argument("--cred-id", required=True)
     p_fill.add_argument(
         "--fields",
@@ -285,7 +290,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Request gated act (eval|download|upload|nav_irreversible); may need confirm",
     )
     _add_url(p_act)
-    p_act.add_argument("--lease-id", required=True)
+    p_act.add_argument(_OPT_LEASE_ID, required=True)
     p_act.add_argument(
         "--category",
         required=True,
@@ -298,7 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_act.add_argument(
         "--confirm-interactive",
-        action="store_true",
+        action=_STORE_TRUE,
         help="Prompt y/N on TTY; Non-TTY auto-denies",
     )
     p_act.set_defaults(_handler="act")
@@ -329,7 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Top-frame navigate on a lease (refused outside domain allowlist)",
     )
     _add_url(p_nav)
-    p_nav.add_argument("--lease-id", required=True)
+    p_nav.add_argument(_OPT_LEASE_ID, required=True)
     p_nav.add_argument("--page-url", required=True, help="http(s) URL to open")
     p_nav.set_defaults(_handler="navigate")
 
@@ -340,7 +345,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_url(p_sp_list)
     p_sp_list.add_argument("--q", default=None, help="Metadata query (key=value AND… / substring)")
     p_sp_list.add_argument(
-        "--tag",
+        _OPT_TAG,
         action="append",
         default=None,
         help="Filter tag key=value (repeatable; AND with --q)",
@@ -348,14 +353,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_sp_list.set_defaults(_handler="spaces_list")
     p_sp_set = spaces_sub.add_parser("set", help="Set/replace Space user_metadata tags")
     _add_url(p_sp_set)
-    p_sp_set.add_argument("--space-id", required=True, help="Space id")
+    p_sp_set.add_argument(_OPT_SPACE_ID, required=True, help="Space id")
     p_sp_set.add_argument(
         "--metadata",
         default=None,
         help='user_metadata JSON object, e.g. \'{"env":"staging","team":"fleet"}\'',
     )
     p_sp_set.add_argument(
-        "--tag",
+        _OPT_TAG,
         action="append",
         default=None,
         help="Tag key=value (repeatable)",
@@ -374,7 +379,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_url(p_ls_list)
     p_ls_list.add_argument("--q", default=None, help="Metadata query (key=value AND… / substring)")
     p_ls_list.add_argument(
-        "--tag",
+        _OPT_TAG,
         action="append",
         default=None,
         help="Filter tag key=value (repeatable; AND with --q)",
@@ -388,7 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_url(p_doc)
     p_doc.add_argument(
         "--json",
-        action="store_true",
+        action=_STORE_TRUE,
         dest="as_json",
         help="Emit machine-readable JSON instead of human text",
     )
@@ -401,7 +406,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ws.add_argument(
         "--json",
-        action="store_true",
+        action=_STORE_TRUE,
         dest="as_json",
         help="Emit machine-readable JSON",
     )

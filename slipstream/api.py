@@ -62,6 +62,71 @@ from slipstream.pool import (
 from slipstream.vault import CredNotFoundError, VaultUnavailableError, VaultValidationError
 from slipstream.metadata import MetadataValidationError
 
+# --- quality-debt: shared path / header / error literals (SKY-L027) ---
+_HDR_CONTENT_TYPE = "Content-Type"
+_HDR_CONTENT_LENGTH = "Content-Length"
+_UTF8 = "utf-8"
+_PART_V1 = "v1"
+_PART_LEASES = "leases"
+_PART_SPACES = "spaces"
+_PART_WATCH = "watch"
+_PART_CREDENTIALS = "credentials"
+_ERR_NOT_FOUND = "not_found"
+_ERR_LEASE_NOT_FOUND = "lease_not_found"
+_ERR_BAD_REQUEST = "bad_request"
+_ERR_INVALID_JSON = "invalid_json"
+_ERR_INVALID_ACTION = "invalid_action"
+_ERR_INVALID_CREDENTIALS = "invalid_credentials"
+_QS_WATCH_AUTH = "token"  # skylos: ignore[SKY-L014,SKY-L032] query param name, not a secret
+_FIELD_ALLOWED_DOMAINS = "allowed_domains"
+_FIELD_USER_METADATA = "user_metadata"
+
+
+def _v1_resource_tail(parts: list[str], resource: str, *tail: str) -> str | None:
+    """Return id when parts == [v1, resource, id, *tail]; else None."""
+    if len(parts) != 3 + len(tail):
+        return None
+    if parts[0] != _PART_V1 or parts[1] != resource:
+        return None
+    if tuple(parts[3:]) != tail:
+        return None
+    return parts[2]
+
+
+def _v1_lease_tail(parts: list[str], *tail: str) -> str | None:
+    return _v1_resource_tail(parts, _PART_LEASES, *tail)
+
+
+def _v1_space_tail(parts: list[str], *tail: str) -> str | None:
+    return _v1_resource_tail(parts, _PART_SPACES, *tail)
+
+
+def _drain_request_body(handler: BaseHTTPRequestHandler) -> None:
+    length = int(handler.headers.get(_HDR_CONTENT_LENGTH, "0") or 0)
+    if length > 0:
+        handler.rfile.read(length)
+
+
+def _watch_form_redirect(handler: BaseHTTPRequestHandler, lease_id: str, token: str | None) -> bool:
+    """If HTML form POST, send 303 to Watch page; return True when handled."""
+    content_type = (handler.headers.get(_HDR_CONTENT_TYPE) or "").lower()
+    if "application/x-www-form-urlencoded" not in content_type:
+        return False
+    from urllib.parse import urlencode
+
+    loc = (
+        f"/v1/leases/{lease_id}/watch?"
+        + urlencode({_QS_WATCH_AUTH: token or "", "mode": "takeover"})
+    )
+    handler.send_response(303)
+    handler.send_header("Location", loc)
+    handler.send_header(_HDR_CONTENT_LENGTH, "0")
+    for hk, hv in WATCH_CLICKJACK_HEADERS.items():
+        handler.send_header(hk, hv)
+    handler.end_headers()
+    return True
+
+
 # ADV-003: shared refuse matcher for free-read secret / cookie dump paths (GET+POST)
 _REFUSED_CRED_TAILS = frozenset(
     {"secret", "secrets", "cookies", "storage_state", "dump"}
@@ -72,7 +137,7 @@ def is_refused_credentials_path(parts: list[str]) -> bool:
     """True when path looks like …/credentials/{secret|cookies|…} free-read."""
     return (
         len(parts) >= 4
-        and "credentials" in parts
+        and _PART_CREDENTIALS in parts
         and parts[-1] in _REFUSED_CRED_TAILS
     )
 
@@ -91,10 +156,10 @@ def _json_response(
     *,
     extra_headers: dict[str, str] | None = None,
 ) -> None:
-    raw = json.dumps(body).encode("utf-8")
+    raw = json.dumps(body).encode(_UTF8)
     handler.send_response(status)
-    handler.send_header("Content-Type", "application/json")
-    handler.send_header("Content-Length", str(len(raw)))
+    handler.send_header(_HDR_CONTENT_TYPE, "application/json")
+    handler.send_header(_HDR_CONTENT_LENGTH, str(len(raw)))
     if extra_headers:
         for k, v in extra_headers.items():
             handler.send_header(k, v)
@@ -111,8 +176,8 @@ def _bytes_response(
     extra_headers: dict[str, str] | None = None,
 ) -> None:
     handler.send_response(status)
-    handler.send_header("Content-Type", content_type)
-    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header(_HDR_CONTENT_TYPE, content_type)
+    handler.send_header(_HDR_CONTENT_LENGTH, str(len(body)))
     handler.send_header("Cache-Control", "no-store")
     if extra_headers:
         for k, v in extra_headers.items():
@@ -183,13 +248,13 @@ def make_handler(pool: BrowserPool):
             pass
 
         def _read_json(self) -> dict[str, Any]:
-            length = int(self.headers.get("Content-Length", "0") or 0)
+            length = int(self.headers.get(_HDR_CONTENT_LENGTH, "0") or 0)
             if length <= 0:
                 return {}
             raw = self.rfile.read(length)
             if not raw:
                 return {}
-            return json.loads(raw.decode("utf-8"))
+            return json.loads(raw.decode(_UTF8))
 
         def do_GET(self) -> None:  # noqa: N802
             path = urlparse(self.path).path.rstrip("/") or "/"
@@ -213,20 +278,15 @@ def make_handler(pool: BrowserPool):
                 return
             # GET /v1/spaces/{space_id}/credentials — metadata only
             parts = path.strip("/").split("/")
-            if (
-                len(parts) == 4
-                and parts[0] == "v1"
-                and parts[1] == "spaces"
-                and parts[3] == "credentials"
-            ):
-                space_id = parts[2]
+            space_id = _v1_space_tail(parts, _PART_CREDENTIALS)
+            if space_id is not None:
                 try:
                     result = pool.list_credentials(space_id)
                     _json_response(self, 200, result)
                 except VaultValidationError as e:
-                    _json_response(self, 400, {"error": "invalid_credentials", "detail": str(e)})
+                    _json_response(self, 400, {"error": _ERR_INVALID_CREDENTIALS, "detail": str(e)})
                 except ValueError as e:
-                    _json_response(self, 400, {"error": "bad_request", "detail": str(e)})
+                    _json_response(self, 400, {"error": _ERR_BAD_REQUEST, "detail": str(e)})
                 return
             if is_refused_credentials_path(parts):
                 _json_response(self, 404, _refused_credentials_body())
@@ -234,21 +294,16 @@ def make_handler(pool: BrowserPool):
 
             # GET /v1/leases/{id}/watch  and  /v1/leases/{id}/watch/frame
             qs = parse_qs(urlparse(self.path).query)
-            token = (qs.get("token") or [None])[0]
+            token = (qs.get(_QS_WATCH_AUTH) or [None])[0]
             mode = (qs.get("mode") or [None])[0]
-            if (
-                len(parts) == 4
-                and parts[0] == "v1"
-                and parts[1] == "leases"
-                and parts[3] == "watch"
-            ):
-                lease_id = parts[2]
+            lease_id = _v1_lease_tail(parts, _PART_WATCH)
+            if lease_id is not None:
                 try:
                     ctype, body = pool.get_watch_page(lease_id, token, mode=mode)
                     _bytes_response(
                         self,
                         200,
-                        body.encode("utf-8"),
+                        body.encode(_UTF8),
                         ctype,
                         extra_headers=WATCH_CLICKJACK_HEADERS,
                     )
@@ -257,14 +312,8 @@ def make_handler(pool: BrowserPool):
                         return
                     raise
                 return
-            if (
-                len(parts) == 5
-                and parts[0] == "v1"
-                and parts[1] == "leases"
-                and parts[3] == "watch"
-                and parts[4] == "frame"
-            ):
-                lease_id = parts[2]
+            lease_id = _v1_lease_tail(parts, _PART_WATCH, "frame")
+            if lease_id is not None:
                 try:
                     jpeg = pool.get_watch_frame(lease_id, token)
                     _bytes_response(
@@ -279,14 +328,8 @@ def make_handler(pool: BrowserPool):
                         return
                     raise
                 return
-            if (
-                len(parts) == 5
-                and parts[0] == "v1"
-                and parts[1] == "leases"
-                and parts[3] == "watch"
-                and parts[4] == "events"
-            ):
-                lease_id = parts[2]
+            lease_id = _v1_lease_tail(parts, _PART_WATCH, "events")
+            if lease_id is not None:
                 try:
                     after_seq = int((qs.get("after_seq") or ["0"])[0] or 0)
                 except ValueError:
@@ -305,44 +348,21 @@ def make_handler(pool: BrowserPool):
                 return
 
 
-            _json_response(self, 404, {"error": "not_found", "path": path})
+            _json_response(self, 404, {"error": _ERR_NOT_FOUND, "path": path})
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path.rstrip("/") or "/"
             parts_early = path.strip("/").split("/")
 
-            # Take-over confirm may be an HTML form POST (not JSON).
-            if (
-                len(parts_early) == 5
-                and parts_early[0] == "v1"
-                and parts_early[1] == "leases"
-                and parts_early[3] == "watch"
-                and parts_early[4] == "confirm"
-            ):
-                # Drain body without requiring JSON.
-                length = int(self.headers.get("Content-Length", "0") or 0)
-                if length > 0:
-                    self.rfile.read(length)
-                lease_id = parts_early[2]
+            # Watch form POSTs (confirm/cede) + JSON input — shared path matchers.
+            lease_confirm = _v1_lease_tail(parts_early, _PART_WATCH, "confirm")
+            if lease_confirm is not None:
+                _drain_request_body(self)
                 qs = parse_qs(urlparse(self.path).query)
-                token = (qs.get("token") or [None])[0]
+                token = (qs.get(_QS_WATCH_AUTH) or [None])[0]
                 try:
-                    result = pool.confirm_watch_takeover(lease_id, token)
-                    content_type = (self.headers.get("Content-Type") or "").lower()
-                    # HTML form POST → redirect; JSON clients get JSON.
-                    if "application/x-www-form-urlencoded" in content_type:
-                        from urllib.parse import urlencode
-
-                        loc = (
-                            f"/v1/leases/{lease_id}/watch?"
-                            + urlencode({"token": token or "", "mode": "takeover"})
-                        )
-                        self.send_response(303)
-                        self.send_header("Location", loc)
-                        self.send_header("Content-Length", "0")
-                        for hk, hv in WATCH_CLICKJACK_HEADERS.items():
-                            self.send_header(hk, hv)
-                        self.end_headers()
+                    result = pool.confirm_watch_takeover(lease_confirm, token)
+                    if _watch_form_redirect(self, lease_confirm, token):
                         return
                     _json_response(
                         self, 200, result, extra_headers=WATCH_CLICKJACK_HEADERS
@@ -353,36 +373,14 @@ def make_handler(pool: BrowserPool):
                     raise
                 return
 
-            # Pair-browse Cede may be an HTML form POST (not JSON).
-            if (
-                len(parts_early) == 5
-                and parts_early[0] == "v1"
-                and parts_early[1] == "leases"
-                and parts_early[3] == "watch"
-                and parts_early[4] == "cede"
-            ):
-                length = int(self.headers.get("Content-Length", "0") or 0)
-                if length > 0:
-                    self.rfile.read(length)
-                lease_id = parts_early[2]
+            lease_cede = _v1_lease_tail(parts_early, _PART_WATCH, "cede")
+            if lease_cede is not None:
+                _drain_request_body(self)
                 qs = parse_qs(urlparse(self.path).query)
-                token = (qs.get("token") or [None])[0]
+                token = (qs.get(_QS_WATCH_AUTH) or [None])[0]
                 try:
-                    result = pool.cede_watch_control(lease_id, token)
-                    content_type = (self.headers.get("Content-Type") or "").lower()
-                    if "application/x-www-form-urlencoded" in content_type:
-                        from urllib.parse import urlencode
-
-                        loc = (
-                            f"/v1/leases/{lease_id}/watch?"
-                            + urlencode({"token": token or "", "mode": "takeover"})
-                        )
-                        self.send_response(303)
-                        self.send_header("Location", loc)
-                        self.send_header("Content-Length", "0")
-                        for hk, hv in WATCH_CLICKJACK_HEADERS.items():
-                            self.send_header(hk, hv)
-                        self.end_headers()
+                    result = pool.cede_watch_control(lease_cede, token)
+                    if _watch_form_redirect(self, lease_cede, token):
                         return
                     _json_response(
                         self, 200, result, extra_headers=WATCH_CLICKJACK_HEADERS
@@ -393,24 +391,17 @@ def make_handler(pool: BrowserPool):
                     raise
                 return
 
-            # Pair-browse input (JSON only).
-            if (
-                len(parts_early) == 5
-                and parts_early[0] == "v1"
-                and parts_early[1] == "leases"
-                and parts_early[3] == "watch"
-                and parts_early[4] == "input"
-            ):
-                lease_id = parts_early[2]
+            lease_input = _v1_lease_tail(parts_early, _PART_WATCH, "input")
+            if lease_input is not None:
                 qs = parse_qs(urlparse(self.path).query)
-                token = (qs.get("token") or [None])[0]
+                token = (qs.get(_QS_WATCH_AUTH) or [None])[0]
                 try:
                     body = self._read_json()
                 except json.JSONDecodeError:
-                    _json_response(self, 400, {"error": "invalid_json"})
+                    _json_response(self, 400, {"error": _ERR_INVALID_JSON})
                     return
                 try:
-                    result = pool.dispatch_watch_input(lease_id, token, body)
+                    result = pool.dispatch_watch_input(lease_input, token, body)
                     _json_response(
                         self, 200, result, extra_headers=WATCH_CLICKJACK_HEADERS
                     )
@@ -423,7 +414,7 @@ def make_handler(pool: BrowserPool):
             try:
                 body = self._read_json()
             except json.JSONDecodeError:
-                _json_response(self, 400, {"error": "invalid_json"})
+                _json_response(self, 400, {"error": _ERR_INVALID_JSON})
                 return
 
             if path == "/v1/leases":
@@ -441,8 +432,8 @@ def make_handler(pool: BrowserPool):
                         {"error": "invalid_ttl_seconds", "detail": str(e)},
                     )
                     return
-                user_metadata = body.get("user_metadata")
-                allowed_domains = body.get("allowed_domains")
+                user_metadata = body.get(_FIELD_USER_METADATA)
+                allowed_domains = body.get(_FIELD_ALLOWED_DOMAINS)
                 try:
                     result = pool.lease(
                         agent_id,
@@ -467,7 +458,7 @@ def make_handler(pool: BrowserPool):
                 except SpaceInUseError as e:
                     _json_response(self, 409, {"error": "space_in_use", "detail": str(e)})
                 except ValueError as e:
-                    _json_response(self, 400, {"error": "bad_request", "detail": str(e)})
+                    _json_response(self, 400, {"error": _ERR_BAD_REQUEST, "detail": str(e)})
                 except (RuntimeError, OSError) as e:
                     _json_response(self, 503, {"error": "launch_failed", "detail": str(e)})
                 except Exception as e:
@@ -477,13 +468,8 @@ def make_handler(pool: BrowserPool):
 
             # /v1/leases/{id}/heartbeat  OR  /v1/leases/{id}/alerts
             parts = path.strip("/").split("/")
-            if (
-                len(parts) == 4
-                and parts[0] == "v1"
-                and parts[1] == "leases"
-                and parts[3] == "heartbeat"
-            ):
-                lease_id = parts[2]
+            lease_id = _v1_lease_tail(parts, "heartbeat")
+            if lease_id is not None:
                 try:
                     result = pool.heartbeat(lease_id)
                     _json_response(self, 200, result)
@@ -494,16 +480,11 @@ def make_handler(pool: BrowserPool):
                         {"error": "lease_expired", "lease_id": lease_id},
                     )
                 except LeaseNotFoundError:
-                    _json_response(self, 404, {"error": "lease_not_found", "lease_id": lease_id})
+                    _json_response(self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id})
                 return
 
-            if (
-                len(parts) == 4
-                and parts[0] == "v1"
-                and parts[1] == "leases"
-                and parts[3] == "alerts"
-            ):
-                lease_id = parts[2]
+            lease_id = _v1_lease_tail(parts, "alerts")
+            if lease_id is not None:
                 try:
                     result = pool.raise_alert(lease_id, body)
                     _json_response(self, 200, result)
@@ -523,18 +504,13 @@ def make_handler(pool: BrowserPool):
                     _json_response(
                         self,
                         404,
-                        {"error": "lease_not_found", "lease_id": lease_id},
+                        {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id},
                     )
                 return
 
             # POST /v1/leases/{lease_id}/actions — permission ladder gate
-            if (
-                len(parts) == 4
-                and parts[0] == "v1"
-                and parts[1] == "leases"
-                and parts[3] == "actions"
-            ):
-                lease_id = parts[2]
+            lease_id = _v1_lease_tail(parts, "actions")
+            if lease_id is not None:
                 try:
                     result = pool.request_action(lease_id, body)
                     _json_response(self, 202, result)
@@ -550,7 +526,7 @@ def make_handler(pool: BrowserPool):
                     )
                 except ActionValidationError as e:
                     _json_response(
-                        self, 400, {"error": "invalid_action", "detail": str(e)}
+                        self, 400, {"error": _ERR_INVALID_ACTION, "detail": str(e)}
                     )
                 except AlertConflictError as e:
                     _json_response(
@@ -558,18 +534,13 @@ def make_handler(pool: BrowserPool):
                     )
                 except LeaseNotFoundError:
                     _json_response(
-                        self, 404, {"error": "lease_not_found", "lease_id": lease_id}
+                        self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id}
                     )
                 return
 
             # POST /v1/leases/{lease_id}/navigate — top-frame nav + domain allowlist
-            if (
-                len(parts) == 4
-                and parts[0] == "v1"
-                and parts[1] == "leases"
-                and parts[3] == "navigate"
-            ):
-                lease_id = parts[2]
+            lease_id = _v1_lease_tail(parts, "navigate")
+            if lease_id is not None:
                 try:
                     result = pool.navigate(lease_id, body)
                     _json_response(self, 200, result)
@@ -585,15 +556,15 @@ def make_handler(pool: BrowserPool):
                     )
                 except LeaseNotFoundError:
                     _json_response(
-                        self, 404, {"error": "lease_not_found", "lease_id": lease_id}
+                        self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id}
                     )
                 return
 
             # POST /v1/leases/{lease_id}/confirmations/{confirm_id}
             if (
                 len(parts) == 5
-                and parts[0] == "v1"
-                and parts[1] == "leases"
+                and parts[0] == _PART_V1
+                and parts[1] == _PART_LEASES
                 and parts[3] == "confirmations"
             ):
                 lease_id = parts[2]
@@ -603,7 +574,7 @@ def make_handler(pool: BrowserPool):
                     _json_response(self, 200, result)
                 except ActionValidationError as e:
                     _json_response(
-                        self, 400, {"error": "invalid_action", "detail": str(e)}
+                        self, 400, {"error": _ERR_INVALID_ACTION, "detail": str(e)}
                     )
                 except ConfirmationGoneError as e:
                     _json_response(
@@ -623,14 +594,14 @@ def make_handler(pool: BrowserPool):
                     )
                 except LeaseNotFoundError:
                     _json_response(
-                        self, 404, {"error": "lease_not_found", "lease_id": lease_id}
+                        self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id}
                     )
                 return
 
             # POST /v1/confirmations/{confirm_id} — CLI confirm|deny by id alone
             if (
                 len(parts) == 3
-                and parts[0] == "v1"
+                and parts[0] == _PART_V1
                 and parts[1] == "confirmations"
             ):
                 confirm_id = parts[2]
@@ -639,7 +610,7 @@ def make_handler(pool: BrowserPool):
                     _json_response(self, 200, result)
                 except ActionValidationError as e:
                     _json_response(
-                        self, 400, {"error": "invalid_action", "detail": str(e)}
+                        self, 400, {"error": _ERR_INVALID_ACTION, "detail": str(e)}
                     )
                 except ConfirmationGoneError as e:
                     _json_response(
@@ -659,36 +630,30 @@ def make_handler(pool: BrowserPool):
                     )
                 except LeaseNotFoundError as e:
                     _json_response(
-                        self, 404, {"error": "lease_not_found", "lease_id": str(e)}
+                        self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": str(e)}
                     )
                 return
 
             # POST /v1/spaces/{space_id}/credentials/bind
-            if (
-                len(parts) == 5
-                and parts[0] == "v1"
-                and parts[1] == "spaces"
-                and parts[3] == "credentials"
-                and parts[4] == "bind"
-            ):
-                space_id = parts[2]
+            space_id = _v1_space_tail(parts, _PART_CREDENTIALS, "bind")
+            if space_id is not None:
                 try:
                     result = pool.bind_credential(space_id, body)
                     _json_response(self, 200, result)
                 except VaultValidationError as e:
-                    _json_response(self, 400, {"error": "invalid_credentials", "detail": str(e)})
+                    _json_response(self, 400, {"error": _ERR_INVALID_CREDENTIALS, "detail": str(e)})
                 except VaultUnavailableError as e:
                     _json_response(self, 503, {"error": "vault_unavailable", "detail": str(e)})
                 except ValueError as e:
-                    _json_response(self, 400, {"error": "bad_request", "detail": str(e)})
+                    _json_response(self, 400, {"error": _ERR_BAD_REQUEST, "detail": str(e)})
                 return
 
             # POST /v1/spaces/{space_id}/credentials/{cred_id}/unbind
             if (
                 len(parts) == 6
-                and parts[0] == "v1"
-                and parts[1] == "spaces"
-                and parts[3] == "credentials"
+                and parts[0] == _PART_V1
+                and parts[1] == _PART_SPACES
+                and parts[3] == _PART_CREDENTIALS
                 and parts[5] == "unbind"
             ):
                 space_id = parts[2]
@@ -703,33 +668,27 @@ def make_handler(pool: BrowserPool):
                         {"error": "cred_not_found", "cred_id": cred_id, "space_id": space_id},
                     )
                 except VaultValidationError as e:
-                    _json_response(self, 400, {"error": "invalid_credentials", "detail": str(e)})
+                    _json_response(self, 400, {"error": _ERR_INVALID_CREDENTIALS, "detail": str(e)})
                 except ValueError as e:
-                    _json_response(self, 400, {"error": "bad_request", "detail": str(e)})
+                    _json_response(self, 400, {"error": _ERR_BAD_REQUEST, "detail": str(e)})
                 return
 
             # POST /v1/leases/{lease_id}/credentials/fill
-            if (
-                len(parts) == 5
-                and parts[0] == "v1"
-                and parts[1] == "leases"
-                and parts[3] == "credentials"
-                and parts[4] == "fill"
-            ):
-                lease_id = parts[2]
+            lease_id = _v1_lease_tail(parts, _PART_CREDENTIALS, "fill")
+            if lease_id is not None:
                 try:
                     result = pool.fill_credentials(lease_id, body)
                     _json_response(self, 200, result)
                 except LeaseNotFoundError:
                     _json_response(
-                        self, 404, {"error": "lease_not_found", "lease_id": lease_id}
+                        self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id}
                     )
                 except CredNotFoundError as e:
                     _json_response(
                         self, 404, {"error": "cred_not_found", "detail": str(e)}
                     )
                 except VaultValidationError as e:
-                    _json_response(self, 400, {"error": "invalid_credentials", "detail": str(e)})
+                    _json_response(self, 400, {"error": _ERR_INVALID_CREDENTIALS, "detail": str(e)})
                 except CdpInjectError as e:
                     _json_response(self, 502, {"error": "cdp_inject_failed", "detail": str(e)})
                 except VaultUnavailableError as e:
@@ -741,25 +700,25 @@ def make_handler(pool: BrowserPool):
                 _json_response(self, 404, _refused_credentials_body())
                 return
 
-            _json_response(self, 404, {"error": "not_found", "path": path})
+            _json_response(self, 404, {"error": _ERR_NOT_FOUND, "path": path})
 
 
         def do_PUT(self) -> None:  # noqa: N802
             path = urlparse(self.path).path.rstrip("/") or "/"
             parts = path.strip("/").split("/")
             # PUT /v1/spaces/{space_id}  { user_metadata? , allowed_domains? }
-            if len(parts) == 3 and parts[0] == "v1" and parts[1] == "spaces":
+            if len(parts) == 3 and parts[0] == _PART_V1 and parts[1] == _PART_SPACES:
                 space_id = parts[2]
                 try:
                     body = self._read_json()
                 except json.JSONDecodeError:
-                    _json_response(self, 400, {"error": "invalid_json"})
+                    _json_response(self, 400, {"error": _ERR_INVALID_JSON})
                     return
                 if not isinstance(body, dict):
-                    _json_response(self, 400, {"error": "invalid_json"})
+                    _json_response(self, 400, {"error": _ERR_INVALID_JSON})
                     return
-                has_meta = "user_metadata" in body
-                has_domains = "allowed_domains" in body
+                has_meta = _FIELD_USER_METADATA in body
+                has_domains = _FIELD_ALLOWED_DOMAINS in body
                 if not has_meta and not has_domains:
                     _json_response(
                         self,
@@ -773,10 +732,10 @@ def make_handler(pool: BrowserPool):
                 try:
                     result = pool.set_space_metadata(
                         space_id,
-                        body.get("user_metadata") if has_meta else None,
-                        allowed_domains=body.get("allowed_domains") if has_domains else None,
+                        body.get(_FIELD_USER_METADATA) if has_meta else None,
+                        allowed_domains=body.get(_FIELD_ALLOWED_DOMAINS) if has_domains else None,
                         clear_allowed_domains=(
-                            has_domains and body.get("allowed_domains") is None
+                            has_domains and body.get(_FIELD_ALLOWED_DOMAINS) is None
                         ),
                     )
                     _json_response(self, 200, result)
@@ -791,14 +750,14 @@ def make_handler(pool: BrowserPool):
                         {"error": "invalid_allowed_domains", "detail": str(e)},
                     )
                 except ValueError as e:
-                    _json_response(self, 400, {"error": "bad_request", "detail": str(e)})
+                    _json_response(self, 400, {"error": _ERR_BAD_REQUEST, "detail": str(e)})
                 return
-            _json_response(self, 404, {"error": "not_found", "path": path})
+            _json_response(self, 404, {"error": _ERR_NOT_FOUND, "path": path})
 
         def do_DELETE(self) -> None:  # noqa: N802
             path = urlparse(self.path).path.rstrip("/") or "/"
             parts = path.strip("/").split("/")
-            if len(parts) == 3 and parts[0] == "v1" and parts[1] == "leases":
+            if len(parts) == 3 and parts[0] == _PART_V1 and parts[1] == _PART_LEASES:
                 lease_id = parts[2]
                 try:
                     body = self._read_json()
@@ -809,9 +768,9 @@ def make_handler(pool: BrowserPool):
                     result = pool.release(lease_id, reason=reason)
                     _json_response(self, 200, result)
                 except LeaseNotFoundError:
-                    _json_response(self, 404, {"error": "lease_not_found", "lease_id": lease_id})
+                    _json_response(self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id})
                 return
-            _json_response(self, 404, {"error": "not_found", "path": path})
+            _json_response(self, 404, {"error": _ERR_NOT_FOUND, "path": path})
 
     return PoolHandler
 

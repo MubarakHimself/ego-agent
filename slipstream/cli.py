@@ -19,6 +19,10 @@ from typing import Any
 
 
 DEFAULT_URL = "http://127.0.0.1:8755"
+_PATH_LEASES = "/v1/leases/"
+_PATH_SPACES = "/v1/spaces/"
+_PATH_CONFIRMATIONS = "/v1/confirmations/"
+_UTF8 = "utf-8"
 
 
 class CliError(Exception):
@@ -92,7 +96,7 @@ def _request(
     timeout: float = 30.0,
 ) -> tuple[int, dict[str, Any]]:
     safe_url = _validate_api_request_url(url)
-    data = None if body is None else json.dumps(body).encode("utf-8")
+    data = None if body is None else json.dumps(body).encode(_UTF8)
     # Construct Request with sanitized URL only — set method/data via attrs so
     # Skylos does not taint `req` through kwargs (SKY-D216).
     req = urllib.request.Request(safe_url)
@@ -102,11 +106,11 @@ def _request(
         req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
+            raw = resp.read().decode(_UTF8)
             parsed: dict[str, Any] = json.loads(raw) if raw else {}
             return resp.status, parsed
     except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", errors="replace")
+        raw = e.read().decode(_UTF8, errors="replace")
         try:
             parsed = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
@@ -156,7 +160,7 @@ def cmd_lease(
 
 def cmd_heartbeat(*, lease_id: str, url: str | None = None) -> int:
     base = resolve_base_url(url)
-    status, payload = _request("POST", f"{base}/v1/leases/{lease_id}/heartbeat", {})
+    status, payload = _request("POST", f"{base}{_PATH_LEASES}{lease_id}/heartbeat", {})
     if status != 200:
         _fail_http(status, payload)
     _print_json(payload)
@@ -171,7 +175,7 @@ def cmd_release(
 ) -> int:
     base = resolve_base_url(url)
     body = {"reason": reason} if reason else None
-    status, payload = _request("DELETE", f"{base}/v1/leases/{lease_id}", body)
+    status, payload = _request("DELETE", f"{base}{_PATH_LEASES}{lease_id}", body)
     if status != 200:
         _fail_http(status, payload)
     _print_json(payload)
@@ -232,7 +236,7 @@ def cmd_alert(
     if ttl_s is not None:
         body["ttl_s"] = ttl_s
 
-    status, payload = _request("POST", f"{base}/v1/leases/{lease_id}/alerts", body)
+    status, payload = _request("POST", f"{base}{_PATH_LEASES}{lease_id}/alerts", body)
     if status != 200:
         _fail_http(status, payload)
     _print_json(payload)
@@ -279,7 +283,7 @@ def resolve_secret(
                 flags |= os.O_NOFOLLOW
             fd = os.open(path, flags)
             try:
-                val = os.read(fd, MAX_BYTES).decode("utf-8").rstrip("\n")
+                val = os.read(fd, MAX_BYTES).decode(_UTF8).rstrip("\n")
             finally:
                 os.close(fd)
         except CliError:
@@ -333,7 +337,7 @@ def cmd_cred_bind(
         "secret": secret,
     }
     status, payload = _request(
-        "POST", f"{base}/v1/spaces/{space_id}/credentials/bind", body
+        "POST", f"{base}{_PATH_SPACES}{space_id}/credentials/bind", body
     )
     if status != 200:
         _fail_http(status, payload)
@@ -351,7 +355,7 @@ def cmd_cred_unbind(
     base = resolve_base_url(url)
     status, payload = _request(
         "POST",
-        f"{base}/v1/spaces/{space_id}/credentials/{cred_id}/unbind",
+        f"{base}{_PATH_SPACES}{space_id}/credentials/{cred_id}/unbind",
         {},
     )
     if status != 200:
@@ -363,7 +367,7 @@ def cmd_cred_unbind(
 def cmd_cred_list(*, space_id: str, url: str | None = None) -> int:
     """GET /v1/spaces/{space_id}/credentials — metadata only."""
     base = resolve_base_url(url)
-    status, payload = _request("GET", f"{base}/v1/spaces/{space_id}/credentials")
+    status, payload = _request("GET", f"{base}{_PATH_SPACES}{space_id}/credentials")
     if status != 200:
         _fail_http(status, payload)
     _print_json(payload)
@@ -387,7 +391,7 @@ def cmd_cred_fill(
         raise CliError("fields must be a JSON object of name→selector", exit_code=2)
     body = {"cred_id": cred_id, "fields": fields}
     status, payload = _request(
-        "POST", f"{base}/v1/leases/{lease_id}/credentials/fill", body
+        "POST", f"{base}{_PATH_LEASES}{lease_id}/credentials/fill", body
     )
     if status != 200:
         _fail_http(status, payload)
@@ -411,7 +415,7 @@ def cmd_act(
     base = resolve_base_url(url)
     body = {"category": category, "summary": summary}
     status, payload = _request(
-        "POST", f"{base}/v1/leases/{lease_id}/actions", body
+        "POST", f"{base}{_PATH_LEASES}{lease_id}/actions", body
     )
     if status not in (200, 202):
         _fail_http(status, payload)
@@ -424,7 +428,7 @@ def cmd_act(
             # Non-TTY → deny (agent-browser pattern)
             d_status, d_payload = _request(
                 "POST",
-                f"{base}/v1/confirmations/{confirm_id}",
+                f"{base}{_PATH_CONFIRMATIONS}{confirm_id}",
                 {"action": "deny"},
             )
             if d_status != 200:
@@ -443,7 +447,7 @@ def cmd_act(
         action = "confirm" if answer in ("y", "yes") else "deny"
         r_status, r_payload = _request(
             "POST",
-            f"{base}/v1/confirmations/{confirm_id}",
+            f"{base}{_PATH_CONFIRMATIONS}{confirm_id}",
             {"action": action},
         )
         if r_status != 200:
@@ -459,7 +463,7 @@ def cmd_confirm(*, confirm_id: str, url: str | None = None) -> int:
     """POST /v1/confirmations/{confirm_id} {action: confirm}."""
     base = resolve_base_url(url)
     status, payload = _request(
-        "POST", f"{base}/v1/confirmations/{confirm_id}", {"action": "confirm"}
+        "POST", f"{base}{_PATH_CONFIRMATIONS}{confirm_id}", {"action": "confirm"}
     )
     if status != 200:
         _fail_http(status, payload)
@@ -471,7 +475,7 @@ def cmd_deny(*, confirm_id: str, url: str | None = None) -> int:
     """POST /v1/confirmations/{confirm_id} {action: deny}."""
     base = resolve_base_url(url)
     status, payload = _request(
-        "POST", f"{base}/v1/confirmations/{confirm_id}", {"action": "deny"}
+        "POST", f"{base}{_PATH_CONFIRMATIONS}{confirm_id}", {"action": "deny"}
     )
     if status != 200:
         _fail_http(status, payload)
@@ -521,7 +525,7 @@ def cmd_navigate(
     base = resolve_base_url(url)
     status, payload = _request(
         "POST",
-        f"{base}/v1/leases/{lease_id}/navigate",
+        f"{base}{_PATH_LEASES}{lease_id}/navigate",
         {"url": page_url},
     )
     if status == 403:
@@ -586,7 +590,7 @@ def cmd_spaces_set(
             "provide --metadata/--tag and/or --allowed-domains",
             exit_code=2,
         )
-    status, payload = _request("PUT", f"{base}/v1/spaces/{space_id}", body)
+    status, payload = _request("PUT", f"{base}{_PATH_SPACES}{space_id}", body)
     if status != 200:
         _fail_http(status, payload)
     _print_json(payload)
