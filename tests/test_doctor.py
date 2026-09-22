@@ -217,7 +217,7 @@ def test_doctor_watch_compose_warn_when_missing(tmp_path, monkeypatch):
 def test_doctor_watch_compose_ok_when_present(tmp_path, monkeypatch):
     monkeypatch.delenv("SLIPSTREAM_MOCK", raising=False)
     watch = tmp_path / "watch-SKILL.md"
-    watch.write_text("# watch\n")
+    watch.write_text("---\nname: watch\ndescription: video\n---\n# /watch\n")
     monkeypatch.setenv("SLIPSTREAM_WATCH_SKILL", str(watch))
     monkeypatch.setenv("SLIPSTREAM_SPACES_ROOT", str(tmp_path / "spaces-watch2"))
     fake_bin = tmp_path / "fake-chrome"
@@ -292,7 +292,7 @@ def test_find_watch_skill_validates_content(tmp_path, monkeypatch):
     bad.write_text("---\nname: watch\ndescription: video\n---\n# /watch\n")
     found = find_watch_skill()
     assert found is not None
-    assert found == bad.resolve()
+    assert found == bad.absolute()
 
 
 def test_watch_compose_status_ok_and_warn(tmp_path, monkeypatch):
@@ -335,3 +335,93 @@ def test_main_watch_status_subcommand(tmp_path, monkeypatch):
     assert code == 0, err
     assert "OK" in out or "watch_compose" in out
 
+
+def test_frontmatter_name_exact_watch(tmp_path, monkeypatch):
+    """Frontmatter name must equal watch exactly; markers are secondary only."""
+    from slipstream.doctor import _frontmatter_name, _looks_like_watch_skill
+
+    monkeypatch.delenv("SLIPSTREAM_WATCH_SKILL", raising=False)
+    skill = tmp_path / "SKILL.md"
+
+    skill.write_text("---\nname: watchdog\n---\n/watch claude-video bradautomates yt-dlp\n")
+    assert _frontmatter_name(skill.read_text()) == "watchdog"
+    assert _looks_like_watch_skill(skill) is False
+
+    skill.write_text("---\nname: watch\n---\n# minimal\n")
+    assert _looks_like_watch_skill(skill) is True
+
+    # No frontmatter name → markers secondary (≥2)
+    skill.write_text("# compose\nclaude-video and /watch via bradautomates\n")
+    assert _frontmatter_name(skill.read_text()) is None
+    assert _looks_like_watch_skill(skill) is True
+
+    skill.write_text("# only one marker /watch\n")
+    assert _looks_like_watch_skill(skill) is False
+
+
+def test_watch_skill_symlink_leaf_refused(tmp_path, monkeypatch):
+    """ADV-008: leaf SKILL.md symlink → O_NOFOLLOW refusal (ELOOP), not followed."""
+    from slipstream.doctor import _read_skill_head_nofollow, _looks_like_watch_skill
+
+    real = tmp_path / "real-SKILL.md"
+    real.write_text("---\nname: watch\n---\n# /watch\n")
+    link = tmp_path / "SKILL.md"
+    link.symlink_to(real)
+
+    assert _read_skill_head_nofollow(link) is None
+    assert _looks_like_watch_skill(link) is False
+
+    monkeypatch.setattr(
+        "slipstream.doctor._watch_skill_candidates",
+        lambda: [link],
+    )
+    assert find_watch_skill() is None
+
+    # Regular file still accepted; path equals fixture
+    monkeypatch.setattr(
+        "slipstream.doctor._watch_skill_candidates",
+        lambda: [real],
+    )
+    found = find_watch_skill()
+    assert found == real.absolute()
+
+
+def test_plugin_cache_confined_walk_finds_skill(tmp_path, monkeypatch):
+    """Plugin-cache discovery: confined walk, only …/skills/watch/SKILL.md."""
+    from slipstream.doctor import _iter_plugin_cache_watch_skills
+
+    cache = tmp_path / "claude-video"
+    target = cache / "watch" / "1.0.0" / "skills" / "watch"
+    target.mkdir(parents=True)
+    skill = target / "SKILL.md"
+    skill.write_text("---\nname: watch\n---\nclaude-video /watch\n")
+
+    # Decoy outside pattern
+    decoy_dir = cache / "other" / "skills" / "notwatch"
+    decoy_dir.mkdir(parents=True)
+    (decoy_dir / "SKILL.md").write_text("---\nname: watch\n---\n")
+
+    hits = _iter_plugin_cache_watch_skills(cache)
+    assert skill.absolute() in hits
+    assert all(p.parent.name == "watch" and p.parent.parent.name == "skills" for p in hits)
+
+    # Dir symlink inside cache is listable; leaf symlink still refused at open
+    alt = cache / "via-link"
+    alt.mkdir()
+    linked_skills = alt / "skills"
+    linked_skills.symlink_to(cache / "watch" / "1.0.0" / "skills")
+    hits2 = _iter_plugin_cache_watch_skills(cache)
+    assert any(p.name == "SKILL.md" for p in hits2)
+
+    leaf_link = target / "SKILL-link.md"
+    # Replace skill with symlink leaf under skills/watch/
+    skill_symlink = tmp_path / "cache2" / "x" / "skills" / "watch" / "SKILL.md"
+    skill_symlink.parent.mkdir(parents=True)
+    real2 = tmp_path / "outside-secret.md"
+    real2.write_text("---\nname: watch\n---\n")
+    skill_symlink.symlink_to(real2)
+    monkeypatch.setattr(
+        "slipstream.doctor._watch_skill_candidates",
+        lambda: [skill_symlink],
+    )
+    assert find_watch_skill() is None
