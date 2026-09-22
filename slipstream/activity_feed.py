@@ -2,8 +2,9 @@
 
 CTO cut slipstream-activity-feed-007: chronological actions beside the Watch
 JPEG — navigate / click / type / fill / alert / confirm / captcha. Bounded ring buffer;
-secrets redacted; same watch_url TTL/revoke (410). No replay, no second
-notification path (alerts reuse need_human / task_done).
+secrets redacted; same watch_url TTL/revoke (410). Thin dual-timeline scrubber
+(session-replay-001) seeks feed markers only — no video/ffmpeg. Alerts reuse
+need_human / task_done (no second notification path).
 """
 
 from __future__ import annotations
@@ -185,6 +186,26 @@ class LeaseActivityFeed:
         if len(rows) > lim:
             rows = rows[-lim:]
         return rows
+
+    def timeline(self, *, limit: int | None = None) -> dict[str, Any]:
+        """Compact markers for dual-timeline scrubber (feed-only; no frames)."""
+        markers = [
+            {"seq": e.seq, "ts": e.ts, "kind": e.kind, "summary": e.summary}
+            for e in self._buf
+        ]
+        if limit is not None:
+            lim = max(1, min(int(limit), self._capacity))
+            if len(markers) > lim:
+                markers = markers[-lim:]
+        wall = time.time()
+        return {
+            "markers": markers,
+            "count": len(markers),
+            "first_ts": markers[0]["ts"] if markers else None,
+            "last_ts": markers[-1]["ts"] if markers else None,
+            "latest_seq": self._seq,
+            "wall_ts": wall,
+        }
 
     def clear(self) -> None:
         self._buf.clear()

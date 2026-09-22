@@ -272,6 +272,7 @@ def render_watch_html(
     input_url: str | None = None,
     cede_url: str | None = None,
     events_url: str | None = None,
+    timeline_url: str | None = None,
     signed_in: bool = False,
     signed_in_host: str | None = None,
     mark_signed_in_url: str | None = None,
@@ -327,10 +328,12 @@ def render_watch_html(
             '<p class="ok">Control ceded — agent may resume; observe-only.</p>'
         )
 
-    # Meta-refresh only while observe-only (refresh would steal focus mid-type).
+    # Meta-refresh only while observe-only and no feed scrubber (refresh would
+    # steal focus mid-type / wipe dual-timeline scrub position). When events_url
+    # is set, JS polls the JPEG frame instead.
     refresh_meta = (
         ""
-        if input_enabled
+        if input_enabled or events_url
         else '<meta http-equiv="refresh" content="2"/>'
     )
 
@@ -371,6 +374,15 @@ def render_watch_html(
 ".captcha-banner.fail{background:#311;color:#fcc;border:1px solid #a44;}",
         "#viewport{display:inline-block;position:relative;max-width:100%;}",
         "#viewport.drive{cursor:crosshair;outline:2px solid #4a4;}",
+        ".clocks{display:flex;gap:1rem;flex-wrap:wrap;font-size:0.85rem;color:#bbb;margin:0.4rem 0;}",
+        ".clocks .c{font-variant-numeric:tabular-nums;}",
+        ".clocks .lbl{color:#777;margin-right:0.25rem;}",
+        ".scrub{margin:0.5rem 0 0.75rem;}",
+        ".scrub input[type=range]{width:100%;max-width:520px;}",
+        ".scrub .ticks{position:relative;height:0.4rem;max-width:520px;margin-top:0.15rem;}",
+        ".scrub .tick{position:absolute;top:0;width:2px;height:0.4rem;background:#568;}",
+        ".scrub-sum{min-height:1.2rem;color:#9cf;font-size:0.85rem;}",
+        ".feed .ev.hi{background:#243048;outline:1px solid #46a;}",
         "</style></head><body>",
         "<h1>Slipstream Watch</h1>",
         '<p class="meta">Lease ',
@@ -398,6 +410,17 @@ def render_watch_html(
         '><img id="frame" src="',
         frame_href,
         '" alt="live viewport (JPEG)"/></div>',
+        '<div class="clocks" id="dual-clocks" aria-label="Dual timeline clocks">',
+        '<span><span class="lbl">Live</span><span class="c" id="wall-clock">—</span></span>',
+        '<span><span class="lbl">Event</span><span class="c" id="event-clock">live</span></span>',
+        '</div>',
+        '<div class="scrub" id="scrubber" hidden>',
+        '<input type="range" id="scrub-range" min="0" max="0" value="0" '
+        'aria-label="Seek activity timeline"/>',
+        '<div class="ticks" id="scrub-ticks"></div>',
+        '<div class="scrub-sum" id="scrub-sum"></div>',
+        '<p class="hint">Feed-only scrub — JPEG stays live (no video replay).</p>',
+        '</div>',
     ]
 
     parts.extend(confirm_parts)
@@ -413,35 +436,8 @@ def render_watch_html(
     parts.append('<div id="feed-list"><p class="empty">No events yet.</p></div>')
     parts.append("</aside></div>")  # feed + layout
     if events_url:
-        # Poll tokenized events; never embed secrets — summaries are server-scrubbed.
-        parts.append("<script>(function(){")
-        parts.append(f"var EVENTS_URL={json_quote(events_url)};")
-        parts.append(
-            "var list=document.getElementById('feed-list');"
-            "var after=0;"
-            "function fmt(ts){try{return new Date(ts*1000).toLocaleTimeString();}catch(e){return '';}}"
-            "function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\"/g,'&quot;');}"
-            "function addRows(rows){"
-            "if(!rows||!rows.length)return;"
-            "var empty=list.querySelector('.empty');if(empty)empty.remove();"
-            "for(var i=0;i<rows.length;i++){"
-            "var r=rows[i];after=Math.max(after,r.seq||0);"
-            "var d=document.createElement('div');d.className='ev';"
-            "var oc=(r.outcome&&r.outcome!=='ok')?'o err':'o';"
-            "d.innerHTML='<span class=\"t\">'+fmt(r.ts)+'</span> '"
-            "+'<span class=\"k\">'+esc(r.kind)+'</span>'"
-            "+'<span>'+esc(r.summary)+'</span> '"
-            "+'<span class=\"'+oc+'\">'+esc(r.outcome)+'</span>';"
-            "list.appendChild(d);}"
-            "list.parentElement.scrollTop=list.parentElement.scrollHeight;}"
-            "function tick(){var u=EVENTS_URL+(EVENTS_URL.indexOf('?')>=0?'&':'?')+'after_seq='+after;"
-            "fetch(u,{credentials:'same-origin'}).then(function(res){"
-            "if(res.status===410||res.status===401){return null;}"
-            "return res.ok?res.json():null;}).then(function(data){"
-            "if(data&&data.events)addRows(data.events);}).catch(function(){});}"
-            "tick();setInterval(tick,2000);"
-        )
-        parts.append("})();</script>")
+        # Poll feed + dual-timeline scrubber (feed-only seek; JPEG stays live).
+        parts.append(_activity_feed_client_script(events_url, timeline_url))
 
 
     if input_enabled and input_url:
@@ -477,6 +473,91 @@ def render_watch_html(
     return "".join(parts)
 
 
+
+
+# Dual-timeline scrubber client (feed-only seek). Placeholders filled via json_quote.
+_ACTIVITY_FEED_JS = (
+    "(function(){"
+    "var EVENTS_URL=__EVENTS__;"
+    "var TIMELINE_URL=__TIMELINE__;"
+    "var list=document.getElementById('feed-list');"
+    "var wallEl=document.getElementById('wall-clock');"
+    "var evEl=document.getElementById('event-clock');"
+    "var scrub=document.getElementById('scrubber');"
+    "var range=document.getElementById('scrub-range');"
+    "var ticks=document.getElementById('scrub-ticks');"
+    "var sumEl=document.getElementById('scrub-sum');"
+    "var after=0;var markers=[];var live=true;var seekSeq=null;"
+    "function fmt(ts){try{return new Date(ts*1000).toLocaleTimeString();}catch(e){return '';}}"
+    "function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\"/g,'&quot;');}"
+    "function setWall(){if(wallEl)wallEl.textContent=new Date().toLocaleTimeString();}"
+    "function highlight(){"
+    "var rows=list?list.querySelectorAll('.ev'):[];"
+    "for(var i=0;i<rows.length;i++){"
+    "var on=!live&&seekSeq!=null&&String(rows[i].getAttribute('data-seq'))===String(seekSeq);"
+    "rows[i].className=on?'ev hi':'ev';"
+    "if(on)rows[i].scrollIntoView({block:'nearest'});}}"
+    "function applySeek(idx){"
+    "if(!markers.length){live=true;seekSeq=null;if(evEl)evEl.textContent='live';"
+    "if(sumEl)sumEl.textContent='';highlight();return;}"
+    "idx=Math.max(0,Math.min(idx,markers.length-1));live=(idx>=markers.length-1);"
+    "var m=markers[idx];seekSeq=m.seq;"
+    "if(evEl)evEl.textContent=live?'live':fmt(m.ts);"
+    "if(sumEl)sumEl.textContent=live?'':(esc(m.kind)+' · '+esc(m.summary)+' · #'+m.seq);"
+    "if(range)range.value=String(idx);highlight();}"
+    "function renderTicks(){"
+    "if(!ticks||!range)return;ticks.innerHTML='';var n=markers.length;"
+    "range.min='0';range.max=String(Math.max(0,n-1));"
+    "if(!n){scrub.hidden=true;return;}scrub.hidden=false;"
+    "for(var i=0;i<n;i++){var t=document.createElement('span');t.className='tick';"
+    "t.style.left=(n===1?'0':((i/(n-1))*100))+'%';ticks.appendChild(t);}"
+    "if(live)range.value=String(n-1);applySeek(parseInt(range.value,10)||0);}"
+    "function addRows(rows){"
+    "if(!rows||!rows.length)return;"
+    "var empty=list.querySelector('.empty');if(empty)empty.remove();"
+    "for(var i=0;i<rows.length;i++){"
+    "var r=rows[i];after=Math.max(after,r.seq||0);"
+    "var d=document.createElement('div');d.className='ev';"
+    "d.setAttribute('data-seq',String(r.seq||0));"
+    "var oc=(r.outcome&&r.outcome!=='ok')?'o err':'o';"
+    "d.innerHTML='<span class=\"t\">'+fmt(r.ts)+'</span> '"
+    "+'<span class=\"k\">'+esc(r.kind)+'</span>'"
+    "+'<span>'+esc(r.summary)+'</span> '"
+    "+'<span class=\"'+oc+'\">'+esc(r.outcome)+'</span>';"
+    "list.appendChild(d);}"
+    "if(live)list.parentElement.scrollTop=list.parentElement.scrollHeight;highlight();}"
+    "function pull(url,cb){if(!url)return;"
+    "fetch(url,{credentials:'same-origin'}).then(function(res){"
+    "if(res.status===410||res.status===401){return null;}"
+    "return res.ok?res.json():null;}).then(function(data){if(data)cb(data);})"
+    ".catch(function(){});}"
+    "function tickFeed(){var u=EVENTS_URL+(EVENTS_URL.indexOf('?')>=0?'&':'?')+'after_seq='+after;"
+    "pull(u,function(data){if(data.events)addRows(data.events);});}"
+    "function tickTimeline(){if(!TIMELINE_URL)return;"
+    "pull(TIMELINE_URL,function(data){markers=data.markers||[];renderTicks();});}"
+    "function refreshFrame(){var img=document.getElementById('frame');if(!img)return;"
+    "var u=img.getAttribute('data-src')||img.src.split('&_t=')[0];"
+    "img.setAttribute('data-src',u);img.src=u+(u.indexOf('?')>=0?'&':'?')+'_t='+Date.now();}"
+    "if(range){range.addEventListener('input',function(){applySeek(parseInt(range.value,10)||0);});}"
+    "setWall();setInterval(setWall,1000);"
+    "tickFeed();setInterval(tickFeed,2000);"
+    "tickTimeline();setInterval(tickTimeline,2000);"
+    "setInterval(refreshFrame,2000);"
+    "})();"
+)
+
+
+def _activity_feed_client_script(
+    events_url: str, timeline_url: str | None = None
+) -> str:
+    """Inline JS: poll scrubbed feed + dual-timeline scrubber (JPEG stays live)."""
+    js = _ACTIVITY_FEED_JS.replace("__EVENTS__", json_quote(events_url)).replace(
+        "__TIMELINE__", json_quote(timeline_url) if timeline_url else "null"
+    )
+    return "<script>" + js + "</script>"  # skylos: ignore[SKY-D228] URLs json_quote'd; markers server-scrubbed
+
+
+
 def json_quote(s: str) -> str:
     """JSON-encode a string for safe embedding in a <script> literal."""
     import json as _json
@@ -509,6 +590,12 @@ def events_path(lease_id: str, token: str, *, base_path: str = "") -> str:
     """Tokenized activity-feed JSON path (same TTL/revoke as Watch)."""
     q = urlencode({"token": token})
     return f"{base_path}{_PATH_LEASES}{quote(lease_id, safe='')}/watch/events?{q}"
+
+
+def timeline_path(lease_id: str, token: str, *, base_path: str = "") -> str:
+    """Tokenized dual-timeline markers JSON (feed scrubber; same TTL/revoke)."""
+    q = urlencode({"token": token})
+    return f"{base_path}{_PATH_LEASES}{quote(lease_id, safe='')}/watch/timeline?{q}"
 
 
 # --- pair-browse CDP input bridge -----------------------------------------

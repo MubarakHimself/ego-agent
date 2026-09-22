@@ -91,6 +91,7 @@ from slipstream.watch import (
     capture_jpeg_frame,
     cede_path,
     events_path,
+    timeline_path,
     confirm_path,
     dispatch_cdp_input,
     frame_path,
@@ -1610,6 +1611,37 @@ class BrowserPool:
             )
         return {"lease_id": lease_id, "events": events}
 
+    def get_watch_timeline(
+        self,
+        lease_id: str,
+        token: str | None,
+        *,
+        limit: int | None = None,
+    ) -> dict:
+        """Token-gated dual-timeline markers — feed scrub only (no frames/video)."""
+        with self._lock:
+            self._get_watch_session_locked(lease_id, token)
+            if lease_id not in self._leases:
+                sess = self._lookup_watch(lease_id)
+                if sess is not None:
+                    self._invalidate_pair_browse_locked(sess, revoke=True)
+                raise WatchGoneError(_ERR_LEASE_INACTIVE)
+            feed = self._activity_feeds.get(lease_id)
+            out = (
+                feed.timeline(limit=limit)
+                if feed is not None
+                else {
+                    "markers": [],
+                    "count": 0,
+                    "first_ts": None,
+                    "last_ts": None,
+                    "latest_seq": 0,
+                    "wall_ts": time.time(),
+                }
+            )
+            out["lease_id"] = lease_id
+            return out
+
     def get_watch_page(
         self, lease_id: str, token: str | None, *, mode: str | None = None
     ) -> tuple[str, str]:
@@ -1651,6 +1683,7 @@ class BrowserPool:
                 cede_path(lease_id, tok) if (mode == "takeover" and enabled) else None
             ),
             events_url=events_path(lease_id, tok),
+            timeline_url=timeline_path(lease_id, tok),
             signed_in=bool(badge.get("signed_in")),
             signed_in_host=badge.get(_KEY_SIGNED_IN_HOST),
             mark_signed_in_url=(

@@ -146,8 +146,16 @@ Lease-scoped append-only event log beside the Watch JPEG (CTO cut `activity-feed
 - Kinds: `navigate`, `click`, `type`, `fill`, `alert`, `confirm`, `captcha` (timestamp + safe summary + outcome)
 - Same watch token TTL/revoke as Watch HTML/frame — stale/revoked → `410`; bad token → `401`
 - Secrets redacted: no cookies/passwords/tokens/vault/CDP auth; `type`/`fill` expose lengths/labels only
-- Bounded ring buffer (no replay/edit). Soft browse stays free; feed is observe opacity for captain
+- Bounded ring buffer (no video/ffmpeg). Soft browse stays free; feed is observe opacity for captain
 - Reuses alerts bus for `need_human` / `task_done` — **no** second notification path
+
+### Dual timeline / thin session scrubber
+
+ui-peers steal #8 / EgoRuntime `session-replay-001`: live Watch viewport clock vs activity-feed event timestamps, with a thin scrubber that seeks/highlights feed markers (JPEG stays the live frame for v1).
+
+- `GET /v1/leases/{id}/watch/timeline?token=…` — JSON `{lease_id, markers:[{seq,ts,kind,summary}], count, first_ts, last_ts, latest_seq, wall_ts}`
+- Same token TTL/revoke → `410`; bad token → `401`; summaries already scrubbed
+- Watch HTML shows dual clocks + range scrubber; seek highlights the matching Activity row — **not** full video replay
 
 
 On `need_human` the pool mints an unguessable token and returns:
@@ -159,6 +167,7 @@ On `need_human` the pool mints an unguessable token and returns:
 |--------|------|--------|
 | `GET` | `/v1/leases/{id}/watch?token=…` | HTML shell embedding JPEG frame; observe-only until confirm |
 | `GET` | `/v1/leases/{id}/watch/frame?token=…` | `image/jpeg` viewport via CDP `Page.captureScreenshot` (mock JPEG under `SLIPSTREAM_MOCK`) |
+| `GET` | `/v1/leases/{id}/watch/timeline?token=…` | Dual-timeline markers JSON for feed scrubber (same TTL/revoke) |
 | `POST` | `/v1/leases/{id}/watch/confirm?token=…` | Confirm Take-over → `{action: pause, agent_paused: true, input_enabled: true, lease_kept: true}` |
 | `POST` | `/v1/leases/{id}/watch/input?token=…` | Bridge click/type/key/scroll into leased CDP (requires confirm; exclusive pause) |
 | `POST` | `/v1/leases/{id}/watch/cede?token=…` | Disable input, clear pause → `{action: continue, agent_paused: false, input_enabled: false}`; lease stays until `task_done`. Requires prior Confirm (`takeover_confirmed` / `input_enabled`); otherwise `400` nothing to cede |
