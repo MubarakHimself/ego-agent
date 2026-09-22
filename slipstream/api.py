@@ -7,6 +7,7 @@ Endpoints:
   POST   /v1/leases/{id}/heartbeat
   POST   /v1/leases/{id}/alerts
   POST   /v1/leases/{id}/captcha
+  POST   /v1/leases/{id}/act
   POST   /v1/leases/{id}/actions
   POST   /v1/leases/{id}/navigate
   POST   /v1/leases/{id}/eval
@@ -51,6 +52,7 @@ from urllib.parse import parse_qs, urlparse
 
 from slipstream.alerts import AlertConflictError, AlertValidationError
 from slipstream.domains import DomainAllowlistError
+from slipstream.actions import ActFallbackValidationError
 from slipstream.actions import (
     ActionValidationError,
     ConfirmationGoneError,
@@ -76,8 +78,7 @@ from slipstream.pool import (
 )
 from slipstream.downloads import (
     KIND_DOWNLOADS,
-    KIND_UPLOADS,
-    ArtifactNotFoundError,
+        ArtifactNotFoundError,
     DownloadForbiddenError,
     DownloadValidationError,
     content_disposition_attachment,
@@ -738,6 +739,38 @@ def make_handler(pool: BrowserPool):
                     _json_response(self, 403, {"error": _ERR_FORBIDDEN, "detail": str(e)})
                 except DownloadValidationError as e:
                     _json_response(self, 400, {"error": "invalid_upload", "detail": str(e)})
+                except LeaseNotFoundError:
+                    _json_response(
+                        self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id}
+                    )
+                return
+
+            # POST /v1/leases/{lease_id}/act — Stagehand-style act → fallback
+            lease_id = _v1_lease_tail(parts, "act")
+            if lease_id is not None:
+                try:
+                    result = pool.run_act(lease_id, body)
+                    status = result.get("status")
+                    code = 403 if status == "confirmation_required" else 200
+                    _json_response(self, code, result)
+                except ActFallbackValidationError as e:
+                    _json_response(
+                        self, 400, {"error": "invalid_act", "detail": str(e)}
+                    )
+                except DomainAllowlistError as e:
+                    _json_response(
+                        self,
+                        403,
+                        {
+                            "error": "domain_not_allowed",
+                            "detail": str(e),
+                            "host": getattr(e, "host", None),
+                        },
+                    )
+                except LadderGateError as e:
+                    _ladder_gate_response(self, e)
+                except CdpInjectError as e:
+                    _json_response(self, 502, {"error": "cdp_inject_failed", "detail": str(e)})
                 except LeaseNotFoundError:
                     _json_response(
                         self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id}

@@ -188,6 +188,32 @@ pool-only. Do not derive CDP endpoints from default public status/lease JSON
 
 Defer: once/always/never policy matrix, Comet UI.
 
+## Act → multi-step fallback (Stagehand-style)
+
+When a one-shot click/nav fails after UI churn, call the pool helper instead of
+blindly re-clicking. Soft browse stays free; gated kinds still use the ladder.
+
+```bash
+# Primary soft click; on failure run a bounded plan (or return need_fallback)
+slipstream try-act --lease-id "$LEASE_ID" --body '{
+  "kind":"click","selector":"#sign-in","soft_retry":true,
+  "fallback_plan":[{"kind":"click","selector":"#account-menu"},{"kind":"click","selector":"#sign-in"}]
+}'
+
+# Soft retry once is default for soft kinds; disable before falling back:
+slipstream try-act --lease-id "$LEASE_ID" --body '{"kind":"click","selector":"#x","soft_retry":false}'
+
+# Gated navigate still needs act+confirm first (or returns confirmation_required):
+slipstream act --lease-id "$LEASE_ID" --category nav_irreversible --summary "open checkout"
+slipstream confirm c_…
+slipstream try-act --lease-id "$LEASE_ID" --body '{"kind":"navigate","url":"https://example.com/checkout"}'
+```
+
+HTTP: `POST /v1/leases/{id}/act` with `{kind, …, fallback_plan?, soft_retry?, max_steps?}`.
+Responses: `status=ok|need_fallback|confirmation_required|failed` plus `reason`, `attempts`.
+Ladder `consume_once` still applies to navigate/fill/eval steps inside the plan.
+Pattern-steal from Stagehand agent-fallbacks docs — no Stagehand/Browserbase code.
+
 ## Domain allowlist (top-frame)
 
 Restrict top-frame navigation when set. **No allowlist anywhere = unrestricted.** Lease `[]` inherits Space∩config (never clears lockdown); lease may only narrow. Active allowlist: http(s) + host only; no `\`/`%5C`/userinfo.

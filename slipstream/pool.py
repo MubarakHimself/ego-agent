@@ -145,6 +145,14 @@ from slipstream.vault import (
 )
 from slipstream.cdp_inject import CdpInjectError, CdpInjector, default_injector
 from slipstream.actions import (
+    act_feed_kind,
+    act_step_summary,
+    parse_act_request,
+    finalize_act_loop,
+    STATUS_ACT_OK as STATUS_ACT_OK,
+    STATUS_ACT_FAILED as STATUS_ACT_FAILED,
+    STATUS_NEED_FALLBACK,
+
     KIND_CONFIRMATION_REQUIRED,
     STATUS_CONFIRMED,
     STATUS_DENIED,
@@ -206,6 +214,9 @@ class BrowserPool:
         self._space_signed_in: dict[str, dict[str, Any]] = {}
         # Mock navigate recorder (tests); never returned with secrets.
         self._nav_log: list[dict[str, Any]] = []
+        # Stagehand-style /act mock recorder + primary-fail budget (tests).
+        self._act_log: list[dict[str, Any]] = []
+        self._mock_act_fail_remaining: dict[str, int] = {}
         # Alerts: per-lease history + task_done idempotency (survives release).
         # Process-lifetime in-memory only (cleared on pool shutdown / process exit).
         # Bounded LRU eviction is deferred — document trust: single long-lived process.
@@ -2189,6 +2200,131 @@ class BrowserPool:
             "allowed_domains": patterns,
         }
 
+
+
+
+
+
+
+
+
+
+    def run_act(self, lease_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """One-shot act with soft retry + bounded fallback plan."""
+        parsed = parse_act_request(body)
+        steps: list[dict[str, Any]] = []
+        attempts = 0
+        last_reason = "primary_failed"
+        used_fallback = False
+        for step in [parsed["primary"]] * (1 + int(parsed["soft_retry"])):
+            attempts += 1
+            out = self._act_gated(lease_id, step, steps, attempts, parsed)
+            if out is not None:
+                return out
+            if steps[-1].get("ok"):
+                return finalize_act_loop(
+                    primary_ok=True,
+                    attempts=attempts,
+                    steps_run=steps,
+                    confirm_retry=parsed["confirm_retry"],
+                    used_fallback=False,
+                    last_reason=last_reason,
+                )
+            last_reason = str(steps[-1].get("reason") or last_reason)
+        for step in parsed["fallback_plan"][: parsed["max_steps"]]:
+            used_fallback = True
+            attempts += 1
+            out = self._act_gated(lease_id, step, steps, attempts, parsed)
+            if out is not None:
+                return out
+            if not steps[-1].get("ok"):
+                last_reason = str(steps[-1].get("reason") or last_reason)
+                break
+        return finalize_act_loop(
+            primary_ok=bool(steps and steps[-1].get("ok")),
+            attempts=attempts,
+            steps_run=steps,
+            confirm_retry=parsed["confirm_retry"],
+            used_fallback=used_fallback,
+            last_reason=last_reason,
+        )
+
+    def _act_gated(
+        self,
+        lease_id: str,
+        step: dict[str, Any],
+        steps: list[dict[str, Any]],
+        attempts: int,
+        parsed: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        gated = self._act_step_or_gate(lease_id, step, steps)
+        if gated is None:
+            return None
+        gated.update(
+            attempts=attempts,
+            steps_run=steps,
+            confirm_retry=parsed["confirm_retry"],
+        )
+        return gated
+
+    def _act_step_or_gate(
+        self,
+        lease_id: str,
+        step: dict[str, Any],
+        steps_run: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Append step result; return confirmation_required payload or None."""
+        try:
+            steps_run.append(self._execute_act_step(lease_id, step))
+        except LadderGateError as e:
+            return {
+                "status": "confirmation_required",
+                "reason": "ladder_gate",
+                "category": e.category,
+                "error": "confirmation_required",
+            }
+  
+    def _execute_act_step(self, lease_id: str, step: dict[str, Any]) -> dict[str, Any]:
+        """Run one click|navigate step. Raises LadderGateError without grant."""
+        with self._lock:
+            lease = self._leases.get(lease_id)
+            slot = self._find_slot_by_lease(lease_id) if lease else None
+            if not lease or not slot or slot.status != SlotStatus.LEASED:
+                raise LeaseNotFoundError(lease_id)
+            mock = self.config.mock
+            fail_left = self._mock_act_fail_remaining.get(lease_id, 0)
+
+        kind = step["kind"]
+        summary = act_step_summary(step)
+        feed = act_feed_kind(kind)
+
+        if mock and fail_left > 0:
+            with self._lock:
+                self._mock_act_fail_remaining[lease_id] = fail_left - 1
+                self._act_log.append(
+                    {"lease_id": lease_id, "kind": kind, "ok": False, "mock_fail": True}
+                )
+            self._record_activity(
+                lease_id, feed, summary, outcome="error", detail={"mock_fail": True}
+            )
+            return {"ok": False, "kind": kind, "reason": "mock_primary_fail", "mock": True}
+
+        if kind == "click":
+            with self._lock:
+                self._act_log.append({"lease_id": lease_id, "kind": kind, "ok": True, "step": step})
+            self._record_activity(
+                lease_id, feed, summary, outcome="ok", detail={"kind": kind}
+            )
+            return {"ok": True, "kind": kind, "mock": mock}
+
+        result = self.navigate(lease_id, {"url": step["url"]})
+        ok = bool(result.get("ok", result.get("matched", True)))
+        return {
+            "ok": ok,
+            "kind": kind,
+            "reason": None if ok else "navigate_unmatched",
+            "result": result,
+        }
 
     def _sync_lease_signed_in(self, lease: Lease) -> None:
         """Copy Space signed-in badge onto lease (metadata only)."""

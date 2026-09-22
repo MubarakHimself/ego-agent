@@ -62,6 +62,7 @@ from slipstream.cli import (
     CliError,
     DEFAULT_URL,
     cmd_act,
+    cmd_try_act,
     cmd_alert,
     cmd_captcha,
     cmd_downloads_get,
@@ -417,6 +418,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_act.set_defaults(_handler="act")
 
+    p_try = sub.add_parser(
+        "try-act",
+        help="One-shot act with soft-retry / multi-step fallback (Stagehand-style)",
+    )
+    _add_url(p_try)
+    p_try.add_argument(_OPT_LEASE_ID, required=True)
+    p_try.add_argument(
+        "--body",
+        required=True,
+        help='JSON act body, e.g. {"kind":"click","selector":"#x","fallback_plan":[...]}',
+    )
+    p_try.set_defaults(_handler="try_act")
+
+
     # --- confirm / deny ---
     p_confirm = sub.add_parser(
         "confirm",
@@ -757,6 +772,12 @@ def main(argv: list[str] | None = None) -> int:
                 lease_id=args.lease_id,
                 cred_id=args.cred_id,
                 fields_json=args.fields,
+                url=args.url,
+            )
+        if args._handler == "try_act":
+            return cmd_try_act(
+                lease_id=args.lease_id,
+                body_json=args.body,
                 url=args.url,
             )
         if args._handler == "act":

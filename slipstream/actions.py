@@ -304,3 +304,142 @@ def parse_eval_request(body: dict[str, Any]) -> dict[str, Any]:
     # Scrub for activity-feed summary only — expression itself is pool-side.
     _ = scrub_text(expression[:200])
     return {"expression": expression}
+
+
+
+
+# --- Stagehand-style act → fallback (pattern only; peers-deep) -------------
+
+_KIND_CLICK = "click"
+_KIND_NAV = "navigate"
+_SOFT = frozenset({_KIND_CLICK})
+STATUS_ACT_OK = "ok"
+STATUS_ACT_FAILED = "failed"
+STATUS_NEED_FALLBACK = "need_fallback"
+
+
+class ActFallbackValidationError(ValueError):
+    """Bad /act body."""
+
+
+_MSG_JSON_OBJ = "{label} must be a JSON object"
+_LABEL_PRIMARY = "primary"
+
+
+def max_fallback_steps() -> int:
+    raw = os.environ.get("SLIPSTREAM_ACT_FALLBACK_MAX_STEPS", "").strip()
+    try:
+        n = int(raw) if raw else 5
+    except ValueError:
+        n = 5
+    return max(1, min(n, 20))
+
+
+def soft_retry_budget() -> int:
+    raw = os.environ.get("SLIPSTREAM_ACT_SOFT_RETRY", "").strip()
+    if not raw:
+        return 1
+    try:
+        return 1 if int(raw) > 0 else 0
+    except ValueError:
+        return 1
+
+
+def _require_obj(raw: Any, label: str) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ActFallbackValidationError(_MSG_JSON_OBJ.format(label=label))
+    try:
+        reject_secret_fields(raw)
+    except AlertValidationError as e:
+        raise ActFallbackValidationError(str(e)) from e
+    return raw
+
+
+def parse_act_step(raw: Any, *, label: str = "step") -> dict[str, Any]:
+    raw = _require_obj(raw, label)
+    kind = raw.get("kind")
+    if kind == _KIND_CLICK:
+        sel = raw.get("selector")
+        if not isinstance(sel, str) or not scrub_text(sel.strip()):
+            raise ActFallbackValidationError("click.selector required")
+        return {"kind": _KIND_CLICK, "selector": scrub_text(sel.strip())[:300]}
+    if kind == _KIND_NAV:
+        url = raw.get("url")
+        if not isinstance(url, str) or not scrub_text(url.strip()):
+            raise ActFallbackValidationError("navigate.url required")
+        return {"kind": _KIND_NAV, "url": scrub_text(url.strip())[:2000]}
+    raise ActFallbackValidationError(f"{label}.kind must be click|navigate")
+
+
+def _plan_cap(body: dict[str, Any]) -> int:
+    cap = max_fallback_steps()
+    ms = body.get("max_steps")
+    if isinstance(ms, int) and ms >= 1:
+        return min(ms, 20)
+    return cap
+
+
+def _soft_n(kind: str, soft: Any) -> int:
+    if kind not in _SOFT:
+        return 0
+    if soft is None:
+        return soft_retry_budget()
+    if isinstance(soft, bool):
+        return int(soft)
+    if isinstance(soft, int) and soft in (0, 1):
+        return soft
+    raise ActFallbackValidationError("soft_retry must be bool or 0|1")
+
+
+def parse_act_request(body: Any) -> dict[str, Any]:
+    body = _require_obj(body, "body")
+    primary = parse_act_step(body.get(_LABEL_PRIMARY, body), label=_LABEL_PRIMARY)
+    plan_raw = body.get("fallback_plan") or body.get("plan") or []
+    if not isinstance(plan_raw, list):
+        raise ActFallbackValidationError("fallback_plan must be a list")
+    cap = _plan_cap(body)
+    if len(plan_raw) > cap:
+        raise ActFallbackValidationError(f"fallback_plan longer than max_steps ({cap})")
+    return {
+        "primary": primary,
+        "fallback_plan": [parse_act_step(s, label=f"plan[{i}]") for i, s in enumerate(plan_raw)],
+        "max_steps": cap,
+        "soft_retry": _soft_n(primary["kind"], body.get("soft_retry")),
+        "confirm_retry": bool(body.get("confirm_retry", True)),
+    }
+
+
+def act_step_summary(step: dict[str, Any]) -> str:
+    if step["kind"] == _KIND_NAV:
+        return f"act nav {step.get('url', '')[:80]}"
+    return f"act clk {step.get('selector', '')[:80]}"
+
+
+def act_feed_kind(kind: str) -> str:
+    return _KIND_NAV if kind == _KIND_NAV else _KIND_CLICK
+
+
+def finalize_act_loop(
+    *,
+    primary_ok: bool,
+    attempts: int,
+    steps_run: list[dict[str, Any]],
+    confirm_retry: bool,
+    used_fallback: bool,
+    last_reason: str,
+) -> dict[str, Any]:
+    if primary_ok and not used_fallback:
+        status, reason = STATUS_ACT_OK, ("primary" if attempts == 1 else "soft_retry")
+    elif primary_ok:
+        status, reason = STATUS_ACT_OK, "fallback_plan"
+    elif used_fallback:
+        status, reason = STATUS_ACT_FAILED, last_reason
+    else:
+        status, reason = STATUS_NEED_FALLBACK, last_reason
+    return {
+        "status": status,
+        "reason": reason,
+        "attempts": attempts,
+        "steps_run": steps_run,
+        "confirm_retry": confirm_retry,
+    }
