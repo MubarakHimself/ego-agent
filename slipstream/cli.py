@@ -121,3 +121,58 @@ def cmd_status(*, url: str | None = None) -> int:
         _fail_http(status, payload)
     _print_json(payload)
     return 0
+
+
+def cmd_alert(
+    *,
+    kind: str,
+    lease_id: str,
+    reason: str | None = None,
+    detail: str | None = None,
+    task_id: str | None = None,
+    ttl_s: int | None = None,
+    ok: bool | None = None,
+    summary: str | None = None,
+    watch_url: str | None = None,
+    url: str | None = None,
+) -> int:
+    """POST /v1/leases/{id}/alerts — need_human or task_done."""
+    base = resolve_base_url(url)
+    kind_norm = kind.strip().lower().replace("_", "-")
+    if kind_norm in ("need-human", "needhuman"):
+        event = "need_human"
+        body: dict[str, Any] = {
+            "event": event,
+            "reason": reason or "other",
+            "detail": detail or "",
+        }
+    elif kind_norm in ("done", "task-done", "task_done"):
+        event = "task_done"
+        body = {
+            "event": event,
+            "detail": detail or "",
+            "outcome": {
+                "ok": True if ok is None else bool(ok),
+                "summary": summary or "",
+            },
+        }
+        if reason:
+            body["reason"] = reason
+    else:
+        raise CliError(
+            f"unknown alert kind {kind!r}; use need-human or done",
+            exit_code=2,
+        )
+
+    if task_id:
+        body["task_id"] = task_id
+    if ttl_s is not None:
+        body["ttl_s"] = ttl_s
+    if watch_url:
+        body["watch_url"] = watch_url
+
+    status, payload = _request("POST", f"{base}/v1/leases/{lease_id}/alerts", body)
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0

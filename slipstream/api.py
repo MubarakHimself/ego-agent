@@ -5,6 +5,7 @@ Base URL default: http://127.0.0.1:8755
 Endpoints:
   POST   /v1/leases
   POST   /v1/leases/{id}/heartbeat
+  POST   /v1/leases/{id}/alerts
   DELETE /v1/leases/{id}
   GET    /v1/pool/status
   GET    /healthz
@@ -18,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
+from slipstream.alerts import AlertConflictError, AlertValidationError
 from slipstream.pool import (
     BrowserPool,
     LeaseExpiredError,
@@ -116,7 +118,7 @@ def make_handler(pool: BrowserPool):
                     _json_response(self, 503, {"error": "launch_failed", "detail": str(e)})
                 return
 
-            # /v1/leases/{id}/heartbeat
+            # /v1/leases/{id}/heartbeat  OR  /v1/leases/{id}/alerts
             parts = path.strip("/").split("/")
             if (
                 len(parts) == 4
@@ -136,6 +138,36 @@ def make_handler(pool: BrowserPool):
                     )
                 except LeaseNotFoundError:
                     _json_response(self, 404, {"error": "lease_not_found", "lease_id": lease_id})
+                return
+
+            if (
+                len(parts) == 4
+                and parts[0] == "v1"
+                and parts[1] == "leases"
+                and parts[3] == "alerts"
+            ):
+                lease_id = parts[2]
+                try:
+                    result = pool.raise_alert(lease_id, body)
+                    _json_response(self, 200, result)
+                except AlertValidationError as e:
+                    _json_response(
+                        self,
+                        400,
+                        {"error": "invalid_alert", "detail": str(e)},
+                    )
+                except AlertConflictError as e:
+                    _json_response(
+                        self,
+                        409,
+                        {"error": "alert_conflict", "detail": str(e)},
+                    )
+                except LeaseNotFoundError:
+                    _json_response(
+                        self,
+                        404,
+                        {"error": "lease_not_found", "lease_id": lease_id},
+                    )
                 return
 
             _json_response(self, 404, {"error": "not_found", "path": path})
@@ -173,6 +205,7 @@ class PoolServer:
         self._evict_stop = threading.Event()
 
     def start(self, background: bool = True) -> None:
+        self.pool.set_api_base_url(self.base_url)
         handler = make_handler(self.pool)
         self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
         self._httpd.daemon_threads = True

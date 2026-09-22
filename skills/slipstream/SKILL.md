@@ -8,7 +8,7 @@ description: >
   browser). HTTP + this CLI/skill surface only — there is no MCP server.
   For video watch intents, compose a separate /watch skill (not Slipstream).
 metadata:
-  version: "0.2.0"
+  version: "0.3.0"
   date: "2026-09-22"
 ---
 
@@ -101,9 +101,13 @@ slipstream lease --agent-id "$AGENT_ID" --space-id "task-42"
 # 3) Heartbeat while working / thinking
 slipstream heartbeat --lease-id "$LEASE_ID"
 
-# 4) Release when finished
-slipstream release --lease-id "$LEASE_ID"
-# optional: slipstream release --lease-id "$LEASE_ID" --reason done
+# 4a) If blocked — raise need_human (keeps lease; pause CDP drive)
+# slipstream alert need-human --lease-id "$LEASE_ID" --reason captcha
+
+# 4b) Prefer task_done (notifies + releases once) when the skill finishes
+slipstream alert done --lease-id "$LEASE_ID" --summary "finished"
+# or plain release if you already notified elsewhere:
+# slipstream release --lease-id "$LEASE_ID" --reason done
 ```
 
 Inspect the pool:
@@ -129,6 +133,47 @@ curl -s "$SLIPSTREAM_URL/healthz"
 ```
 
 (`SLIPSTREAM_URL` defaults to `http://127.0.0.1:8755` if unset.)
+
+## Alerts (need_human + task_done)
+
+Ship-now takeover / done signals on the lease HTTP spine. **Never** put cookies,
+passwords, tokens, auth headers, credential dumps, or secret paths in alert
+payloads.
+
+| Event | Effect |
+|-------|--------|
+| `need_human` | Pause the agent; **lease stays warm** (Chromium kept). Captain gets a one-liner + Watch / Take-over links. |
+| `task_done` | Notify once, then **release** the lease. Double-fire is idempotent/safe. |
+
+```bash
+# Agent blocked (CAPTCHA / login / ambiguous UI / …) — pause & keep session
+slipstream alert need-human --lease-id "$LEASE_ID" --reason captcha \
+  --detail "Cloudflare challenge on checkout"
+
+# Skill finished — notify once then release
+slipstream alert done --lease-id "$LEASE_ID" --summary "Filled form; submitted"
+# declared fail:
+slipstream alert done --lease-id "$LEASE_ID" --fail --summary "Blocked by paywall"
+```
+
+Harness JSON (`alert` + `harness`) tells the caller to `pause` or `continue`.
+Fields include `captain_message`, `watch_url`, `takeover_url`, `lease_kept` /
+`lease_released`. `watch_url` is a short-TTL local placeholder until live
+pair-browse UI ships.
+
+curl:
+
+```bash
+curl -s -X POST "$SLIPSTREAM_URL/v1/leases/$LEASE_ID/alerts" \
+  -H 'Content-Type: application/json' \
+  -d '{"event":"need_human","reason":"captcha","detail":"challenge visible"}'
+
+curl -s -X POST "$SLIPSTREAM_URL/v1/leases/$LEASE_ID/alerts" \
+  -H 'Content-Type: application/json' \
+  -d '{"event":"task_done","outcome":{"ok":true,"summary":"done"}}'
+```
+
+Reasons for `need_human`: `captcha` | `login` | `ambiguous_ui` | `stuck` | `other`.
 
 ## Exclusivity and warm rules
 
@@ -189,6 +234,7 @@ Prefer `SLIPSTREAM_*` names. There is no MCP env or MCP server in this project.
 slipstream serve   [--host HOST] [--port PORT] [--mock] [--headed]
 slipstream lease   --agent-id ID --space-id ID [--ttl-seconds N] [--url URL]
 slipstream heartbeat --lease-id ID [--url URL]
+slipstream alert   need-human|done --lease-id ID [options] [--url URL]
 slipstream release --lease-id ID [--reason REASON] [--url URL]
 slipstream status  [--url URL]
 slipstream doctor  [--url URL] [--json]
@@ -202,8 +248,10 @@ slipstream doctor  [--url URL] [--json]
 - No Monid / paid marketplace.
 - No MCP server (skill+CLI+HTTP only).
 - No free-read of Space cookies / credential dumps.
-- Credentials vault, takeover/done alerts, live pair-browse, compose `/watch`
-  are **later / compose** — not part of this skill’s CLI surface yet.
+- Credentials vault, live pair-browse UI polish, optional stuck/captcha chips,
+  Take/Cede exclusive lock are **later** — not part of this skill yet.
+- Compose `/watch` remains upstream (see doctor warn). Alerts (`need_human` /
+  `task_done`) **are** on the CLI/HTTP surface (this section).
 
 ## Examples
 
