@@ -24,6 +24,23 @@ from __future__ import annotations
 _STORE_TRUE = "store_true"
 _OPT_LEASE_ID = "--lease-id"
 _OPT_AGENT_ID = "--agent-id"
+_HELP_AGENT_ID_REQUIRED = "Lease owner agent id (required)"
+
+# Shared CLI literals (SKY-L027 claw)
+_CMD_SERVE = "serve"
+_CMD_LEASE = "lease"
+_CMD_HEARTBEAT = "heartbeat"
+_CMD_RELEASE = "release"
+_CMD_STATUS = "status"
+_CMD_ALERT = "alert"
+_CMD_CONFIRM = "confirm"
+_CMD_NAVIGATE = "navigate"
+_CMD_DOCTOR = "doctor"
+_OPT_HOST = "--host"
+_HELP_LEASE_ID = "Lease id from lease JSON"
+_HELP_SPACE_ID = "Space id"
+_REDACTED_SECRET = "[REDACTED_SECRET]"
+_ACTION_APPEND = "append"
 _OPT_SPACE_ID = "--space-id"
 _OPT_TAG = "--tag"
 _OPT_JSON = "--json"
@@ -130,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
         "serve",
         help="Start the pool HTTP server (agents lease via CLI/HTTP, not MCP)",
     )
-    p_serve.add_argument("--host", default=None, help="Bind host (default 127.0.0.1)")
+    p_serve.add_argument(_OPT_HOST, default=None, help="Bind host (default 127.0.0.1)")
     p_serve.add_argument(
         "--port", type=int, default=None, help="Bind port (default 8755)"
     )
@@ -155,7 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     # --- lease ---
-    p_lease = sub.add_parser("lease", help="Acquire a lease (prints lease JSON)")
+    p_lease = sub.add_parser(_CMD_LEASE, help="Acquire a lease (prints lease JSON)")
     _add_url(p_lease)
     p_lease.add_argument(_OPT_AGENT_ID, required=True, help="Calling agent id")
     p_lease.add_argument(_OPT_SPACE_ID, required=True, help="Space / user-data-dir id")
@@ -172,7 +189,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_lease.add_argument(
         _OPT_TAG,
-        action="append",
+        action=_ACTION_APPEND,
         default=None,
         help="Lease metadata tag key=value (repeatable; overrides/extends --metadata)",
     )
@@ -184,15 +201,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_lease.set_defaults(_handler="lease")
 
     # --- heartbeat ---
-    p_hb = sub.add_parser("heartbeat", help="Renew a lease soft-idle window")
+    p_hb = sub.add_parser(_CMD_HEARTBEAT, help="Renew a lease soft-idle window")
     _add_url(p_hb)
-    p_hb.add_argument(_OPT_LEASE_ID, required=True, help="Lease id from lease JSON")
+    p_hb.add_argument(_OPT_LEASE_ID, required=True, help=_HELP_LEASE_ID)
     p_hb.set_defaults(_handler="heartbeat")
 
     # --- release ---
-    p_rel = sub.add_parser("release", help="Release a lease (DELETE)")
+    p_rel = sub.add_parser(_CMD_RELEASE, help="Release a lease (DELETE)")
     _add_url(p_rel)
-    p_rel.add_argument(_OPT_LEASE_ID, required=True, help="Lease id from lease JSON")
+    p_rel.add_argument(_OPT_LEASE_ID, required=True, help=_HELP_LEASE_ID)
     p_rel.add_argument(
         "--reason",
         default=None,
@@ -201,7 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rel.set_defaults(_handler="release")
 
     # --- status ---
-    p_st = sub.add_parser("status", help="Print pool status JSON")
+    p_st = sub.add_parser(_CMD_STATUS, help="Print pool status JSON")
     _add_url(p_st)
     p_st.set_defaults(_handler="status")
 
@@ -217,7 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["need-human", "done"],
         help="need-human: pause agent, keep Chromium; done: notify once then release",
     )
-    p_alert.add_argument(_OPT_LEASE_ID, required=True, help="Lease id from lease JSON")
+    p_alert.add_argument(_OPT_LEASE_ID, required=True, help=_HELP_LEASE_ID)
     p_alert.add_argument(
         "--reason",
         default=None,
@@ -252,7 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["started", "finished", "failed"],
         help="solving lifecycle (aliases: captcha_solving_*)",
     )
-    p_cap.add_argument(_OPT_LEASE_ID, required=True, help="Lease id from lease JSON")
+    p_cap.add_argument(_OPT_LEASE_ID, required=True, help=_HELP_LEASE_ID)
     p_cap.add_argument(_OPT_DETAIL, default=None, help=_HELP_DETAIL)
     p_cap.add_argument(
         "--provider",
@@ -278,7 +295,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_dll = dl_sub.add_parser("list", help="GET /v1/leases/{id}/downloads")
     _add_url(p_dll)
     p_dll.add_argument(_OPT_LEASE_ID, required=True)
-    p_dll.add_argument(_OPT_AGENT_ID, default=None, help="Optional ownership check")
+    p_dll.add_argument(_OPT_AGENT_ID, required=True, help=_HELP_AGENT_ID_REQUIRED)
     p_dll.add_argument(
         "--rel-path",
         action=_STORE_TRUE,
@@ -290,7 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_dlg.add_argument(_OPT_LEASE_ID, required=True)
     p_dlg.add_argument("--artifact-id", required=True)
     p_dlg.add_argument("-o", "--output", default=None, help="Write bytes to file")
-    p_dlg.add_argument(_OPT_AGENT_ID, default=None)
+    p_dlg.add_argument(_OPT_AGENT_ID, required=True, help=_HELP_AGENT_ID_REQUIRED)
     p_dlg.set_defaults(_handler="downloads_get")
 
     # --- uploads (thin drop) ---
@@ -302,14 +319,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_upl = up_sub.add_parser("list", help="GET /v1/leases/{id}/uploads")
     _add_url(p_upl)
     p_upl.add_argument(_OPT_LEASE_ID, required=True)
-    p_upl.add_argument(_OPT_AGENT_ID, default=None)
+    p_upl.add_argument(_OPT_AGENT_ID, required=True, help=_HELP_AGENT_ID_REQUIRED)
     p_upl.set_defaults(_handler="uploads_list")
     p_upp = up_sub.add_parser("put", help="POST /v1/leases/{id}/uploads")
     _add_url(p_upp)
     p_upp.add_argument(_OPT_LEASE_ID, required=True)
     p_upp.add_argument("--filename", required=True)
     p_upp.add_argument("--file", required=True, help="Local regular file to upload")
-    p_upp.add_argument(_OPT_AGENT_ID, default=None)
+    p_upp.add_argument(_OPT_AGENT_ID, required=True, help=_HELP_AGENT_ID_REQUIRED)
     p_upp.set_defaults(_handler="uploads_put")
 
 
@@ -436,14 +453,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_sp_list.add_argument("--q", default=None, help="Metadata query (key=value AND… / substring)")
     p_sp_list.add_argument(
         _OPT_TAG,
-        action="append",
+        action=_ACTION_APPEND,
         default=None,
         help="Filter tag key=value (repeatable; AND with --q)",
     )
     p_sp_list.set_defaults(_handler="spaces_list")
     p_sp_set = spaces_sub.add_parser("set", help="Set/replace Space user_metadata tags")
     _add_url(p_sp_set)
-    p_sp_set.add_argument(_OPT_SPACE_ID, required=True, help="Space id")
+    p_sp_set.add_argument(_OPT_SPACE_ID, required=True, help=_HELP_SPACE_ID)
     p_sp_set.add_argument(
         "--metadata",
         default=None,
@@ -451,7 +468,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_sp_set.add_argument(
         _OPT_TAG,
-        action="append",
+        action=_ACTION_APPEND,
         default=None,
         help="Tag key=value (repeatable)",
     )
@@ -466,9 +483,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mark/unmark Space signed-in badge (profile cookies persist; no dump)",
     )
     _add_url(p_sp_si)
-    p_sp_si.add_argument(_OPT_SPACE_ID, required=True, help="Space id")
+    p_sp_si.add_argument(_OPT_SPACE_ID, required=True, help=_HELP_SPACE_ID)
     p_sp_si.add_argument(
-        "--host",
+        _OPT_HOST,
         default=None,
         help="Optional host label for badge (e.g. github.com)",
     )
@@ -483,10 +500,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Lease Space + need_human(reason=login) for Watch/Take-over",
     )
     _add_url(p_sp_lo)
-    p_sp_lo.add_argument(_OPT_SPACE_ID, required=True, help="Space id")
+    p_sp_lo.add_argument(_OPT_SPACE_ID, required=True, help=_HELP_SPACE_ID)
     p_sp_lo.add_argument(_OPT_AGENT_ID, required=True, help="Agent id for the lease")
     p_sp_lo.add_argument(_OPT_DETAIL, default=None, help="Human-safe detail string")
-    p_sp_lo.add_argument("--host", default=None, help="Optional host hint for later badge")
+    p_sp_lo.add_argument(_OPT_HOST, default=None, help="Optional host hint for later badge")
     p_sp_lo.add_argument("--ttl-s", type=int, default=None, help="Watch TTL seconds")
     p_sp_lo.set_defaults(_handler="spaces_login_once")
 
@@ -499,7 +516,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sess.add_argument("--q", default=None, help="Metadata query filter")
     p_sess.add_argument(
         _OPT_TAG,
-        action="append",
+        action=_ACTION_APPEND,
         default=None,
         help="Filter tag key=value (repeatable; AND with --q)",
     )
@@ -519,7 +536,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ls_list.add_argument("--q", default=None, help="Metadata query (key=value AND… / substring)")
     p_ls_list.add_argument(
         _OPT_TAG,
-        action="append",
+        action=_ACTION_APPEND,
         default=None,
         help="Filter tag key=value (repeatable; AND with --q)",
     )

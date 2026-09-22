@@ -434,15 +434,15 @@ Optional thin **upload drop** (same discipline):
 
 ```http
 POST /v1/leases/{lease_id}/uploads
-{ "filename": "drop.bin", "content_b64": "…", "agent_id?": "…" }
+{ "filename": "drop.bin", "content_b64": "…", "agent_id": "…"  // required }
 → 201 { "lease_id", "upload": { id, filename, bytes, sha256, created_at, kind:"upload" } }
 
 GET /v1/leases/{lease_id}/uploads
 GET /v1/leases/{lease_id}/uploads/{artifact_id}
 ```
 
-Safety: Path containment + `O_NOFOLLOW`; symlink escape refused; secret-looking
-filenames denylisted; optional `agent_id` must match lease owner. Env:
+Safety: Path containment + `O_NOFOLLOW` / `O_DIRECTORY|O_NOFOLLOW` on kind dirs; directory symlink containment refused; file symlink escape refused; secret-looking
+filenames denylisted; **required** `agent_id` must match lease owner (omit → 401/403). Env:
 `SLIPSTREAM_ARTIFACTS_ROOT`, `SLIPSTREAM_MAX_UPLOAD_BYTES` (default 5 MiB).
 
 CLI: `slipstream downloads list|get` · `slipstream uploads list|put`.

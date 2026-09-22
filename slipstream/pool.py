@@ -34,13 +34,15 @@ from slipstream.captcha import (
 )
 _ERR_BODY_MUST_JSON = "body must be a JSON object"
 
+from slipstream.download_cdp import (
+    MockDownloadRecorder,
+    configure_chrome_download_behavior,
+)
 from slipstream.downloads import (
     KIND_DOWNLOADS,
     KIND_UPLOADS,
     DownloadForbiddenError,
     DownloadValidationError,
-    MockDownloadRecorder,
-    configure_chrome_download_behavior,
     ensure_lease_artifact_dirs,
     list_artifacts,
     read_artifact,
@@ -238,7 +240,8 @@ class BrowserPool:
                 "mock": self.config.mock,
                 "spaces_root": str(self.config.spaces_root),
                 "vault_root": str(self.config.vault_root),
-                "artifacts_root": str(self.config.artifacts_root),
+                # ADV-DL-003: never expose absolute artifacts_root on status.
+                "artifacts_configured": True,
                 "cdp_base_port": self.config.cdp_base_port,
                 "chrome_binary": self.launcher.binary,
                 "slots": [s.to_dict() for s in self._slots],
@@ -993,8 +996,11 @@ class BrowserPool:
                 raise
 
     def _require_lease_agent(self, lease_id: str, agent_id: str | None):
+        """ADV-DL-001: matching agent_id required (omit → forbidden)."""
         lease = self._require_leased(lease_id)
-        if agent_id is not None and agent_id != lease.agent_id:
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise DownloadForbiddenError("agent_id required")
+        if agent_id.strip() != lease.agent_id:
             raise DownloadForbiddenError("agent_id does not own this lease")
         return lease
 

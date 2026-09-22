@@ -11,19 +11,16 @@ when not mock. Mock mode records the call for tests.
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-
 import hashlib
 import os
 import re
 import stat
-import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote
 
 from slipstream.alerts import scrub_text
 
@@ -47,14 +44,6 @@ class ArtifactNotFoundError(DownloadError):
 
 class DownloadForbiddenError(DownloadError):
     """Lease ownership / agent_id mismatch."""
-
-
-class ArtifactBackend(ABC):
-    """Abstract artifact IO — keeps module off Zone-of-Pain extreme."""
-
-    @abstractmethod
-    def list_for_lease(self, lease_id: str) -> list[dict]:
-        raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
@@ -89,11 +78,14 @@ DEFAULT_MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MiB thin drop
 _BEHAVIOR_ALLOW = "allow"
 _ERR_PATH_ESCAPE = "path escape refused"
 _ERR_SYMLINK = "symlink escape refused"
+_LABEL_ARTIFACT_DIR = "artifact dir"
+_FLAG_O_NOFOLLOW = "O_NOFOLLOW"  # used in messages / feature probes
 
 KIND_DOWNLOADS = "downloads"
+_HAS_O_NOFOLLOW = hasattr(os, "O_NOFOLLOW")
+_HAS_O_DIRECTORY = hasattr(os, "O_DIRECTORY")
 KIND_UPLOADS = "uploads"
-_KIND_DOWNLOADS = KIND_DOWNLOADS
-_KIND_UPLOADS = KIND_UPLOADS
+_ARTIFACT_KINDS = frozenset({KIND_DOWNLOADS, KIND_UPLOADS})
 
 
 # ---------------------------------------------------------------------------
@@ -158,28 +150,69 @@ def sanitize_upload_filename(raw: Any) -> str:
     return name
 
 
-def artifact_id_for_filename(filename: str, *, kind: str = _KIND_DOWNLOADS) -> str:
+def artifact_id_for_filename(filename: str, *, kind: str = KIND_DOWNLOADS) -> str:
     """Stable id from basename (dl_/up_ + sha256 prefix)."""
-    prefix = "dl" if kind == _KIND_DOWNLOADS else "up"
+    prefix = "dl" if kind == KIND_DOWNLOADS else "up"
     digest = hashlib.sha256(filename.encode("utf-8")).hexdigest()[:16]
     return f"{prefix}_{digest}"
 
 
 def lease_artifacts_dir(artifacts_root: Path, lease_id: str, kind: str) -> Path:
-    """Return ``{artifacts_root}/leases/{lease_id}/{downloads|uploads}/``."""
+    """Return ``{artifacts_root}/leases/{lease_id}/{downloads|uploads}/``.
+
+    ADV-DL-002: resolve *only* ``artifacts_root``; join lease/kind without
+    resolving so a directory symlink at ``kind`` cannot redirect before checks.
+    """
     safe = validate_id_component("lease_id", lease_id, pattern=_SAFE_LEASE_RE)
-    if kind not in (_KIND_DOWNLOADS, _KIND_UPLOADS):
+    if kind not in _ARTIFACT_KINDS:
         raise DownloadValidationError("invalid artifact kind")
     root = _resolve_policy_path(artifacts_root)
     return root / "leases" / safe / kind
 
 
+def _refuse_symlink_path(path: Path, *, label: str = "path") -> None:
+    """lstat and refuse S_ISLNK (ADV-DL-002)."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        raise DownloadValidationError(f"{label} lstat failed") from e
+    if stat.S_ISLNK(st.st_mode):
+        raise DownloadValidationError(_ERR_SYMLINK)
+
+
+def _open_dir_nofollow(path: Path) -> int:
+    """Open directory nofollow; refuse symlink (ADV-DL-002)."""
+    _refuse_symlink_path(path, label=_LABEL_ARTIFACT_DIR)
+    flags = os.O_RDONLY
+    if _HAS_O_DIRECTORY:
+        flags |= os.O_DIRECTORY
+    if _HAS_O_NOFOLLOW:
+        flags |= os.O_NOFOLLOW
+    try:
+        return os.open(  # skylos: ignore[SKY-D215] O_DIRECTORY|O_NOFOLLOW kind dir
+            os.fspath(path), flags
+        )
+    except OSError as e:
+        raise DownloadValidationError(f"{_LABEL_ARTIFACT_DIR} open failed") from e
+
+
 def ensure_lease_artifact_dirs(artifacts_root: Path, lease_id: str) -> dict[str, Path]:
-    """Create lease downloads + uploads dirs (mode 0o700)."""
+    """Create lease downloads + uploads dirs (mode 0o700); refuse kind symlinks."""
     out: dict[str, Path] = {}
-    for kind in (_KIND_DOWNLOADS, _KIND_UPLOADS):
+    for kind in (KIND_DOWNLOADS, KIND_UPLOADS):
         path = lease_artifacts_dir(artifacts_root, lease_id, kind)
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _refuse_symlink_path(path, label=kind)
+        # Create parents without following a kind symlink (checked above).
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _refuse_symlink_path(path, label=kind)
+        if not path.exists():
+            path.mkdir(mode=0o700)
+        _refuse_symlink_path(path, label=kind)
+        # Confirm it opens as a real directory (not a raced symlink).
+        fd = _open_dir_nofollow(path)
+        os.close(fd)
         try:
             os.chmod(path, 0o700)
         except OSError:
@@ -236,13 +269,17 @@ def _path_contained(candidate: Path, root: Path) -> bool:
 
 
 def _open_reg_nofollow(path: Path, *, root: Path) -> tuple[int, os.stat_result]:
-    """Open regular file with O_NOFOLLOW; require containment under root."""
-    root_r = _resolve_policy_path(root)
-    # Do not resolve ``path`` before open (symlink escape). Open leaf, then
-    # fstat + check realpath of parent chain via /proc or os.path.realpath
-    # after confirming REG.
+    """Open regular file nofollow; require containment under root."""
+    # root is the kind dir (not resolved through a symlink — caller validated).
+    root_r = root if root.is_absolute() else _resolve_policy_path(root)
+    # Prefer realpath of a verified non-symlink directory for containment.
+    try:
+        if not root.is_symlink():
+            root_r = _resolve_policy_path(root)
+    except OSError:
+        root_r = Path(root)
     flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
+    if _HAS_O_NOFOLLOW:
         flags |= os.O_NOFOLLOW
     try:
         fd = os.open(  # skylos: ignore[SKY-D215] O_NOFOLLOW leaf; fstat REG + containment
@@ -255,12 +292,10 @@ def _open_reg_nofollow(path: Path, *, root: Path) -> tuple[int, os.stat_result]:
         if not stat.S_ISREG(st.st_mode):
             os.close(fd)
             raise DownloadValidationError("artifact must be a regular file")
-        # Containment: realpath of the opened path must stay under root.
-        # Use /proc/self/fd on Linux; fall back to resolve of parent+name.
         try:
             opened = Path(os.readlink(f"/proc/self/fd/{fd}"))
         except OSError:
-            opened = _resolve_policy_path(path)
+            opened = Path(path).absolute()
         if not _path_contained(opened, root_r):
             os.close(fd)
             raise DownloadValidationError(_ERR_PATH_ESCAPE)
@@ -271,6 +306,19 @@ def _open_reg_nofollow(path: Path, *, root: Path) -> tuple[int, os.stat_result]:
         except OSError:
             pass
         raise
+
+
+def _prepare_kind_dir(dir_path: Path) -> Path:
+    """Validate kind dir is a real directory (not symlink); return unreolved path.
+
+    ADV-DL-002: never ``Path.resolve()`` the kind dir (follows dir symlink).
+    """
+    _refuse_symlink_path(dir_path, label=_LABEL_ARTIFACT_DIR)
+    if not dir_path.exists():
+        raise DownloadValidationError(f"{_LABEL_ARTIFACT_DIR} missing")
+    fd = _open_dir_nofollow(dir_path)
+    os.close(fd)
+    return dir_path
 
 
 def _sha256_fd(fd: int, *, size: int) -> str:
@@ -301,12 +349,62 @@ def _public_meta(
         "bytes": size,
         "sha256": sha256,
         "created_at": created_at,
-        "kind": "download" if kind == _KIND_DOWNLOADS else "upload",
+        "kind": "download" if kind == KIND_DOWNLOADS else "upload",
     }
     if include_rel_path:
         # Lease-relative only — never absolute host paths.
         out["path"] = f"{kind}/{filename}"
     return out
+
+
+def content_disposition_attachment(filename: str) -> str:
+    """ADV-DL-005: safe Content-Disposition — no CR/LF/quotes; ASCII fallback + RFC5987."""
+    name = Path(filename).name
+    # Strip header-breaking / quoting characters.
+    ascii_name = "".join(
+        ch if (32 <= ord(ch) < 127 and ch not in '"\\;') else "_" for ch in name
+    )
+    if not ascii_name or ascii_name in (".", ".."):
+        ascii_name = "download"
+    starred = quote(name, safe="")
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{starred}'
+
+
+
+def _list_one_artifact(
+    root: Path,
+    name: str,
+    *,
+    kind: str,
+    include_rel_path: bool,
+) -> dict[str, Any] | None:
+    """Return public meta for one regular file, or None to skip."""
+    if is_denied_filename(name) or name.startswith("."):
+        return None
+    candidate = root / name
+    if candidate.is_symlink():
+        return None
+    try:
+        if not candidate.is_file():
+            return None
+        fd, st = _open_reg_nofollow(candidate, root=root)
+    except (DownloadError, OSError):
+        return None
+    try:
+        digest = _sha256_fd(  # skylos: ignore[SKY-P401] bounded artifact hash via fd
+            fd, size=st.st_size
+        )
+    finally:
+        os.close(fd)
+    return _public_meta(
+        artifact_id=artifact_id_for_filename(name, kind=kind),
+        filename=name,
+        size=int(st.st_size),
+        sha256=digest,
+        created_at=float(st.st_mtime),
+        kind=kind,
+        include_rel_path=include_rel_path,
+    )
 
 
 def list_artifacts(
@@ -316,48 +414,25 @@ def list_artifacts(
     include_rel_path: bool = False,
 ) -> list[dict[str, Any]]:
     """List regular files under a lease artifact dir (no absolute paths)."""
-    root = _resolve_policy_path(dir_path)
-    if not root.is_dir():
+    try:
+        root = _prepare_kind_dir(dir_path)
+    except DownloadValidationError:
+        if dir_path.is_symlink() or (
+            dir_path.exists() and stat.S_ISLNK(os.lstat(dir_path).st_mode)
+        ):
+            raise
         return []
-    items: list[dict[str, Any]] = []
     try:
         names = sorted(os.listdir(root))
     except OSError:
         return []
+    items: list[dict[str, Any]] = []
     for name in names:
-        if is_denied_filename(name):
-            continue
-        if name.startswith("."):
-            continue
-        candidate = root / name
-        # Skip symlinks before open (also O_NOFOLLOW).
-        if candidate.is_symlink():
-            continue
-        if not candidate.is_file():
-            continue
-        try:
-            fd, st = _open_reg_nofollow(candidate, root=root)
-        except (DownloadError, OSError):
-            continue
-        try:
-            # Rewind not needed — fresh fd; hash then reopen for safety.
-            digest = _sha256_fd(  # skylos: ignore[SKY-P401] bounded artifact hash via fd
-                fd, size=st.st_size
-            )
-        finally:
-            os.close(fd)
-        aid = artifact_id_for_filename(name, kind=kind)
-        items.append(
-            _public_meta(
-                artifact_id=aid,
-                filename=name,
-                size=int(st.st_size),
-                sha256=digest,
-                created_at=float(st.st_mtime),
-                kind=kind,
-                include_rel_path=include_rel_path,
-            )
+        meta = _list_one_artifact(
+            root, name, kind=kind, include_rel_path=include_rel_path
         )
+        if meta is not None:
+            items.append(meta)
     return items
 
 
@@ -370,10 +445,7 @@ def read_artifact(
 ) -> tuple[dict[str, Any], bytes]:
     """Return (public meta, file bytes) for artifact_id under dir."""
     aid = validate_id_component("artifact_id", artifact_id, pattern=_SAFE_ARTIFACT_RE)
-    root = _resolve_policy_path(dir_path)
-    if not root.is_dir():
-        raise ArtifactNotFoundError(aid)
-    # Match by scanning — refuse client-supplied filenames as path pieces.
+    root = _prepare_kind_dir(dir_path)
     for name in os.listdir(root):
         if is_denied_filename(name) or name.startswith("."):
             continue
@@ -388,9 +460,7 @@ def read_artifact(
                 fd, st.st_size + 1
             )
             if len(data) > st.st_size:
-                # Size raced — refuse.
                 raise DownloadValidationError("artifact size race")
-            # Hash from bytes we already hold.
             digest = hashlib.sha256(data).hexdigest()
         finally:
             os.close(fd)
@@ -407,15 +477,58 @@ def read_artifact(
     raise ArtifactNotFoundError(aid)
 
 
+def _unique_upload_name(root: Path, name: str) -> str:
+    """If ``name`` exists, return stem-xxxxxxxx.suffix (ADV-DL-004)."""
+    candidate = root / name
+    if not candidate.exists() and not candidate.is_symlink():
+        return name
+    stem = Path(name).stem
+    suf = Path(name).suffix
+    for _ in range(8):
+        alt = f"{stem}-{uuid.uuid4().hex[:8]}{suf}"
+        alt_path = root / alt
+        if not alt_path.exists() and not alt_path.is_symlink():
+            return alt
+    raise DownloadValidationError("upload name collision")
+
+
+
+def _excl_create_write(dest: Path, payload: bytes) -> None:
+    """O_EXCL|O_NOFOLLOW create+write under an already-validated kind dir."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if _HAS_O_NOFOLLOW:
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(  # skylos: ignore[SKY-D215] O_EXCL|O_NOFOLLOW under kind dir
+            os.fspath(dest), flags, 0o600
+        )
+    except FileExistsError as e:
+        raise DownloadValidationError("upload exists") from e
+    except OSError as e:
+        raise DownloadValidationError(_ERR_SYMLINK) from e
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(dest, 0o600)
+    except OSError:
+        pass
+
+
 def write_upload(
     dir_path: Path,
     *,
     filename: str,
     data: bytes,
-    kind: str = _KIND_UPLOADS,
+    kind: str = KIND_UPLOADS,
 ) -> dict[str, Any]:
-    """Write bytes into a lease artifact dir (O_NOFOLLOW create)."""
-    if kind not in (_KIND_DOWNLOADS, _KIND_UPLOADS):
+    """Write bytes into a lease artifact dir (nofollow|excl create).
+
+    ADV-DL-002: refuse kind-dir symlink; do not resolve kind dir.
+    ADV-DL-004: O_EXCL create; on collision use unique id filename.
+    """
+    if kind not in _ARTIFACT_KINDS:
         raise DownloadValidationError("invalid artifact kind")
     name = sanitize_upload_filename(filename)
     if not isinstance(data, (bytes, bytearray)):
@@ -423,28 +536,18 @@ def write_upload(
     payload = bytes(data)
     if len(payload) > max_upload_bytes():
         raise DownloadValidationError("upload too large")
-    root = _resolve_policy_path(dir_path)
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _refuse_symlink_path(dir_path, label=_LABEL_ARTIFACT_DIR)
+    dir_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not dir_path.exists():
+        dir_path.mkdir(mode=0o700)
+    root = _prepare_kind_dir(dir_path)
+    name = _unique_upload_name(root, name)
     dest = root / name
-    if dest.exists() and dest.is_symlink():
-        raise DownloadValidationError(_ERR_SYMLINK)
-    dest_resolved = _resolve_policy_path(dest)
-    if not _path_contained(dest_resolved.parent, root):
+    _refuse_symlink_path(dest, label="upload target")
+    # Containment: dest must be direct child of unreolved kind dir.
+    if dest.parent != root or dest.name != name:
         raise DownloadValidationError(_ERR_PATH_ESCAPE)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(  # skylos: ignore[SKY-D215] O_NOFOLLOW create under contained root
-        os.fspath(dest_resolved), flags, 0o600
-    )
-    try:
-        os.write(fd, payload)
-    finally:
-        os.close(fd)
-    try:
-        os.chmod(dest_resolved, 0o600)
-    except OSError:
-        pass
+    _excl_create_write(dest, payload)
     return _public_meta(
         artifact_id=artifact_id_for_filename(name, kind=kind),
         filename=name,
@@ -454,94 +557,3 @@ def write_upload(
         kind=kind,
         include_rel_path=False,
     )
-
-
-
-# ---------------------------------------------------------------------------
-# CDP download behavior + mock recorder
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class MockDownloadRecorder:
-    """Records setDownloadBehavior calls when SLIPSTREAM_MOCK=1."""
-
-    calls: list[dict[str, Any]] = field(default_factory=list)
-    _lock: threading.Lock = field(default_factory=threading.Lock)
-
-    def record(self, *, download_path: str, behavior: str = _BEHAVIOR_ALLOW) -> None:
-        with self._lock:
-            self.calls.append(
-                {
-                    "method": "Browser.setDownloadBehavior",
-                    "behavior": behavior,
-                    # Store lease-relative hint only in public tests — absolute
-                    # path kept for assert-contains in unit tests under tmp.
-                    "download_path": download_path,
-                    "events_enabled": True,
-                    "ts": time.time(),
-                }
-            )
-
-    def clear(self) -> None:
-        with self._lock:
-            self.calls.clear()
-
-
-def _browser_ws_url(cdp_http_url: str) -> str:
-    """Resolve browser-level WebSocket URL from CDP /json/version."""
-    import json
-    import urllib.request
-
-    from slipstream.cli import _validate_api_request_url
-
-    base = cdp_http_url.rstrip("/")
-    host = urlparse(base).hostname
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        raise DownloadValidationError(f"refusing non-loopback CDP host {host!r}")
-    with urllib.request.urlopen(
-        _validate_api_request_url(f"{base}/json/version"), timeout=3.0
-    ) as resp:
-        ver = json.load(resp)
-    ws = ver.get("webSocketDebuggerUrl") if isinstance(ver, dict) else None
-    if not isinstance(ws, str) or not ws.startswith("ws"):
-        raise DownloadError("no browser WebSocketDebuggerUrl")
-    return ws
-
-
-def configure_chrome_download_behavior(
-    cdp_http_url: str,
-    download_dir: Path,
-    *,
-    mock: bool = False,
-    recorder: MockDownloadRecorder | None = None,
-) -> dict[str, Any]:
-    """CDP Browser.setDownloadBehavior → lease downloads dir (or mock record).
-
-    When mock=True, records the call and returns without talking to Chrome.
-    Absolute ``download_dir`` is used for Chrome; never returned to agents.
-    """
-    abs_dir = _resolve_policy_path(download_dir)
-    abs_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path_str = str(abs_dir)
-    if mock:
-        if recorder is not None:
-            recorder.record(download_path=path_str, behavior=_BEHAVIOR_ALLOW)
-        return {"ok": True, "mocked": True, "behavior": _BEHAVIOR_ALLOW}
-
-    from slipstream.cdp_inject import CdpInjectError, _ws_cdp_call
-
-    try:
-        ws_url = _browser_ws_url(cdp_http_url)
-        _ws_cdp_call(
-            ws_url,
-            "Browser.setDownloadBehavior",
-            {
-                "behavior": _BEHAVIOR_ALLOW,
-                "downloadPath": path_str,
-                "eventsEnabled": True,
-            },
-        )
-    except CdpInjectError as e:
-        raise DownloadError(str(e)) from e
-    return {"ok": True, "mocked": False, "behavior": _BEHAVIOR_ALLOW}
