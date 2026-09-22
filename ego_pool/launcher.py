@@ -131,6 +131,13 @@ class ChromiumLauncher:
         )
 
     def stop(self, handle: LaunchHandle | None, grace_seconds: float = 2.0) -> None:
+        """Best-effort teardown of a Chromium process tree.
+
+        SIGTERM → wait(grace) → SIGKILL → wait(2). The final wait catches
+        ``TimeoutExpired`` so pool release can finish clearing lease state
+        even if the OS has not fully reaped the process yet (orphan risk is
+        accepted; lease bookkeeping must not desync).
+        """
         if handle is None:
             return
         if handle.mocked:
@@ -159,4 +166,8 @@ class ChromiumLauncher:
                 os.killpg(proc.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
                 proc.kill()
-            proc.wait(timeout=2)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                # Best-effort: do not block release / lease-state cleanup.
+                pass

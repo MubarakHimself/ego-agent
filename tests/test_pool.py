@@ -93,6 +93,79 @@ def test_idempotent_release_after_hard_ttl_gets_fresh(pool: BrowserPool):
     assert pool.heartbeat(b["lease_id"])["ok"] is True
 
 
+def test_ttl_seconds_clamped_to_hard_ceiling(pool: BrowserPool):
+    """Client ttl above lease_hard_ttl_seconds is clamped; shorter still allowed."""
+    ceiling = pool.config.lease_hard_ttl_seconds
+    before = time.time()
+    over = pool.lease("agent-1", "space-a", ttl_seconds=ceiling + 10_000)
+    after = time.time()
+    assert over["expires_at"] <= after + ceiling + 0.5
+    assert over["expires_at"] >= before + ceiling - 0.5
+    pool.release(over["lease_id"])
+
+    before = time.time()
+    short = pool.lease("agent-1", "space-b", ttl_seconds=60)
+    after = time.time()
+    assert short["expires_at"] <= after + 60 + 0.5
+    assert short["expires_at"] >= before + 60 - 0.5
+
+
+def test_idempotent_dead_leased_handle_cold_starts(pool: BrowserPool):
+    """Same (agent_id, space_id) LEASED hit with a dead handle → release + cold start."""
+    a = pool.lease("agent-1", "space-a")
+    old_id = a["lease_id"]
+    slot = pool._find_slot_by_lease(old_id)
+    assert slot is not None
+    dead_proc = MagicMock()
+    dead_proc.poll.return_value = 1  # exited
+    pool._handles[slot.slot_id] = LaunchHandle(
+        pid=slot.chromium_pid or 99999,
+        cdp_port=slot.cdp_port or 19222,
+        cdp_http_url=slot.cdp_http_url or "http://127.0.0.1:19222",
+        cdp_ws_url=slot.cdp_ws_url,
+        user_data_dir=pool.config.spaces_root / "space-a",
+        process=dead_proc,
+        mocked=False,
+    )
+
+    with patch.object(pool.launcher, "launch", wraps=pool.launcher.launch) as launch_spy:
+        b = pool.lease("agent-1", "space-a")
+        assert launch_spy.call_count == 1
+
+    assert b["lease_id"] != old_id
+    assert old_id not in pool._leases
+    assert b["status"] == "leased"
+    assert pool.status()["leased"] == 1
+    assert pool.heartbeat(b["lease_id"])["ok"] is True
+
+
+def test_stop_final_wait_timeout_is_best_effort(mock_config):
+    """TimeoutExpired on final wait must not raise — release can clear lease state."""
+    from ego_pool.launcher import ChromiumLauncher
+
+    launcher = ChromiumLauncher(mock_config)
+    proc = MagicMock()
+    proc.poll.return_value = None  # still running
+    proc.pid = 12345
+    # First wait (grace) times out → SIGKILL path; final wait also times out
+    proc.wait.side_effect = [
+        __import__("subprocess").TimeoutExpired(cmd="chrome", timeout=2),
+        __import__("subprocess").TimeoutExpired(cmd="chrome", timeout=2),
+    ]
+    handle = LaunchHandle(
+        pid=12345,
+        cdp_port=9222,
+        cdp_http_url="http://127.0.0.1:9222",
+        cdp_ws_url=None,
+        user_data_dir=mock_config.spaces_root / "x",
+        process=proc,
+        mocked=False,
+    )
+    with patch("ego_pool.launcher.os.killpg"):
+        launcher.stop(handle, grace_seconds=0.01)  # must not raise
+    assert proc.wait.call_count == 2
+
+
 def test_space_exclusivity_different_agent(pool: BrowserPool):
     pool.lease("agent-1", "space-a")
     with pytest.raises(SpaceInUseError):

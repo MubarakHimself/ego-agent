@@ -52,7 +52,9 @@ Env overrides: `EGO_POOL_MOCK=1`, `EGO_POOL_CHROME`, `EGO_POOL_SPACES_ROOT`, `EG
 
 → `400` for invalid `space_id` (empty / `.` / `..` / path separators `/` `\` / NULs / unsafe) or non-integer `ttl_seconds`. Distinct ids are never rewritten — bad ids are rejected.
 
-→ `409` when `space_id` is already leased by another agent (`{"error":"space_in_use"}`). Same `(agent_id, space_id)` while leased remains idempotent (`200`) unless the hard TTL has expired — then the old lease is released (process stopped) and a fresh lease is issued.
+→ `409` when `space_id` is already leased by another agent (`{"error":"space_in_use"}`). Same `(agent_id, space_id)` while leased remains idempotent (`200`) unless the hard TTL has expired **or** the Chromium handle is dead — then the old lease is released (process stopped, `allow_warm=False`) and a fresh lease is issued (cold start).
+
+Optional `ttl_seconds` may be shorter than `lease_hard_ttl_seconds`; requests above the ceiling are **clamped** to `lease_hard_ttl_seconds` (never reject solely for being too long).
 
 → `503` when pool at hard K (`{"error":"pool_full"}`) or Chromium launch fails (`{"error":"launch_failed"}`, including `OSError` / other launch exceptions).
 

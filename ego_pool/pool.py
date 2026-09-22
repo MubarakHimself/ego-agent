@@ -140,7 +140,9 @@ class BrowserPool:
         """Wire Lease + slot lease fields; caller sets process/CDP fields as needed."""
         now = time.time()
         lease_id = new_lease_id()
-        hard_ttl = ttl_seconds if ttl_seconds is not None else self.config.lease_hard_ttl_seconds
+        # Client may request shorter TTLs; never exceed config ceiling (docs align).
+        requested = ttl_seconds if ttl_seconds is not None else self.config.lease_hard_ttl_seconds
+        hard_ttl = min(requested, self.config.lease_hard_ttl_seconds)
         lease = Lease(
             lease_id=lease_id,
             slot_id=slot.slot_id,
@@ -184,6 +186,14 @@ class BrowserPool:
                         if existing.expires_at is not None and now >= existing.expires_at:
                             self._release_locked(
                                 lid, reason="hard_ttl_expired", allow_warm=False
+                            )
+                            break
+                        # Dead Chromium under an active lease → stop + fall through
+                        # to cold start (mirror dead-warm path); never hand off a
+                        # stale CDP endpoint.
+                        if not self._handle_alive(slot):
+                            self._release_locked(
+                                lid, reason="dead_process", allow_warm=False
                             )
                             break
                         slot.last_heartbeat = now
