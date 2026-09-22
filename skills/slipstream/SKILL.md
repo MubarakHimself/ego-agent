@@ -178,7 +178,7 @@ Defer: once/always/never policy matrix, full server-enforced ladder, Comet UI.
 
 ## Domain allowlist (top-frame)
 
-Restrict top-frame navigation when set. **Empty = unrestricted.**
+Restrict top-frame navigation when set. **No allowlist anywhere = unrestricted.** Lease `[]` inherits Space∩config (never clears lockdown); lease may only narrow. Active allowlist: http(s) + host only; no `\`/`%5C`/userinfo.
 
 ```bash
 export SLIPSTREAM_ALLOWED_DOMAINS="example.com,*.example.org"

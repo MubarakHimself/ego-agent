@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import secrets
 from typing import Any
+from urllib.parse import urlparse
 
 # Process-lifetime nonce (stable within one CLI/pool process).
 _PROCESS_NONCE: str | None = None
@@ -41,6 +42,41 @@ def reset_boundary_nonce_for_tests() -> None:
     _PROCESS_NONCE = None
 
 
+def sanitize_origin(origin: str | None) -> str | None:
+    """Reduce origin/page_url to a single-line ``scheme://host[:port]``.
+
+    ADV-BOUND-001: unsanitized newlines (or forged ``--- END_…`` suffixes) in
+    origin= break marker lines so naive parsers treat trailing attacker text
+    as outside the untrusted zone. Only a strict origin form is emitted.
+    """
+    if origin is None:
+        return None
+    if not isinstance(origin, str):
+        origin = str(origin)
+    # Drop C0 controls + DEL; collapse to single line first.
+    cleaned = "".join(ch for ch in origin if ord(ch) >= 32 and ord(ch) != 127)
+    cleaned = cleaned.replace("\r", "").replace("\n", "").strip()
+    if not cleaned:
+        return None
+    # Refuse marker-like payloads outright.
+    if "---" in cleaned or " " in cleaned or "\t" in cleaned:
+        # Still try to salvage scheme://host if parseable.
+        pass
+    try:
+        parsed = urlparse(cleaned)
+    except Exception:
+        return None
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if scheme not in ("http", "https") or not host:
+        return None
+    # Rebuild origin only — drop path/query/fragment/userinfo.
+    netloc = host
+    if parsed.port:
+        netloc = f"{host}:{parsed.port}"
+    return f"{scheme}://{netloc}"[:512]
+
+
 def wrap_page_content(
     text: str,
     *,
@@ -60,7 +96,8 @@ def wrap_page_content(
     if not force and not content_boundaries_enabled():
         return text
     n = nonce or boundary_nonce()
-    origin_part = f" origin={origin}" if origin else ""
+    safe_origin = sanitize_origin(origin)
+    origin_part = f" origin={safe_origin}" if safe_origin else ""
     begin = BEGIN_FMT.format(nonce=n, origin_part=origin_part)
     end = END_FMT.format(nonce=n)
     return f"{begin}\n{text}\n{end}"
@@ -68,4 +105,4 @@ def wrap_page_content(
 
 def boundary_meta(*, origin: str | None = None, nonce: str | None = None) -> dict[str, Any]:
     """JSON ``_boundary`` object for orchestrators (agent-browser-style)."""
-    return {"nonce": nonce or boundary_nonce(), "origin": origin}
+    return {"nonce": nonce or boundary_nonce(), "origin": sanitize_origin(origin)}

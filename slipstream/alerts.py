@@ -79,7 +79,31 @@ _FORBIDDEN_SEGMENTS = frozenset(
         "jwts",
         "bearer",
         "bearers",
+        "auth",  # ADV-META-001-GAP: basicAuth / proxyAuth / myAuth
     }
+)
+
+# Flattened lowercase compounds (no camelCase boundary) — ADV-META-001-GAP.
+_FORBIDDEN_FLAT = frozenset(
+    {
+        "accesstoken",
+        "sessiontoken",
+        "clientsecret",
+        "mypassword",
+        "cookiejar",
+        "refreshtoken",
+        "idtoken",
+        "bearertoken",
+        "privatekey",
+        "accesskey",
+        "apikey",
+    }
+)
+
+# Stem + trailing digits (password1 / Token2 / passwd2).
+_FORBIDDEN_STEM_DIGIT_RE = re.compile(
+    r"(?i)^(passwords?|passwd|tokens?|secrets?|cookies?|jwts?|bearers?|"
+    r"credentials?|authorization)(\d+)$"
 )
 
 # Adjacent segment pairs that form secret compounds (token-boundary).
@@ -101,13 +125,27 @@ _FORBIDDEN_SEGMENT_PAIRS = frozenset(
 
 # Light scrub of free-text detail/summary/need_human values (trust boundary:
 # callers must not put secrets in text; we still redact denylist-stem leaks
-# aligned with reject_secret_fields — ADV-PL-002: jwt=/access_key=/private_key=/
-# api_key=/passwd=/… must not survive into summary/detail payloads).
+# aligned with reject_secret_fields — ADV-PL-002 + ADV-PL-002-GAP: compounds,
+# camelCase name=value, Authorization: Bearer, JSON "api_key":"...").
 _SCRUB_STEMS = (
-    r"passwords?|passwd|cookies?|tokens?|secrets?|authorization|bearers?|"
-    r"jwts?|api[_-]?keys?|private[_-]?keys?|access[_-]?keys?|credentials?"
+    r"passwords?|passwd|cookies?|tokens?|secrets?|bearers?|"
+    r"jwts?|api[_-]?keys?|private[_-]?keys?|access[_-]?keys?|credentials?|"
+    r"client[_-]?secrets?|session[_-]?tokens?|refresh[_-]?tokens?|id[_-]?tokens?|"
+    r"aws[_-]?secret[_-]?access[_-]?keys?|"
+    r"accessToken|sessionToken|clientSecret|refreshToken|idToken|apiKey|"
+    r"privateKey|accessKey|bearerToken"
 )
-_SCRUB_VALUE_RE = re.compile(rf"(?i)\b({_SCRUB_STEMS})\s*=\s*\S+")
+# name=value / name: value — authorization handled separately (Bearer / = form)
+# so "Authorization: Bearer …" is not eaten as authorization=:Bearer.
+_SCRUB_VALUE_RE = re.compile(
+    rf"(?i)(?:\b|_|-)({_SCRUB_STEMS})\s*[=:]\s*\S+"
+)
+_SCRUB_AUTH_EQ_RE = re.compile(r"(?i)\bauthorization\s*=\s*\S+")
+_SCRUB_JSON_KEY_RE = re.compile(
+    r'(?i)("(?:api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|'
+    r'password|passwd|token|secret|jwt|bearer|accessToken|sessionToken|'
+    r'clientSecret)"\s*:\s*")([^"]*)(")'
+)
 
 DEFAULT_WATCH_TTL_S = 300
 
@@ -150,6 +188,11 @@ def _key_forbidden(key: str) -> bool:
     lowered = key.lower().replace("-", "_")
     if lowered in _FORBIDDEN_FRAGMENTS:
         return True
+    flat = re.sub(r"[_\-]", "", lowered)
+    if flat in _FORBIDDEN_FLAT:
+        return True
+    if _FORBIDDEN_STEM_DIGIT_RE.match(lowered) or _FORBIDDEN_STEM_DIGIT_RE.match(flat):
+        return True
     segments = _key_segments(key)
     if any(seg in _FORBIDDEN_SEGMENTS for seg in segments):
         return True
@@ -160,13 +203,25 @@ def _key_forbidden(key: str) -> bool:
 
 
 def scrub_text(value: str) -> str:
-    """Redact denylist-stem ``name=value`` leaks in free-text (ADV-PL-002)."""
+    """Redact denylist-stem leaks in free-text (ADV-PL-002 / ADV-PL-002-GAP)."""
     if not value:
         return value
-    return _SCRUB_VALUE_RE.sub(
-        lambda m: m.group(1) + "=[REDACTED]",
+
+    # Header / bare Bearer first.
+    out = re.sub(
+        r"(?i)\bAuthorization\s*:\s*Bearer\s+\S+",
+        "Authorization: Bearer [REDACTED]",
         value,
     )
+    out = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._\-+=/]+", "Bearer [REDACTED]", out)
+    out = _SCRUB_JSON_KEY_RE.sub(r"\1[REDACTED]\3", out)
+    out = _SCRUB_AUTH_EQ_RE.sub("authorization=[REDACTED]", out)
+
+    def _kv(m: re.Match[str]) -> str:
+        return f"{m.group(1)}=[REDACTED]"
+
+    out = _SCRUB_VALUE_RE.sub(_kv, out)
+    return out
 
 
 def reject_secret_fields(obj: Any, *, path: str = "") -> None:
