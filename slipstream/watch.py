@@ -2,6 +2,9 @@
 
 Minted on need_human as a short-TTL tokenized watch_url. Revoked on
 task_done and after TTL expiry. No pair-browse / input / secrets on page.
+
+Frames are sensitive screenshots of the leased viewport (ADV-WATCH-007) —
+treat watch_url like a screen-share secret (v1: credential-in-URL).
 """
 
 from __future__ import annotations
@@ -16,6 +19,11 @@ from urllib.parse import quote, urlencode, urlparse
 # Minimal JPEG SOI+EOI for mock / fallback (not a secret; low entropy).
 _MOCK_JPEG = bytes((0xFF, 0xD8, 0xFF, 0xD9))
 
+# Clickjacking defenses for Watch HTML / frame / confirm (ADV-WATCH-003).
+WATCH_CLICKJACK_HEADERS: dict[str, str] = {
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+}
 
 
 class WatchAuthError(Exception):
@@ -125,6 +133,26 @@ def assert_cdp_loopback(cdp_http_url: str) -> None:
         raise WatchCaptureError(f"refusing non-loopback CDP URL host {host!r}")
 
 
+def assert_ws_debugger_url(ws_url: str) -> str:
+    """Reject non-loopback / non-ws(s) webSocketDebuggerUrl before connect.
+
+    ADV-WATCH-006: Chrome may advertise a debugger WS; only loopback ws/wss
+    are allowed for pool-side Watch screenshot and credential inject.
+    """
+    parsed = urlparse(ws_url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("ws", "wss"):
+        raise WatchCaptureError(
+            f"refusing non-ws(s) webSocketDebuggerUrl scheme {scheme!r}"
+        )
+    host = parsed.hostname
+    if not _host_is_loopback(host):
+        raise WatchCaptureError(
+            f"refusing non-loopback webSocketDebuggerUrl host {host!r}"
+        )
+    return ws_url
+
+
 def capture_jpeg_frame(cdp_http_url: str, *, mock: bool = False) -> bytes:
     """Capture a JPEG viewport via CDP Page.captureScreenshot (or mock JPEG).
 
@@ -140,7 +168,7 @@ def capture_jpeg_frame(cdp_http_url: str, *, mock: bool = False) -> bytes:
     from slipstream.cdp_inject import CdpInjectError, _page_ws_url, _ws_cdp_call
 
     try:
-        ws_url = _page_ws_url(cdp_http_url)
+        ws_url = assert_ws_debugger_url(_page_ws_url(cdp_http_url))
         # Page domain must be enabled for some Chrome builds; captureScreenshot
         # usually works without — enable defensively, ignore enable errors.
         try:

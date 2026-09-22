@@ -148,11 +148,17 @@ On `need_human` the pool mints an unguessable token and returns:
 | `GET` | `/v1/leases/{id}/watch/frame?token=…` | `image/jpeg` viewport via CDP `Page.captureScreenshot` (mock JPEG under `SLIPSTREAM_MOCK`) |
 | `POST` | `/v1/leases/{id}/watch/confirm?token=…` | Confirm Take-over → `{action: pause, agent_paused: true, lease_kept: true}` |
 
-→ `401` missing/wrong token · `410` after `task_done`, lease release, or Watch TTL expiry · `404` no session.
+→ `401` missing/wrong/cross-lease token · `410` after `task_done`, lease release, Watch TTL expiry, or revoke/identity race mid-frame · `404` unknown lease / no watch session.
 
-**Never on the Watch page / frame:** cookies, passwords, tokens-as-JSON, vault dumps, raw CDP auth / `cdp_http_url` / debugger WS. Treat `watch_url` itself as a credential (loopback allowlist still applies to pool/CDP URLs).
+**Credential-in-URL (v1):** `watch_url` carries `?token=…` — treat the whole URL as a **screen-share secret** (anyone with the link can see live viewport screenshots for the TTL). Do not paste into group chat / tickets / logs. **HttpOnly cookie migration** (token out of the URL / HTML) is deferred — wait for Firstmate / captain before implementing.
 
-**Defer:** pair-browse, replay, WS dashboard, iframe embed product, Take/Cede exclusive lock.
+**Sensitive frames (ADV-WATCH-007):** `/watch/frame` JPEG bytes are screenshots of whatever the leased Chromium is showing (may include PII, account UI, partial secrets on-screen). Responses use `Cache-Control: no-store`, `X-Frame-Options: DENY`, and `Content-Security-Policy: frame-ancestors 'none'` on Watch HTML / frame / confirm. After CDP capture the pool re-validates `session.revoked` + lease/slot/CDP identity before returning bytes (concurrent `task_done` / port reuse → `410`, never a mock soft-fallback after auth).
+
+**Never on the Watch page / frame:** cookies, passwords, tokens-as-JSON, vault dumps, raw CDP auth / `cdp_http_url` / debugger WS. CDP `webSocketDebuggerUrl` must be loopback `ws`/`wss` before connect.
+
+**Chromium `--remote-allow-origins=*` (v1 residual risk):** pool launch still passes `*` so localhost CDP WebSockets (Watch screenshot + cred fill) work. On a shared host this widens who may attach to the debugging port if they can reach loopback. **Tighten** (explicit origin allowlist) is deferred — wait for Firstmate. Mitigations today: loopback-only CDP bind, pool API on `127.0.0.1`, WS debugger URL allowlist (loopback ws/wss only).
+
+**Defer:** pair-browse, replay, WS dashboard, iframe embed product, Take/Cede exclusive lock, token→HttpOnly cookie, `--remote-allow-origins` tighten.
 
 **In-memory alert state:** `_alert_log`, `_task_done_envelopes`, and `_watches` are **process-lifetime** maps (survive lease release for idempotent `task_done` / revoked-watch `410`; cleared on pool shutdown / process exit). Bounded LRU eviction is deferred.
 

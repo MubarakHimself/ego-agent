@@ -66,6 +66,31 @@ class MockCdpInjector:
         return filled
 
 
+def _assert_ws_debugger_url(ws_url: str) -> str:
+    """ADV-WATCH-006: refuse non-loopback / non-ws(s) debugger URLs before connect."""
+    parsed = urlparse(ws_url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("ws", "wss"):
+        raise CdpInjectError(
+            f"refusing non-ws(s) webSocketDebuggerUrl scheme {scheme!r}"
+        )
+    host = (parsed.hostname or "").strip().lower().strip("[]")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        # Also accept other loopback IPs
+        try:
+            import ipaddress
+
+            if not ipaddress.ip_address(host).is_loopback:
+                raise CdpInjectError(
+                    f"refusing non-loopback webSocketDebuggerUrl host {host!r}"
+                )
+        except ValueError as e:
+            raise CdpInjectError(
+                f"refusing non-loopback webSocketDebuggerUrl host {host!r}"
+            ) from e
+    return ws_url
+
+
 def _page_ws_url(cdp_http_url: str) -> str:
     """Resolve a page WebSocket debugger URL from CDP HTTP endpoint."""
     base = cdp_http_url.rstrip("/")
@@ -77,14 +102,14 @@ def _page_ws_url(cdp_http_url: str) -> str:
         if not isinstance(t, dict):
             continue
         if t.get("type") in (None, "page") and t.get("webSocketDebuggerUrl"):
-            return str(t["webSocketDebuggerUrl"])
+            return _assert_ws_debugger_url(str(t["webSocketDebuggerUrl"]))
     # Fallback: version endpoint browser-level WS (less ideal for DOM)
     with urlopen(f"{base}/json/version", timeout=3.0) as resp:
         ver = json.load(resp)
     ws = ver.get("webSocketDebuggerUrl") if isinstance(ver, dict) else None
     if not ws:
         raise CdpInjectError("no CDP WebSocket target available")
-    return str(ws)
+    return _assert_ws_debugger_url(str(ws))
 
 
 def _ws_cdp_call(ws_url: str, method: str, params: dict[str, Any] | None = None) -> Any:
