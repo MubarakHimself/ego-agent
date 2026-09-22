@@ -225,6 +225,9 @@ Keep **interactive web** (forms, QA, login, CDP automation) on a Slipstream
 **Space lease**. Live human observe of a leased page is Slipstream’s tokenized
 Watch JPEG/HTML (`need_human`) — that is **not** the Claude `/watch` skill.
 
+**Activity feed (Watch dock):** the Watch page shows a chronological lease-scoped action feed beside the live JPEG (`navigate` / `click` / `type` / `fill` / `alert` / `confirm`). Poll `GET …/watch/events?token=…` (same token TTL/revoke as Watch → 410). Entries are scrubbed — never cookies, passwords, typed text, vault, or CDP auth (`type`/`fill` → length/labels only). Soft browse remains free; feed is captain observe opacity. Reuses the alerts bus for `need_human` / `task_done` (no second notification path).
+
+
 ### Install upstream `/watch`
 
 ```bash

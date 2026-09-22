@@ -235,6 +235,7 @@ def render_watch_html(
     input_enabled: bool = False,
     input_url: str | None = None,
     cede_url: str | None = None,
+    events_url: str | None = None,
 ) -> str:
     """Watch HTML shell. Input bridge only when confirmed+enabled; no secrets.
 
@@ -292,6 +293,8 @@ def render_watch_html(
         else '<meta http-equiv="refresh" content="2"/>'
     )
 
+    events_href = html.escape(events_url, quote=True) if events_url else ""
+
     parts = [
         '<!DOCTYPE html><html lang="en"><head>',
         '<meta charset="utf-8"/>',
@@ -302,6 +305,18 @@ def render_watch_html(
         "</title>",
         "<style>",
         "body{font-family:system-ui,sans-serif;margin:1rem;background:#111;color:#eee;}",
+        ".layout{display:flex;gap:1rem;align-items:flex-start;flex-wrap:wrap;}",
+        ".main{flex:1 1 420px;min-width:280px;}",
+        ".feed{flex:0 1 320px;max-width:100%;max-height:70vh;overflow:auto;",
+        "border:1px solid #333;background:#1a1a1a;padding:0.5rem 0.75rem;",
+        "font-size:0.8rem;line-height:1.35;}",
+        ".feed h2{margin:0 0 0.5rem;font-size:0.95rem;color:#ccc;}",
+        ".feed .ev{border-top:1px solid #2a2a2a;padding:0.35rem 0;}",
+        ".feed .ev .t{color:#888;font-variant-numeric:tabular-nums;}",
+        ".feed .ev .k{color:#8af;font-weight:600;margin-right:0.35rem;}",
+        ".feed .ev .o{color:#8c8;}",
+        ".feed .ev .o.err{color:#c88;}",
+        ".feed .empty{color:#666;}",
         "img{max-width:100%;border:1px solid #444;background:#000;}",
         ".meta{color:#aaa;font-size:0.9rem;}.hint{color:#888;font-size:0.85rem;}",
         ".ok{color:#8c8;}button{font-size:1rem;padding:0.5rem 1rem;cursor:pointer;}",
@@ -322,14 +337,54 @@ def render_watch_html(
         safe_detail,
         "</p>",
         '<p class="hint">No cookies, passwords, tokens, vault, or CDP auth on this page. '
-        "Observe-only blocks input until Take-over is confirmed.</p>",
+        "Observe-only blocks input until Take-over is confirmed. Activity feed is "
+        "lease-scoped, scrubbed, and revoked with watch_url.</p>",
+        '<div class="layout"><div class="main">',
         '<div id="viewport"',
         ' class="drive"' if input_enabled else "",
         '><img id="frame" src="',
         frame_href,
         '" alt="live viewport (JPEG)"/></div>',
     ]
+
     parts.extend(confirm_parts)
+    parts.append("</div>")  # .main
+    # Activity feed dock (CTO 007) — polls tokenized /watch/events
+    parts.append('<aside class="feed" id="feed" aria-label="Activity feed">')
+    parts.append("<h2>Activity</h2>")
+    parts.append('<div id="feed-list"><p class="empty">No events yet.</p></div>')
+    parts.append("</aside></div>")  # feed + layout
+    if events_url:
+        # Poll tokenized events; never embed secrets — summaries are server-scrubbed.
+        parts.append("<script>(function(){")
+        parts.append(f"var EVENTS_URL={json_quote(events_url)};")
+        parts.append(
+            "var list=document.getElementById('feed-list');"
+            "var after=0;"
+            "function fmt(ts){try{return new Date(ts*1000).toLocaleTimeString();}catch(e){return '';}}"
+            "function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\"/g,'&quot;');}"
+            "function addRows(rows){"
+            "if(!rows||!rows.length)return;"
+            "var empty=list.querySelector('.empty');if(empty)empty.remove();"
+            "for(var i=0;i<rows.length;i++){"
+            "var r=rows[i];after=Math.max(after,r.seq||0);"
+            "var d=document.createElement('div');d.className='ev';"
+            "var oc=(r.outcome&&r.outcome!=='ok')?'o err':'o';"
+            "d.innerHTML='<span class=\"t\">'+fmt(r.ts)+'</span> '"
+            "+'<span class=\"k\">'+esc(r.kind)+'</span>'"
+            "+'<span>'+esc(r.summary)+'</span> '"
+            "+'<span class=\"'+oc+'\">'+esc(r.outcome)+'</span>';"
+            "list.appendChild(d);}"
+            "list.parentElement.scrollTop=list.parentElement.scrollHeight;}"
+            "function tick(){var u=EVENTS_URL+(EVENTS_URL.indexOf('?')>=0?'&':'?')+'after_seq='+after;"
+            "fetch(u,{credentials:'same-origin'}).then(function(res){"
+            "if(res.status===410||res.status===401){return null;}"
+            "return res.ok?res.json():null;}).then(function(data){"
+            "if(data&&data.events)addRows(data.events);}).catch(function(){});}"
+            "tick();setInterval(tick,2000);"
+        )
+        parts.append("})();</script>")
+
 
     if input_enabled and input_url:
         # Inline bridge: coordinates + keys POST to pool; never echo typed text.
@@ -390,6 +445,12 @@ def input_path(lease_id: str, token: str, *, base_path: str = "") -> str:
 def cede_path(lease_id: str, token: str, *, base_path: str = "") -> str:
     q = urlencode({"token": token})
     return f"{base_path}/v1/leases/{quote(lease_id, safe='')}/watch/cede?{q}"
+
+
+def events_path(lease_id: str, token: str, *, base_path: str = "") -> str:
+    """Tokenized activity-feed JSON path (same TTL/revoke as Watch)."""
+    q = urlencode({"token": token})
+    return f"{base_path}/v1/leases/{quote(lease_id, safe='')}/watch/events?{q}"
 
 
 # --- pair-browse CDP input bridge -----------------------------------------

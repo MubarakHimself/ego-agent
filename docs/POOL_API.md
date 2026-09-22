@@ -137,6 +137,18 @@ Request must **not** include `watch_url` or `status` — both are server-derived
 
 ### Live Watch + thin pair-browse v1
 
+### Watch activity feed (thin dock)
+
+Lease-scoped append-only event log beside the Watch JPEG (CTO cut `activity-feed-007` / EgoRuntime `activity-feed-001`).
+
+- `GET /v1/leases/{id}/watch/events?token=…&after_seq=0` — JSON `{lease_id, events:[{seq,ts,kind,summary,outcome,detail}]}`
+- Kinds: `navigate`, `click`, `type`, `fill`, `alert`, `confirm` (timestamp + safe summary + outcome)
+- Same watch token TTL/revoke as Watch HTML/frame — stale/revoked → `410`; bad token → `401`
+- Secrets redacted: no cookies/passwords/tokens/vault/CDP auth; `type`/`fill` expose lengths/labels only
+- Bounded ring buffer (no replay/edit). Soft browse stays free; feed is observe opacity for captain
+- Reuses alerts bus for `need_human` / `task_done` — **no** second notification path
+
+
 On `need_human` the pool mints an unguessable token and returns:
 
 - `watch_url` = `/v1/leases/{id}/watch?token=…` (TTL from `ttl_s`, default 300s)
