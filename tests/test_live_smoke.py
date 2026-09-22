@@ -1,12 +1,12 @@
-"""Optional live smoke — requires real Chrome; skipped unless --live / mark selected."""
+"""Optional live smoke — requires real Chrome; skipped unless -m live."""
 
 from __future__ import annotations
 
 import os
-import urllib.request
 
 import pytest
 
+from ego_pool.cdp_http import navigate_via_json_new, wait_cdp_ready
 from ego_pool.config import PoolConfig
 from ego_pool.launcher import find_chrome_binary
 from ego_pool.pool import BrowserPool
@@ -14,7 +14,7 @@ from ego_pool.rss import sample_tree_rss
 
 
 @pytest.mark.live
-def test_live_chrome_lease_and_cdp(tmp_path):
+def test_live_chrome_lease_navigate_heartbeat_release(tmp_path):
     binary = find_chrome_binary()
     if not binary:
         pytest.skip("No Chrome/Chromium binary on PATH")
@@ -23,7 +23,7 @@ def test_live_chrome_lease_and_cdp(tmp_path):
 
     cfg = PoolConfig(
         K=1,
-        W=0,
+        W=1,
         spaces_root=tmp_path / "spaces",
         cdp_base_port=19422,
         mock=False,
@@ -41,25 +41,38 @@ def test_live_chrome_lease_and_cdp(tmp_path):
                 pid = s["chromium_pid"]
                 break
         assert pid is not None
-        # CDP HTTP should respond (may take a moment)
-        url = lease["cdp_http_url"] + "/json/version"
-        ok = False
-        import time
 
-        for _ in range(20):
-            try:
-                with urllib.request.urlopen(url, timeout=1) as resp:
-                    if resp.status == 200:
-                        ok = True
-                        break
-            except Exception:
-                time.sleep(0.25)
-        assert ok, f"CDP not reachable at {url}"
+        version = wait_cdp_ready(lease["cdp_http_url"], timeout=20.0)
+        assert "Browser" in version
+
+        snap = navigate_via_json_new(
+            lease["cdp_http_url"],
+            "https://example.com",
+            expect_title_substr="Example Domain",
+            settle_timeout=15.0,
+        )
+        assert snap.get("matched"), f"navigate failed: {snap}"
+        assert "Example Domain" in (snap.get("title") or "")
 
         rss = sample_tree_rss(pid)
-        # Document hook works on live Linux
         assert rss is None or rss > 0
 
+        hb = pool.heartbeat(lease["lease_id"])
+        assert hb.get("ok") is True
+
         pool.release(lease["lease_id"])
+
+        # Warm reuse path (W=1): same space should come back without relaunch race
+        lease2 = pool.lease("live-agent", "live-space")
+        assert lease2["status"] == "leased"
+        assert lease2["cdp_http_url"] == lease["cdp_http_url"]
+        pid2 = None
+        for s in pool.status()["slots"]:
+            if s["lease_id"] == lease2["lease_id"]:
+                pid2 = s["chromium_pid"]
+                break
+        assert pid2 == pid
+        wait_cdp_ready(lease2["cdp_http_url"], timeout=5.0)
+        pool.release(lease2["lease_id"])
     finally:
         pool.shutdown()
