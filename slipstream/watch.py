@@ -224,6 +224,40 @@ def capture_jpeg_frame(cdp_http_url: str, *, mock: bool = False) -> bytes:
     return raw
 
 
+
+def _signed_in_chip_html(*, signed_in: bool, signed_in_host: str | None) -> str:
+    if not signed_in:
+        return '<span class="chip off">not signed-in</span>'
+    host = (" · " + html.escape(signed_in_host)) if signed_in_host else ""
+    return (
+        '<span class="chip on" title="Space profile holds session cookies">'
+        f"signed-in{host}</span>"
+    )
+
+
+def _mark_signed_in_form_html(mark_url: str) -> str:
+    mu = html.escape(mark_url, quote=True)
+    return (
+        f'<form method="POST" action="{mu}" class="hint" style="margin-top:0.75rem">'
+        "<label>Host label (optional) "
+        '<input name="host" maxlength="128" placeholder="github.com"/>'
+        "</label> "
+        '<button type="submit">Mark Space signed-in</button>'
+        '<p class="hint">Cookies already persist in the Space profile dir; '
+        "this only sets the signed-in badge (never dumps cookies).</p>"
+        "</form>"
+    )
+
+
+def _signed_in_ok_html(signed_in_host: str | None) -> str:
+    host_bit = (" (" + html.escape(signed_in_host) + ")") if signed_in_host else ""
+    return (
+        '<p class="ok">Space tagged signed-in'
+        + host_bit
+        + " — profile cookies reused on later leases.</p>"
+    )
+
+
 def render_watch_html(
     *,
     lease_id: str,
@@ -238,6 +272,9 @@ def render_watch_html(
     input_url: str | None = None,
     cede_url: str | None = None,
     events_url: str | None = None,
+    signed_in: bool = False,
+    signed_in_host: str | None = None,
+    mark_signed_in_url: str | None = None,
 ) -> str:
     """Watch HTML shell. Input bridge only when confirmed+enabled; no secrets.
 
@@ -322,6 +359,9 @@ def render_watch_html(
         "img{max-width:100%;border:1px solid #444;background:#000;}",
         ".meta{color:#aaa;font-size:0.9rem;}.hint{color:#888;font-size:0.85rem;}",
         ".ok{color:#8c8;}button{font-size:1rem;padding:0.5rem 1rem;cursor:pointer;}",
+".chip{display:inline-block;padding:0.15rem 0.5rem;border-radius:999px;font-size:0.75rem;font-weight:600;vertical-align:middle;}",
+".chip.on{background:#1a4;color:#cfc;border:1px solid #2a6;}",
+".chip.off{background:#333;color:#aaa;border:1px solid #555;}",
         "#viewport{display:inline-block;position:relative;max-width:100%;}",
         "#viewport.drive{cursor:crosshair;outline:2px solid #4a4;}",
         "</style></head><body>",
@@ -334,7 +374,9 @@ def render_watch_html(
         why,
         " · TTL left ~",
         exp,
-        "s</p>",
+        "s · ",
+        _signed_in_chip_html(signed_in=signed_in, signed_in_host=signed_in_host),
+        "</p>",
         '<p class="meta">',
         safe_detail,
         "</p>",
@@ -350,6 +392,11 @@ def render_watch_html(
     ]
 
     parts.extend(confirm_parts)
+    # Login-once: captain can mark Space signed-in after human login (badge only).
+    if mark_signed_in_url and (reason or "") == "login" and not signed_in:
+        parts.append(_mark_signed_in_form_html(mark_signed_in_url))
+    elif signed_in:
+        parts.append(_signed_in_ok_html(signed_in_host))
     parts.append("</div>")  # .main
     # Activity feed dock (CTO 007) — polls tokenized /watch/events
     parts.append('<aside class="feed" id="feed" aria-label="Activity feed">')

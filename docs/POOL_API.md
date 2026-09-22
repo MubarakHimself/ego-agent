@@ -313,6 +313,43 @@ POST /v1/leases/{lease_id}/credentials/fill
 
 **Refuse:** `GET/POST …/credentials/secret|cookies|storage_state|dump` → `404 {"error":"refused"}`. Fill body must not include secret-like keys (recursive; expanded denylist) — only `cred_id` + selectors (and optional `post_inject`).
 
+
+### Login-once + signed-in badge
+
+Thin Browserbase-style **login once into a Space profile**, then show a **signed-in** metadata badge — **never** free-read cookies to the agent.
+
+**Persist is automatic:** Space = `{spaces_root}/{space_id}/` = Chromium `--user-data-dir`. After a human logs in via Watch/Take-over, session cookies stay in that profile for later leases of the same Space. Vault fill stays separate.
+
+**Flow**
+
+1. Agent raises `need_human` with `reason=login` **or** `POST /v1/spaces/{space_id}/login-once` (creates lease + need_human).
+2. Captain opens `watch_url` → Confirm Take-over → human signs in in the live viewport.
+3. Cede (return drive) **or** mark badge: `POST /v1/spaces/{space_id}/signed-in` (or Watch form **Mark Space signed-in**).
+4. Later leases of that Space reuse the profile; list/lease/Watch show `signed_in` (+ optional `signed_in_host`).
+
+```http
+POST /v1/spaces/{space_id}/login-once
+{"agent_id":"agent-1","detail":"sign in to github","host":"github.com","ttl_s":300}
+→ 200 {lease, alert, harness, flow:"login_once", next:"…", host_hint?}
+
+POST /v1/spaces/{space_id}/signed-in
+{"signed_in":true,"host":"github.com"}
+→ 200 {space_id, signed_in:true, signed_in_host?, user_metadata, persist_note}
+
+POST /v1/spaces/{space_id}/signed-in
+{"signed_in":false}
+→ 200 {space_id, signed_in:false, …}
+
+POST /v1/leases/{lease_id}/watch/mark-signed-in?token=…
+# form or JSON; marks the lease's Space (same badge fields)
+```
+
+`GET /v1/spaces` / `GET /v1/leases` include `signed_in` (+ `signed_in_host` when set). Watch header shows a **signed-in** chip. `user_metadata` mirrors `signed_in=true` / `signed_in_host` for `q=` filters.
+
+**Refuse:** still no cookie / `storage_state` / secret free-read (`…/credentials/cookies|secret|dump` → `404 refused`). Mark body must not include secret-like keys.
+
+CLI: `slipstream spaces login-once …`, `slipstream spaces signed-in --space-id S [--host …] [--clear]`.
+
 **Login / 2FA:** if the agent cannot complete auth after fill (or before bind), raise `need_human` with `reason=login` (or `other` for CAPTCHA/2FA). Lease stays warm; captain Watch / Take-over. Never paste passwords into chat/alerts.
 
 CLI (`cred` subcommands — also listed under CLI client below):

@@ -71,9 +71,12 @@ class Lease:
     allowed_domains_override: list[str] | None = None
     # Effective top-frame allowlist (empty = unrestricted); set by pool on attach.
     allowed_domains: list[str] = field(default_factory=list)
+    # Space signed-in badge (metadata only; cookies stay in user-data-dir).
+    signed_in: bool = False
+    signed_in_host: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "lease_id": self.lease_id,
             "slot_id": self.slot_id,
             "agent_id": self.agent_id,
@@ -85,7 +88,11 @@ class Lease:
             "expires_at": self.expires_at,
             "user_metadata": dict(self.user_metadata),
             "allowed_domains": list(self.allowed_domains),
+            "signed_in": bool(self.signed_in),
         }
+        if self.signed_in and self.signed_in_host:
+            out["signed_in_host"] = self.signed_in_host
+        return out
 
 
 def new_lease_id() -> str:

@@ -15,8 +15,11 @@ Endpoints:
   POST   /v1/leases/{id}/watch/cede
   POST   /v1/spaces/{space_id}/credentials/bind
   POST   /v1/spaces/{space_id}/credentials/{cred_id}/unbind
+  POST   /v1/spaces/{space_id}/signed-in
+  POST   /v1/spaces/{space_id}/login-once
   GET    /v1/spaces/{space_id}/credentials
   PUT    /v1/spaces/{space_id}
+  POST   /v1/leases/{id}/watch/mark-signed-in
   GET    /v1/spaces?q=…
   GET    /v1/leases?q=…
   GET    /v1/leases/{id}/watch
@@ -61,6 +64,7 @@ from slipstream.pool import (
 )
 from slipstream.vault import CredNotFoundError, VaultUnavailableError, VaultValidationError
 from slipstream.metadata import MetadataValidationError
+from slipstream.signed_in import SignedInValidationError
 
 # --- quality-debt: shared path / header / error literals (SKY-L027) ---
 _HDR_CONTENT_TYPE = "Content-Type"
@@ -77,6 +81,7 @@ _ERR_BAD_REQUEST = "bad_request"
 _ERR_INVALID_JSON = "invalid_json"
 _ERR_INVALID_ACTION = "invalid_action"
 _ERR_INVALID_CREDENTIALS = "invalid_credentials"
+_ERR_INVALID_SIGNED_IN = "invalid_signed_in"
 _QS_WATCH_AUTH = "token"  # skylos: ignore[SKY-L014,SKY-L032] query param name, not a secret
 _FIELD_ALLOWED_DOMAINS = "allowed_domains"
 _FIELD_USER_METADATA = "user_metadata"
@@ -131,6 +136,42 @@ def _watch_form_redirect(handler: BaseHTTPRequestHandler, lease_id: str, token: 
 _REFUSED_CRED_TAILS = frozenset(
     {"secret", "secrets", "cookies", "storage_state", "dump"}
 )
+
+
+
+def _parse_mark_json(raw: bytes) -> dict[str, Any]:
+    if not raw:
+        return {"signed_in": True}
+    try:
+        data = json.loads(raw.decode(_UTF8))
+    except json.JSONDecodeError as e:
+        raise ValueError("invalid_json") from e
+    if not isinstance(data, dict):
+        raise ValueError("invalid_json")
+    if "signed_in" not in data:
+        data = {**data, "signed_in": True}
+    return data
+
+
+def _parse_mark_form(raw: bytes) -> dict[str, Any]:
+    from urllib.parse import parse_qs as _pqs
+
+    parsed = _pqs(raw.decode(_UTF8, errors="replace"), keep_blank_values=True)
+    host = (parsed.get("host") or [""])[0].strip()
+    body: dict[str, Any] = {"signed_in": True}
+    if host:
+        body["host"] = host
+    return body
+
+
+def _read_watch_mark_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
+    """JSON or form-urlencoded body for mark-signed-in (host label only)."""
+    length = int(handler.headers.get(_HDR_CONTENT_LENGTH, "0") or 0)
+    raw = handler.rfile.read(length) if length > 0 else b""
+    ctype = (handler.headers.get(_HDR_CONTENT_TYPE) or "").lower()
+    if "application/x-www-form-urlencoded" in ctype:
+        return _parse_mark_form(raw)
+    return _parse_mark_json(raw)
 
 
 def is_refused_credentials_path(parts: list[str]) -> bool:
@@ -391,6 +432,32 @@ def make_handler(pool: BrowserPool):
                     raise
                 return
 
+            lease_mark = _v1_lease_tail(parts_early, _PART_WATCH, "mark-signed-in")
+            if lease_mark is not None:
+                qs = parse_qs(urlparse(self.path).query)
+                token = (qs.get(_QS_WATCH_AUTH) or [None])[0]
+                try:
+                    mark_body = _read_watch_mark_body(self)
+                except ValueError:
+                    _json_response(self, 400, {"error": _ERR_INVALID_JSON})
+                    return
+                try:
+                    result = pool.mark_watch_signed_in(lease_mark, token, mark_body)
+                    if _watch_form_redirect(self, lease_mark, token):
+                        return
+                    _json_response(
+                        self, 200, result, extra_headers=WATCH_CLICKJACK_HEADERS
+                    )
+                except SignedInValidationError as e:
+                    _json_response(
+                        self, 400, {"error": _ERR_INVALID_SIGNED_IN, "detail": str(e)}
+                    )
+                except Exception as e:
+                    if _watch_error(self, e):
+                        return
+                    raise
+                return
+
             lease_input = _v1_lease_tail(parts_early, _PART_WATCH, "input")
             if lease_input is not None:
                 qs = parse_qs(urlparse(self.path).query)
@@ -632,6 +699,58 @@ def make_handler(pool: BrowserPool):
                     _json_response(
                         self, 404, {"error": _ERR_LEASE_NOT_FOUND, "lease_id": str(e)}
                     )
+                return
+
+            # POST /v1/spaces/{space_id}/signed-in — mark/unmark badge (no cookies)
+            space_id = _v1_space_tail(parts, "signed-in")
+            if space_id is not None:
+                try:
+                    result = pool.set_space_signed_in(space_id, body)
+                    _json_response(self, 200, result)
+                except SignedInValidationError as e:
+                    _json_response(
+                        self, 400, {"error": _ERR_INVALID_SIGNED_IN, "detail": str(e)}
+                    )
+                except ValueError as e:
+                    _json_response(self, 400, {"error": _ERR_BAD_REQUEST, "detail": str(e)})
+                return
+
+            # POST /v1/spaces/{space_id}/login-once — lease + need_human(reason=login)
+            space_id = _v1_space_tail(parts, "login-once")
+            if space_id is not None:
+                try:
+                    agent_id = body.get("agent_id") if isinstance(body, dict) else None
+                    if not agent_id:
+                        _json_response(
+                            self,
+                            400,
+                            {
+                                "error": _ERR_BAD_REQUEST,
+                                "detail": "agent_id required",
+                            },
+                        )
+                        return
+                    result = pool.login_once(
+                        space_id,
+                        agent_id=str(agent_id),
+                        detail=body.get("detail"),
+                        ttl_s=body.get("ttl_s"),
+                        host=body.get("host"),
+                        ttl_seconds=body.get("ttl_seconds"),
+                    )
+                    _json_response(self, 200, result)
+                except SignedInValidationError as e:
+                    _json_response(
+                        self, 400, {"error": _ERR_INVALID_SIGNED_IN, "detail": str(e)}
+                    )
+                except PoolFullError as e:
+                    _json_response(self, 503, {"error": "pool_full", "detail": str(e)})
+                except SpaceInUseError as e:
+                    _json_response(self, 409, {"error": "space_in_use", "detail": str(e)})
+                except (RuntimeError, OSError) as e:
+                    _json_response(self, 503, {"error": "launch_failed", "detail": str(e)})
+                except ValueError as e:
+                    _json_response(self, 400, {"error": _ERR_BAD_REQUEST, "detail": str(e)})
                 return
 
             # POST /v1/spaces/{space_id}/credentials/bind
