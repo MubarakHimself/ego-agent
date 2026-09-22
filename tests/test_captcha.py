@@ -16,11 +16,17 @@ from slipstream.captcha import (
     EVENT_FINISHED,
     EVENT_STARTED,
     STATE_ESCALATED,
+    STATE_FAILED,
     STATE_SOLVED,
     STATE_SOLVING,
+    CaptchaState,
+    apply_captcha_event,
+    captcha_banner_html,
     captcha_chip_html,
+    captcha_may_escalate,
     normalize_captcha_event,
     parse_captcha_request,
+    scrub_captcha_detail,
 )
 from slipstream.alerts import AlertValidationError
 from slipstream.cli import _validate_api_request_url
@@ -275,3 +281,162 @@ def test_watch_chip_while_solving(api_server: PoolServer):
     assert code == 200
     assert "CAPTCHA solving" in html
     assert "captcha-banner" in html
+
+def test_late_failed_after_finished_no_need_human(api_server: PoolServer):
+    """ADV-CAP-001: once SOLVED, late failed must not escalate need_human."""
+    base = api_server.base_url
+    lid = _lease(base, space="cap-late-fail")
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/captcha",
+        {"event": "started"},
+    )
+    assert code == 200, body
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/captcha",
+        {"event": "finished"},
+    )
+    assert code == 200, body
+    assert body["captcha"]["state"] == STATE_SOLVED
+    assert "alert" not in body
+
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/captcha",
+        {"event": "failed", "detail": "late noise"},
+    )
+    assert code == 200, body
+    assert body["captcha"]["state"] == STATE_SOLVED
+    assert body["captcha"]["escalated"] is False
+    assert "alert" not in body
+    assert "harness" not in body
+    assert api_server.pool._leases[lid].status == "leased"
+
+
+def test_apply_failed_keeps_solved_unit():
+    """ADV-CAP-001 unit: apply_captcha_event does not unwind SOLVED."""
+    st = CaptchaState(state=STATE_SOLVED, escalated=False)
+    apply_captcha_event(
+        st,
+        event=EVENT_FAILED,
+        detail="late",
+        provider=None,
+        timeout_s=60,
+    )
+    assert st.state == STATE_SOLVED
+    assert captcha_may_escalate(st) is False
+
+
+def test_timeout_escalate_skips_when_already_solved(api_server: PoolServer):
+    """ADV-CAP-002: timeout path must not escalate if finished→SOLVED won."""
+    base = api_server.base_url
+    lid = _lease(base, space="cap-to-solved")
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/captcha",
+        {"event": "started", "timeout_s": 5},
+    )
+    assert code == 200, body
+    st = api_server.pool._captcha[lid]
+    st.started_at = time.time() - 30
+    # Finished wins before timeout escalate.
+    code, body = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/captcha",
+        {"event": "finished"},
+    )
+    assert code == 200, body
+    assert body["captcha"]["state"] == STATE_SOLVED
+
+    env = api_server.pool._escalate_captcha_timeout_if_needed(lid)
+    assert env is None
+    st2 = api_server.pool._captcha[lid]
+    assert st2.state == STATE_SOLVED
+    assert st2.escalated is False
+    assert api_server.pool._leases[lid].status == "leased"
+
+    code, hb = _req("POST", f"{base}/v1/leases/{lid}/heartbeat", {})
+    assert code == 200, hb
+    assert hb.get("captcha_escalated") is not True
+    assert api_server.pool._leases[lid].status == "leased"
+
+
+def test_timeout_escalate_recheck_under_lock(api_server: PoolServer):
+    """ADV-CAP-002: if state becomes SOLVED under lock before escalate, skip."""
+    base = api_server.base_url
+    lid = _lease(base, space="cap-to-recheck")
+    code, _ = _req(
+        "POST",
+        f"{base}/v1/leases/{lid}/captcha",
+        {"event": "started", "timeout_s": 5},
+    )
+    assert code == 200
+    st = api_server.pool._captcha[lid]
+    st.started_at = time.time() - 30
+    assert st.is_timed_out()
+
+    # Simulate concurrent finished by flipping to SOLVED while "timed out" bookkeeping
+    # would have run — escalate must observe SOLVED and abort.
+    st.state = STATE_SOLVED
+    env = api_server.pool._escalate_captcha_timeout_if_needed(lid)
+    assert env is None
+    assert api_server.pool._captcha[lid].state == STATE_SOLVED
+    assert api_server.pool._captcha[lid].escalated is False
+    assert api_server.pool._leases[lid].status == "leased"
+
+
+def test_scrub_unlabeled_jwt_and_secrets():
+    """ADV-CAP-003: bare JWT / sk- / AKIA scrubbed in captcha detail."""
+    jwt = (
+        "challenge eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "aaaaaaaaaaaaaaaa."
+        "bbbbbbbbbbbbbbbb visible"
+    )
+    out = scrub_captcha_detail(jwt)
+    assert "REDACTED_JWT" in out
+    assert "eyJhbGci" not in out
+
+    sk = scrub_captcha_detail("solver sk-abcdefghijklmnopqrstuvwxyz12 done")
+    assert "[REDACTED]" in sk
+    assert "sk-abcdef" not in sk
+
+    parsed = parse_captcha_request(
+        {
+            "event": "started",
+            "detail": (
+                "tok eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                "ccccccccddddddddeeee."
+                "fffffggggghhhhiiiijjjj"
+            ),
+        }
+    )
+    assert "REDACTED_JWT" in parsed["detail"]
+    assert "eyJ" not in parsed["detail"]
+
+
+def test_chip_banner_html_escapes_dynamic():
+    """ADV-CAP-004: provider/detail in chip/banner titles/body are escaped."""
+    evil = CaptchaState(
+        state=STATE_SOLVING,
+        started_at=time.time(),
+        provider='"><img src=x onerror=alert(1)>',
+        detail='</span><script>alert(1)</script>',
+    )
+    chip = captcha_chip_html(evil)
+    assert "<script>" not in chip
+    # Attribute-quoted: leading \"> must be escaped so markup cannot break out.
+    assert "&quot;" in chip or "&#x27;" in chip or "&#39;" in chip
+    assert 'title="">' not in chip
+    assert "&lt;script&gt;" in chip
+
+    fail = CaptchaState(
+        state=STATE_FAILED,
+        detail='<b>x</b> & "y"',
+        provider="p<script>",
+    )
+    banner = captcha_banner_html(fail)
+    assert "<script>" not in banner
+    assert "<b>" not in banner
+    assert "&lt;b&gt;" in banner or "&lt;" in banner
+

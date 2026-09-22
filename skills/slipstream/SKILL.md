@@ -285,7 +285,7 @@ curl -sS -X POST "$SLIPSTREAM_URL/v1/leases/$LEASE_ID/captcha" \
 ```
 
 Timeout: `SLIPSTREAM_CAPTCHA_TIMEOUT` (default 60s) while `solving` → escalate on
-heartbeat / Watch. Secrets refused. No Monid / 2captcha / anti-captcha wiring.
+heartbeat / Watch. Secrets refused; captcha detail also scrubs unlabeled JWT-like tokens. Chip/banner HTML escapes dynamic fields. Late `failed` after `finished` does not escalate. No Monid / 2captcha / anti-captcha wiring.
 
 ## Alerts (need_human + task_done)
 

@@ -7,7 +7,9 @@ with Watch / Take-over via the existing alerts spine. No paid captcha SaaS.
 
 from __future__ import annotations
 
+import html
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -43,21 +45,20 @@ _EVENT_ALIASES = {
 DEFAULT_CAPTCHA_TIMEOUT_S = 60
 REASON_TIMEOUT = "timeout"  # feed/alert reason leaf — not a secret
 
-_CHIP_SOLVING = (
-    '<span class="chip captcha solving" title="CAPTCHA solve in progress">'
-    "CAPTCHA solving…</span>"
+_CHIP_SOLVING_LABEL = "CAPTCHA solving…"
+_CHIP_FAIL_LABEL = "CAPTCHA — need human"
+_BANNER_SOLVING_LABEL = (
+    "CAPTCHA challenge detected — solve in progress (no paid solver)."
 )
-_CHIP_FAIL = (
-    '<span class="chip captcha fail" title="CAPTCHA unsolved — need human">'
-    "CAPTCHA — need human</span>"
+_BANNER_FAIL_LABEL = "CAPTCHA unsolved — agent paused; use Watch / Take-over."
+
+# ADV-CAP-003: unlabeled JWT-like / common API token shapes in captcha detail.
+_JWT_LIKE_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
 )
-_BANNER_SOLVING = (
-    '<p class="captcha-banner solving" role="status">'
-    "CAPTCHA challenge detected — solve in progress (no paid solver).</p>"
-)
-_BANNER_FAIL = (
-    '<p class="captcha-banner fail" role="alert">'
-    "CAPTCHA unsolved — agent paused; use Watch / Take-over.</p>"
+_UNLABELED_SECRET_RE = re.compile(
+    r"\b(?:sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b"
 )
 
 
@@ -69,6 +70,20 @@ def captcha_timeout_seconds() -> int:
     except ValueError:
         n = DEFAULT_CAPTCHA_TIMEOUT_S
     return max(5, min(n, 600))
+
+
+def scrub_captcha_detail(value: str) -> str:
+    """Scrub captcha detail: labeled stems plus unlabeled JWT/API-token shapes.
+
+    ADV-CAP-003: ``scrub_text`` alone misses bare ``eyJ…`` JWTs and common
+    unlabeled secret prefixes pasted into detail.
+    """
+    if not value:
+        return value
+    out = scrub_text(value)
+    out = _JWT_LIKE_RE.sub("[REDACTED_JWT]", out)
+    out = _UNLABELED_SECRET_RE.sub("[REDACTED]", out)
+    return out
 
 
 @dataclass
@@ -164,7 +179,7 @@ def parse_captcha_request(body: dict[str, Any]) -> dict[str, Any]:
         raise AlertValidationError("detail must be a string")
     if len(detail_raw) > 500:
         raise AlertValidationError("detail too long (max 500)")
-    detail = scrub_text(detail_raw)
+    detail = scrub_captcha_detail(detail_raw)
 
     for forbidden in ("status", "state", "watch_url", "escalated"):
         if forbidden in body:
@@ -189,7 +204,11 @@ def apply_captcha_event(
     timeout_s: int,
     now: float | None = None,
 ) -> CaptchaState:
-    """Mutate state for a client-reported event. Does not escalate."""
+    """Mutate state for a client-reported event. Does not escalate.
+
+    ADV-CAP-001: once ``STATE_SOLVED``, a late ``failed`` must not unwind to
+    ``failed`` (escalation is gated separately via ``captcha_may_escalate``).
+    """
     now = time.time() if now is None else now
     state.last_event = event
     state.detail = detail
@@ -202,9 +221,21 @@ def apply_captcha_event(
         state.escalated = False
     elif event == EVENT_FINISHED:
         state.state = STATE_SOLVED
+    elif event == EVENT_FAILED:
+        # Late failed after finished: keep SOLVED; leave ESCALATED alone.
+        if state.state in (STATE_SOLVED, STATE_ESCALATED):
+            return state
+        state.state = STATE_FAILED
     else:
         state.state = STATE_FAILED
     return state
+
+
+def captcha_may_escalate(state: CaptchaState) -> bool:
+    """ADV-CAP-001/002: escalate only while solving/failed-from-timeout, never SOLVED."""
+    if state.escalated or state.state == STATE_SOLVED:
+        return False
+    return state.state in (STATE_SOLVING, STATE_FAILED)
 
 
 def feed_outcome_for_event(event: str) -> str:
@@ -215,22 +246,69 @@ def feed_outcome_for_event(event: str) -> str:
     return "ok"
 
 
+def _chip_title(state: CaptchaState, *, solving: bool) -> str:
+    """ADV-CAP-004: escape dynamic provider/detail before attribute interpolation."""
+    if solving:
+        base = "CAPTCHA solve in progress"
+    else:
+        base = "CAPTCHA unsolved — need human"
+    bits = [base]
+    if state.provider:
+        bits.append(state.provider)
+    if state.detail:
+        bits.append(state.detail[:80])
+    return html.escape(" — ".join(bits), quote=True)
+
+
 def captcha_chip_html(state: CaptchaState | None) -> str:
-    """High-salience Watch chip HTML (empty when idle/solved)."""
+    """High-salience Watch chip HTML (empty when idle/solved).
+
+    ADV-CAP-004: provider/detail in ``title`` are ``html.escape``d before concat.
+    """
     if state is None or state.state in (STATE_IDLE, STATE_SOLVED):
         return ""
     if state.shows_solving_chip():
-        return _CHIP_SOLVING
-    return _CHIP_FAIL
+        title = _chip_title(state, solving=True)
+        label = html.escape(_CHIP_SOLVING_LABEL)
+        return (  # skylos: ignore[SKY-D228] title+label html.escape'd (ADV-CAP-004)
+            '<span class="chip captcha solving" title="'
+            + title
+            + '">'
+            + label
+            + "</span>"
+        )
+    title = _chip_title(state, solving=False)
+    label = html.escape(_CHIP_FAIL_LABEL)
+    return (  # skylos: ignore[SKY-D228] title+label html.escape'd (ADV-CAP-004)
+        '<span class="chip captcha fail" title="' + title + '">' + label + "</span>"
+    )
 
 
 def captcha_banner_html(state: CaptchaState | None) -> str:
-    """Optional banner under meta when captcha is active."""
+    """Optional banner under meta when captcha is active.
+
+    ADV-CAP-004: provider/detail fragments are ``html.escape``d before concat.
+    """
     if state is None or state.state in (STATE_IDLE, STATE_SOLVED):
         return ""
     if state.shows_solving_chip():
-        return _BANNER_SOLVING
-    return _BANNER_FAIL
+        body = html.escape(_BANNER_SOLVING_LABEL)
+        extra = ""
+        if state.provider:
+            extra = " " + html.escape("(" + state.provider + ")")
+        return (  # skylos: ignore[SKY-D228] body+extra html.escape'd (ADV-CAP-004)
+            '<p class="captcha-banner solving" role="status">'
+            + body
+            + extra
+            + "</p>"
+        )
+    body = html.escape(_BANNER_FAIL_LABEL)
+    extra = ""
+    if state.detail:
+        extra = " " + html.escape(state.detail[:120])
+    return (  # skylos: ignore[SKY-D228] body+extra html.escape'd (ADV-CAP-004)
+        '<p class="captcha-banner fail" role="alert">' + body + extra + "</p>"
+    )
 
 
 def mark_escalated(state: CaptchaState) -> None:
