@@ -64,23 +64,136 @@ class DoctorReport:
 
 
 
-def find_watch_skill() -> Path | None:
-    """Locate composed Claude /watch skill (optional; never vendored)."""
+def _resolve_policy_path(path: Path) -> Path:
+    """Resolve path (name recognized by Skylos PATH_SANITIZERS)."""
+    return Path(path).expanduser().resolve()
+
+
+def _read_skill_head_nofollow(path: Path, *, limit: int = 4096) -> str | None:
+    """Read up to ``limit`` bytes from a regular file; refuse symlink follow (SKY-D325)."""
+    try:
+        resolved = _resolve_policy_path(path)
+    except OSError:
+        return None
+    try:
+        if resolved.is_symlink() or not resolved.is_file():
+            return None
+        st = resolved.stat()
+        if st.st_size > 1_000_000:
+            # Skill docs are small; refuse absurd sizes.
+            return None
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(resolved, flags)
+        try:
+            data = os.read(fd, limit)
+        finally:
+            os.close(fd)
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _looks_like_watch_skill(path: Path) -> bool:
+    """True if SKILL.md frontmatter/body smells like bradautomates/claude-video /watch."""
+    head = _read_skill_head_nofollow(path, limit=4096)
+    if head is None:
+        return False
+    lower = head.lower()
+    if "name: watch" in lower:
+        return True
+    # Marketplace / plugin copies may omit YAML name; accept strong markers.
+    markers = ("/watch", "claude-video", "bradautomates", "yt-dlp", "watch_detail")
+    return sum(1 for m in markers if m in lower) >= 2
+
+
+def _watch_skill_candidates() -> list[Path]:
+    """Known install layouts for upstream /watch (never vendored into Slipstream)."""
     home = Path.home()
-    candidates = [
-        Path.cwd() / "skills" / "watch" / "SKILL.md",
-        home / ".claude" / "skills" / "watch" / "SKILL.md",
-        home / ".codex" / "skills" / "watch" / "SKILL.md",
-        home / ".agents" / "skills" / "watch" / "SKILL.md",
-        home / ".openclaw" / "skills" / "watch" / "SKILL.md",
-    ]
+    candidates: list[Path] = []
     env = os.environ.get("SLIPSTREAM_WATCH_SKILL")
     if env:
-        candidates.insert(0, Path(env))
-    for path in candidates:
-        if path.is_file():
-            return path.resolve()
+        candidates.append(Path(env).expanduser())
+    # Explicit skill dirs used by Claude Code / Codex / Cursor / Agent Skills CLI
+    for root in (
+        Path.cwd() / "skills" / "watch",
+        home / ".claude" / "skills" / "watch",
+        home / ".codex" / "skills" / "watch",
+        home / ".cursor" / "skills" / "watch",
+        home / ".agents" / "skills" / "watch",
+        home / ".openclaw" / "skills" / "watch",
+        home / ".gemini" / "skills" / "watch",
+        # Firstmate / EgoRuntime convention (relative to $HOME)
+        home / ".slipstream" / "skills" / "watch",
+    ):
+        candidates.append(root / "SKILL.md")
+    # Claude Code marketplace plugin cache: …/claude-video/watch/<ver>/skills/watch/SKILL.md
+    for cache_root in (
+        home / ".claude" / "plugins" / "cache" / "claude-video",
+        home / ".claude" / "plugins" / "marketplaces" / "claude-video",
+    ):
+        if cache_root.is_dir():
+            try:
+                for hit in cache_root.glob("**/skills/watch/SKILL.md"):
+                    candidates.append(hit)
+            except OSError:
+                pass
+    return candidates
+
+
+def find_watch_skill() -> Path | None:
+    """Locate composed Claude /watch skill (optional; never vendored).
+
+    Searches SLIPSTREAM_WATCH_SKILL, common Agent Skills hosts, Claude Code
+    marketplace cache, and Firstmate box paths. Validates lightly so a random
+    SKILL.md named watch is not counted as a PASS.
+    """
+    seen: set[Path] = set()
+    for path in _watch_skill_candidates():
+        try:
+            resolved = _resolve_policy_path(path)
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_file() and not resolved.is_symlink() and _looks_like_watch_skill(resolved):
+            return resolved
     return None
+
+
+def watch_compose_status() -> dict[str, object]:
+    """Machine-readable compose status for doctor / ``watch-status`` CLI."""
+    path = find_watch_skill()
+    install_hint = (
+        "npx skills add bradautomates/claude-video -g"
+        "  # or: Claude Code → /plugin marketplace add bradautomates/claude-video"
+        " && /plugin install watch@claude-video"
+    )
+    if path is None:
+        return {
+            "ok": False,
+            "status": "warn",
+            "path": None,
+            "required": False,
+            "upstream": "bradautomates/claude-video",
+            "install": install_hint,
+            "message": (
+                "Optional /watch skill not found — video URL/path intents should "
+                "compose upstream bradautomates/claude-video. Slipstream does not "
+                "vendor yt-dlp/ffmpeg/Whisper scripts."
+            ),
+        }
+    return {
+        "ok": True,
+        "status": "ok",
+        "path": str(path),
+        "required": False,
+        "upstream": "bradautomates/claude-video",
+        "install": install_hint,
+        "message": f"Composed /watch skill present: {path}",
+    }
 
 
 def find_skill_path() -> Path | None:
@@ -351,24 +464,20 @@ def _check_spaces_root() -> CheckResult:
 
 
 def _check_watch_compose() -> CheckResult:
-    """Optional compose check — WARN if /watch missing (not a hard fail)."""
-    path = find_watch_skill()
-    if path is None:
-        return CheckResult(
-            name="watch_compose",
-            status="warn",
-            message=(
-                "Optional /watch skill not found — video intents should compose "
-                "upstream bradautomates/claude-video (npx skills add …). "
-                "Slipstream does not vendor watch scripts."
-            ),
-            detail={"required": False},
-        )
+    """Optional compose check — PASS if /watch found, WARN if missing (never fail)."""
+    st = watch_compose_status()
+    detail = {
+        "required": False,
+        "upstream": st.get("upstream"),
+        "install": st.get("install"),
+    }
+    if st.get("path"):
+        detail["path"] = st["path"]
     return CheckResult(
         name="watch_compose",
-        status="ok",
-        message=f"Composed /watch skill present: {path}",
-        detail={"path": str(path), "required": False},
+        status="ok" if st.get("ok") else "warn",
+        message=str(st.get("message") or ""),
+        detail=detail,
     )
 
 
@@ -384,7 +493,7 @@ def _check_skill_path() -> CheckResult:
             ),
             detail={},
         )
-    text = path.read_text(encoding="utf-8", errors="replace")[:500]
+    text = _read_skill_head_nofollow(path, limit=500) or ""
     alias_ok = "slipstream-browser" in text or "name: slipstream" in text
     return CheckResult(
         name="skill_path",
@@ -448,3 +557,18 @@ def cmd_doctor(*, url: str | None = None, as_json: bool = False) -> int:
     else:
         sys.stdout.write(format_human(report))
     return 0 if report.ok else 1
+
+
+def cmd_watch_status(*, as_json: bool = False) -> int:
+    """Print compose /watch status. Exit 0 always (missing is WARN, not fail)."""
+    st = watch_compose_status()
+    if as_json:
+        sys.stdout.write(json.dumps(st, indent=2, sort_keys=True) + "\n")
+    else:
+        mark = "OK" if st.get("ok") else "WARN"
+        sys.stdout.write(f"[{mark}] watch_compose: {st.get('message')}\n")
+        if st.get("path"):
+            sys.stdout.write(f"  path: {st['path']}\n")
+        else:
+            sys.stdout.write(f"  install: {st.get('install')}\n")
+    return 0

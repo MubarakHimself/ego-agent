@@ -14,6 +14,8 @@ from slipstream import __main__ as mainmod
 from slipstream.api import PoolServer
 from slipstream.config import PoolConfig
 from slipstream.doctor import (
+    find_watch_skill,
+    watch_compose_status,
     CheckResult,
     DoctorReport,
     cmd_doctor,
@@ -272,3 +274,64 @@ def test_ephemeral_loopback_port_is_free_int():
     p2 = _ephemeral_loopback_port()
     assert isinstance(p1, int) and 0 < p1 < 65536
     assert isinstance(p2, int) and 0 < p2 < 65536
+
+
+def test_find_watch_skill_validates_content(tmp_path, monkeypatch):
+    monkeypatch.delenv("SLIPSTREAM_WATCH_SKILL", raising=False)
+    decoy = tmp_path / "skills" / "watch"
+    decoy.mkdir(parents=True)
+    bad = decoy / "SKILL.md"
+    bad.write_text("# unrelated skill\nname: other\n")
+    # Isolate candidates to this tmp skill only (ignore host-installed /watch)
+    monkeypatch.setattr(
+        "slipstream.doctor._watch_skill_candidates",
+        lambda: [bad],
+    )
+    assert find_watch_skill() is None
+
+    bad.write_text("---\nname: watch\ndescription: video\n---\n# /watch\n")
+    found = find_watch_skill()
+    assert found is not None
+    assert found == bad.resolve()
+
+
+def test_watch_compose_status_ok_and_warn(tmp_path, monkeypatch):
+    monkeypatch.delenv("SLIPSTREAM_WATCH_SKILL", raising=False)
+    monkeypatch.setattr("slipstream.doctor._watch_skill_candidates", lambda: [])
+    st = watch_compose_status()
+    assert st["ok"] is False
+    assert st["status"] == "warn"
+    assert st["required"] is False
+    assert "bradautomates/claude-video" in str(st["upstream"])
+
+    skill = tmp_path / "watch-SKILL.md"
+    skill.write_text("---\nname: watch\n---\ncompose bradautomates/claude-video /watch\n")
+    monkeypatch.setattr(
+        "slipstream.doctor._watch_skill_candidates",
+        lambda: [skill],
+    )
+    st2 = watch_compose_status()
+    assert st2["ok"] is True
+    assert st2["status"] == "ok"
+    assert st2["path"]
+
+
+def test_main_watch_status_subcommand(tmp_path, monkeypatch):
+    monkeypatch.delenv("SLIPSTREAM_WATCH_SKILL", raising=False)
+    monkeypatch.setattr("slipstream.doctor._watch_skill_candidates", lambda: [])
+    code, out, err = _run_main(["watch-status", "--json"])
+    assert code == 0, err
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["status"] == "warn"
+
+    skill = tmp_path / "w.md"
+    skill.write_text("---\nname: watch\n---\n")
+    monkeypatch.setattr(
+        "slipstream.doctor._watch_skill_candidates",
+        lambda: [skill],
+    )
+    code, out, err = _run_main(["watch-status"])
+    assert code == 0, err
+    assert "OK" in out or "watch_compose" in out
+

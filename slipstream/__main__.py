@@ -6,7 +6,8 @@ Subcommands:
   heartbeat   POST /v1/leases/{id}/heartbeat
   release     DELETE /v1/leases/{id}
   status      GET /v1/pool/status
-  doctor     Preflight: Chrome, CDP, pool healthz, spaces, skill
+  doctor     Preflight: Chrome, CDP, pool healthz, spaces, skill, watch_compose
+  watch-status  Compose /watch detection (optional; never hard-fail)
 
 Client commands talk to a running pool (SLIPSTREAM_URL or --url).
 HTTP remains the primary surface — there is no MCP server.
@@ -33,7 +34,7 @@ from slipstream.cli import (
     cmd_status,
     resolve_secret,
 )
-from slipstream.doctor import cmd_doctor
+from slipstream.doctor import cmd_doctor, cmd_watch_status
 from slipstream.config import PoolConfig
 from slipstream.pool import BrowserPool
 
@@ -71,7 +72,7 @@ def _run_serve(args: argparse.Namespace) -> int:
         flush=True,
     )
     print(
-        "Agent CLI: slipstream lease|heartbeat|alert|release|status|doctor  "
+        "Agent CLI: slipstream lease|heartbeat|alert|release|status|doctor|watch-status  "
         "(see skills/slipstream/SKILL.md)",
         flush=True,
     )
@@ -84,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="slipstream",
         description=(
             "Slipstream browser pool — serve, lease/heartbeat/alert/release/status, "
-            "or doctor (preflight) against Chrome + pool."
+            "doctor (preflight), or watch-status (compose /watch)."
         ),
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -265,6 +266,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_doc.set_defaults(_handler="doctor")
 
+    # --- watch-status ---
+    p_ws = sub.add_parser(
+        "watch-status",
+        help="Compose /watch detection only (PASS/WARN; never hard-fail)",
+    )
+    p_ws.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit machine-readable JSON",
+    )
+    p_ws.set_defaults(_handler="watch_status")
+
     return parser
 
 
@@ -341,6 +355,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args._handler == "doctor":
             return cmd_doctor(url=args.url, as_json=args.as_json)
+        if args._handler == "watch_status":
+            return cmd_watch_status(as_json=args.as_json)
     except CliError as e:
         print(e, file=sys.stderr)
         return e.exit_code
