@@ -1,7 +1,7 @@
 """Lease-scoped append-only Watch activity feed (thin dock).
 
 CTO cut slipstream-activity-feed-007: chronological actions beside the Watch
-JPEG — navigate / click / type / fill / alert / confirm. Bounded ring buffer;
+JPEG — navigate / click / type / fill / alert / confirm / captcha. Bounded ring buffer;
 secrets redacted; same watch_url TTL/revoke (410). No replay, no second
 notification path (alerts reuse need_human / task_done).
 """
@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 # Ship-now action kinds (CTO cut). Pair-browse scroll→click; key→type.
-FEED_KINDS = frozenset({"navigate", "click", "type", "fill", "alert", "confirm"})
+FEED_KINDS = frozenset({"navigate", "click", "type", "fill", "alert", "confirm", "captcha"})
 
 DEFAULT_CAPACITY = 100
 DEFAULT_LIST_LIMIT = 80

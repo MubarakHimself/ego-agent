@@ -6,6 +6,7 @@ Endpoints:
   POST   /v1/leases
   POST   /v1/leases/{id}/heartbeat
   POST   /v1/leases/{id}/alerts
+  POST   /v1/leases/{id}/captcha
   POST   /v1/leases/{id}/actions
   POST   /v1/leases/{id}/navigate
   POST   /v1/leases/{id}/confirmations/{confirm_id}
@@ -85,6 +86,7 @@ _ERR_INVALID_JSON = "invalid_json"
 _ERR_INVALID_ACTION = "invalid_action"
 _ERR_INVALID_CREDENTIALS = "invalid_credentials"
 _ERR_INVALID_SIGNED_IN = "invalid_signed_in"
+_ERR_ALERT_CONFLICT = "alert_conflict"
 _QS_WATCH_AUTH = "token"  # skylos: ignore[SKY-L014,SKY-L032] query param name, not a secret
 _FIELD_ALLOWED_DOMAINS = "allowed_domains"
 _FIELD_USER_METADATA = "user_metadata"
@@ -588,7 +590,33 @@ def make_handler(pool: BrowserPool):
                     _json_response(
                         self,
                         409,
-                        {"error": "alert_conflict", "detail": str(e)},
+                        {"error": _ERR_ALERT_CONFLICT, "detail": str(e)},
+                    )
+                except LeaseNotFoundError:
+                    _json_response(
+                        self,
+                        404,
+                        {"error": _ERR_LEASE_NOT_FOUND, "lease_id": lease_id},
+                    )
+                return
+
+            # POST /v1/leases/{lease_id}/captcha — solve-status chips (§5.11)
+            lease_id = _v1_lease_tail(parts, "captcha")
+            if lease_id is not None:
+                try:
+                    result = pool.report_captcha(lease_id, body)
+                    _json_response(self, 200, result)
+                except AlertValidationError as e:
+                    _json_response(
+                        self,
+                        400,
+                        {"error": "invalid_captcha", "detail": str(e)},
+                    )
+                except AlertConflictError as e:
+                    _json_response(
+                        self,
+                        409,
+                        {"error": _ERR_ALERT_CONFLICT, "detail": str(e)},
                     )
                 except LeaseNotFoundError:
                     _json_response(
@@ -620,7 +648,7 @@ def make_handler(pool: BrowserPool):
                     )
                 except AlertConflictError as e:
                     _json_response(
-                        self, 409, {"error": "alert_conflict", "detail": str(e)}
+                        self, 409, {"error": _ERR_ALERT_CONFLICT, "detail": str(e)}
                     )
                 except LeaseNotFoundError:
                     _json_response(

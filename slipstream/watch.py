@@ -275,6 +275,8 @@ def render_watch_html(
     signed_in: bool = False,
     signed_in_host: str | None = None,
     mark_signed_in_url: str | None = None,
+    captcha_chip: str = "",
+    captcha_banner: str = "",
 ) -> str:
     """Watch HTML shell. Input bridge only when confirmed+enabled; no secrets.
 
@@ -362,6 +364,11 @@ def render_watch_html(
 ".chip{display:inline-block;padding:0.15rem 0.5rem;border-radius:999px;font-size:0.75rem;font-weight:600;vertical-align:middle;}",
 ".chip.on{background:#1a4;color:#cfc;border:1px solid #2a6;}",
 ".chip.off{background:#333;color:#aaa;border:1px solid #555;}",
+".chip.captcha.solving{background:#542;color:#fd8;border:1px solid #a80;margin-left:0.35rem;}",
+".chip.captcha.fail{background:#511;color:#fcc;border:1px solid #a44;margin-left:0.35rem;}",
+".captcha-banner{font-weight:600;padding:0.4rem 0.6rem;border-radius:4px;margin:0.5rem 0;}",
+".captcha-banner.solving{background:#332200;color:#fd8;border:1px solid #a80;}",
+".captcha-banner.fail{background:#311;color:#fcc;border:1px solid #a44;}",
         "#viewport{display:inline-block;position:relative;max-width:100%;}",
         "#viewport.drive{cursor:crosshair;outline:2px solid #4a4;}",
         "</style></head><body>",
@@ -376,7 +383,9 @@ def render_watch_html(
         exp,
         "s · ",
         _signed_in_chip_html(signed_in=signed_in, signed_in_host=signed_in_host),
+        (" · " + captcha_chip) if captcha_chip else "",
         "</p>",
+        captcha_banner or "",
         '<p class="meta">',
         safe_detail,
         "</p>",
