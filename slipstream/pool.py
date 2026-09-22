@@ -16,6 +16,7 @@ from slipstream.alerts import (
     default_takeover_url,
     parse_alert_request,
 )
+from slipstream.activity_feed import LeaseActivityFeed, safe_url_summary
 from slipstream.watch import (
     WatchAuthError,
     WatchCaptureError,
@@ -26,6 +27,7 @@ from slipstream.watch import (
     WatchSession,
     capture_jpeg_frame,
     cede_path,
+    events_path,
     confirm_path,
     dispatch_cdp_input,
     frame_path,
@@ -123,6 +125,8 @@ class BrowserPool:
         self._task_done_envelopes: dict[str, dict[str, Any]] = {}
         # Watch sessions: tokenized short-TTL observe URLs (survive revoke for 410).
         self._watches: dict[str, WatchSession] = {}
+        # Lease-scoped Watch activity feed (CTO-007); bounded + scrubbed.
+        self._activity_feeds: dict[str, LeaseActivityFeed] = {}
         self._api_base_url: str = f"http://{self.config.host}:{self.config.port}"
         # Ensure spaces root exists
         self.config.spaces_root.mkdir(parents=True, exist_ok=True)
@@ -714,6 +718,13 @@ class BrowserPool:
                     unlocked[k] = "\0" * len(val)
             unlocked.clear()
 
+        self._record_activity(
+            lease_id,
+            "fill",
+            f"fill {len(filled)} field(s)",
+            outcome="ok",
+            detail={"fields": list(filled), "cred_id": cred_id},
+        )
         return {"ok": True, "filled": filled, "cred_id": cred_id, "lease_id": lease_id}
 
     def set_api_base_url(self, base_url: str) -> None:
@@ -810,6 +821,12 @@ class BrowserPool:
                     idempotent=False,
                 )
                 self._alert_log.setdefault(lease_id, []).append(payload)
+                self._feed_for(lease_id).append(
+                    "alert",
+                    f"need_human:{parsed.get('reason') or 'other'}",
+                    outcome="pending",
+                    detail={"event": EVENT_NEED_HUMAN, "reason": parsed.get("reason")},
+                )
                 return envelope
 
             # task_done — revoke watch_url, notify, then release once
@@ -827,6 +844,12 @@ class BrowserPool:
             )
             self._alert_log.setdefault(lease_id, []).append(payload)
             self._task_done_envelopes[lease_id] = envelope
+            self._feed_for(lease_id).append(
+                "alert",
+                f"task_done:{parsed.get('outcome') or 'ok'}",
+                outcome=str(parsed.get("outcome") or "ok")[:32],
+                detail={"event": EVENT_TASK_DONE},
+            )
             stop_handle = self._detach_lease_locked(lease_id, allow_warm=True)
 
         if stop_handle is not None:
@@ -928,6 +951,15 @@ class BrowserPool:
             )
             self._alert_log.setdefault(lease_id, []).append(payload)
             self._confirmations.add(pending)
+            self._feed_for(lease_id).append(
+                "confirm",
+                f"confirmation_required:{parsed['category']}",
+                outcome="pending",
+                detail={
+                    "confirm_id": confirm_id,
+                    "category": parsed["category"],
+                },
+            )
 
         out = pending.to_public()
         out["alert"] = envelope["alert"]
@@ -975,6 +1007,12 @@ class BrowserPool:
 
             # Resume agent unless another pending confirmation remains.
             self._clear_confirmation_pause_locked(lease_id)
+            self._feed_for(lease_id).append(
+                "confirm",
+                f"confirmation {decision}:{pending.category}",
+                outcome=decision,
+                detail={"confirm_id": confirm_id, "category": pending.category},
+            )
 
             return {
                 "status": pending.status,
@@ -1140,6 +1178,52 @@ class BrowserPool:
             raise WatchGoneError("watch_url expired")
         return sess
 
+
+    def _feed_for(self, lease_id: str) -> LeaseActivityFeed:
+        """Return (creating if needed) the lease activity feed. Caller holds lock."""
+        feed = self._activity_feeds.get(lease_id)
+        if feed is None:
+            feed = LeaseActivityFeed()
+            self._activity_feeds[lease_id] = feed
+        return feed
+
+    def _record_activity(
+        self,
+        lease_id: str,
+        kind: str,
+        summary: str,
+        *,
+        outcome: str = "ok",
+        detail: dict | None = None,
+    ) -> None:
+        """Append scrubbed feed row (acquires lock)."""
+        with self._lock:
+            self._feed_for(lease_id).append(
+                kind, summary, outcome=outcome, detail=detail
+            )
+
+    def get_watch_events(
+        self,
+        lease_id: str,
+        token: str | None,
+        *,
+        after_seq: int = 0,
+        limit: int = 80,
+    ) -> dict:
+        """Token-gated activity feed JSON — same auth/TTL/revoke as Watch (410)."""
+        with self._lock:
+            self._get_watch_session_locked(lease_id, token)
+            if lease_id not in self._leases:
+                sess = self._lookup_watch(lease_id)
+                if sess is not None:
+                    self._invalidate_pair_browse_locked(sess, revoke=True)
+                raise WatchGoneError("lease no longer active")
+            feed = self._activity_feeds.get(lease_id)
+            events = (
+                feed.list_events(after_seq=after_seq, limit=limit) if feed else []
+            )
+        return {"lease_id": lease_id, "events": events}
+
     def get_watch_page(
         self, lease_id: str, token: str | None, *, mode: str | None = None
     ) -> tuple[str, str]:
@@ -1161,6 +1245,7 @@ class BrowserPool:
         confirm = confirm_path(lease_id, tok) if mode == "takeover" else None
         in_url = input_path(lease_id, tok) if enabled else None
         cede = cede_path(lease_id, tok) if (mode == "takeover" and enabled) else None
+        events = events_path(lease_id, tok)
         body = render_watch_html(
             lease_id=lease_id,
             reason=reason,
@@ -1173,6 +1258,7 @@ class BrowserPool:
             input_enabled=enabled,
             input_url=in_url,
             cede_url=cede,
+            events_url=events,
         )
         return "text/html; charset=utf-8", body
 
@@ -1254,6 +1340,12 @@ class BrowserPool:
                 slot.last_heartbeat = time.time()
             sess.takeover_confirmed = True
             sess.input_enabled = True
+            self._feed_for(lease_id).append(
+                "confirm",
+                "takeover confirmed",
+                outcome="ok",
+                detail={"action": "pause"},
+            )
             return {
                 "ok": True,
                 "lease_id": lease_id,
@@ -1322,8 +1414,39 @@ class BrowserPool:
                 or not sess.input_enabled
             ):
                 raise WatchGoneError("pair-browse invalidated during dispatch")
-        # Scrubbed ack only
-        return {"ok": True, "kind": result["kind"], "input_enabled": True}
+        # Scrubbed ack only — feed never stores typed text (text_len only).
+        kind = result["kind"]
+        if kind == "click":
+            self._record_activity(
+                lease_id,
+                "click",
+                f"click @ ({int(event.get('x', 0))},{int(event.get('y', 0))})",
+                outcome="ok",
+            )
+        elif kind == "type":
+            self._record_activity(
+                lease_id,
+                "type",
+                "type",
+                outcome="ok",
+                detail={"text_len": len(event.get("text") or "")},
+            )
+        elif kind == "key":
+            self._record_activity(
+                lease_id,
+                "type",
+                f"key {event.get('key') or ''}",
+                outcome="ok",
+            )
+        elif kind == "scroll":
+            self._record_activity(
+                lease_id,
+                "click",
+                "scroll",
+                outcome="ok",
+                detail={"deltaY": event.get("deltaY")},
+            )
+        return {"ok": True, "kind": kind, "input_enabled": True}
 
     def cede_watch_control(
         self, lease_id: str, token: str | None
@@ -1345,6 +1468,12 @@ class BrowserPool:
             slot = self._find_slot_by_lease(lease_id)
             if slot is not None:
                 slot.last_heartbeat = time.time()
+            self._feed_for(lease_id).append(
+                "confirm",
+                "cede — drive returned to agent",
+                outcome="ok",
+                detail={"action": "continue"},
+            )
             return {
                 "ok": True,
                 "lease_id": lease_id,
@@ -1390,6 +1519,13 @@ class BrowserPool:
                 self._nav_log.append(
                     {"lease_id": lease_id, "url": url, "allowed_domains": patterns}
                 )
+            self._record_activity(
+                lease_id,
+                "navigate",
+                safe_url_summary(url),
+                outcome="ok",
+                detail={"mock": True},
+            )
             return {
                 "ok": True,
                 "url": url,
@@ -1403,10 +1539,18 @@ class BrowserPool:
         from slipstream.cdp_http import navigate_via_json_new
 
         result = navigate_via_json_new(cdp_http, url, allowed_domains=patterns)
+        ok = bool(result.get("matched"))
+        self._record_activity(
+            lease_id,
+            "navigate",
+            safe_url_summary(url),
+            outcome="ok" if ok else "error",
+            detail={"matched": ok},
+        )
         return {
-            "ok": bool(result.get("matched")),
+            "ok": ok,
             "url": url,
-            "matched": bool(result.get("matched")),
+            "matched": ok,
             "title": (result.get("title") or "")[:200],
             "observed_url": result.get("url") or "",
             "allowed_domains": patterns,
@@ -1550,5 +1694,6 @@ class BrowserPool:
             self._space_metadata.clear()
             self._watches.clear()
             self._watch_input_log.clear()
+            self._activity_feeds.clear()
         for h in pending_stops:
             self.launcher.stop(h)

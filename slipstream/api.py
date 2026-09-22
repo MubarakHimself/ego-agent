@@ -21,6 +21,7 @@ Endpoints:
   GET    /v1/leases?q=…
   GET    /v1/leases/{id}/watch
   GET    /v1/leases/{id}/watch/frame
+  GET    /v1/leases/{id}/watch/events
   DELETE /v1/leases/{id}
   GET    /v1/pool/status
   GET    /healthz
@@ -278,6 +279,31 @@ def make_handler(pool: BrowserPool):
                         return
                     raise
                 return
+            if (
+                len(parts) == 5
+                and parts[0] == "v1"
+                and parts[1] == "leases"
+                and parts[3] == "watch"
+                and parts[4] == "events"
+            ):
+                lease_id = parts[2]
+                try:
+                    after_seq = int((qs.get("after_seq") or ["0"])[0] or 0)
+                except ValueError:
+                    after_seq = 0
+                try:
+                    result = pool.get_watch_events(
+                        lease_id, token, after_seq=after_seq
+                    )
+                    _json_response(
+                        self, 200, result, extra_headers=WATCH_CLICKJACK_HEADERS
+                    )
+                except Exception as e:
+                    if _watch_error(self, e):
+                        return
+                    raise
+                return
+
 
             _json_response(self, 404, {"error": "not_found", "path": path})
 

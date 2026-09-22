@@ -48,6 +48,10 @@ def sanitize_origin(origin: str | None) -> str | None:
     ADV-BOUND-001: unsanitized newlines (or forged ``--- END_…`` suffixes) in
     origin= break marker lines so naive parsers treat trailing attacker text
     as outside the untrusted zone. Only a strict origin form is emitted.
+
+    ADV-BOUND-002: refuse hosts / netlocs that still contain whitespace (or
+    percent-encoded space). A space in ``origin=…`` would emit a second
+    ``origin=`` token on the BEGIN marker line (dual-origin forge).
     """
     if origin is None:
         return None
@@ -58,10 +62,7 @@ def sanitize_origin(origin: str | None) -> str | None:
     cleaned = cleaned.replace("\r", "").replace("\n", "").strip()
     if not cleaned:
         return None
-    # Refuse marker-like payloads outright.
-    if "---" in cleaned or " " in cleaned or "\t" in cleaned:
-        # Still try to salvage scheme://host if parseable.
-        pass
+    # Marker / whitespace payloads: try salvage via urlparse, then re-validate.
     try:
         parsed = urlparse(cleaned)
     except Exception:
@@ -70,11 +71,24 @@ def sanitize_origin(origin: str | None) -> str | None:
     host = (parsed.hostname or "").lower().rstrip(".")
     if scheme not in ("http", "https") or not host:
         return None
+    # ADV-BOUND-002: host must be a single token — no space/tab/%20/---.
+    if (
+        " " in host
+        or "\t" in host
+        or "%" in host
+        or "---" in host
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in host)
+    ):
+        return None
     # Rebuild origin only — drop path/query/fragment/userinfo.
     netloc = host
     if parsed.port:
         netloc = f"{host}:{parsed.port}"
-    return f"{scheme}://{netloc}"[:512]
+    out = f"{scheme}://{netloc}"[:512]
+    # Final guard: emitted value must never introduce a second origin= field.
+    if " " in out or "\t" in out or "origin=" in out.lower():
+        return None
+    return out
 
 
 def wrap_page_content(

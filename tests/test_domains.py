@@ -189,9 +189,12 @@ def test_host_matches_bb_and_wildcard():
     assert host_matches("a.b.example.com", "example.com")
     assert host_matches("example.com", "example.com")
     assert not host_matches("evil.com", "example.com")
-    assert host_matches("example.com", "*.example.com")
+    # ADV-DOM-006: *.example.com is subdomain-only (apex excluded)
+    assert not host_matches("example.com", "*.example.com")
     assert host_matches("www.example.com", "*.example.com")
+    assert host_matches("a.b.example.com", "*.example.com")
     assert not host_matches("evil.com", "*.example.com")
+    assert not host_matches("example.com.evil.com", "*.example.com")
 
 
 def test_url_allowed_empty_unrestricted():

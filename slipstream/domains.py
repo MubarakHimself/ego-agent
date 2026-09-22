@@ -78,7 +78,8 @@ def allowed_domains_from_env() -> list[str]:
 def host_matches(host: str, pattern: str) -> bool:
     """True if host matches pattern.
 
-    - ``*.example.com`` — bare ``example.com`` + any subdomain
+    - ``*.example.com`` — subdomains only (``www.example.com``); **not** apex
+      ``example.com`` (ADV-DOM-006 — literal wildcard, not naive endswith)
     - ``example.com`` — exact + subdomains (Browserbase-style)
     """
     host = (host or "").lower().rstrip(".")
@@ -89,7 +90,8 @@ def host_matches(host: str, pattern: str) -> bool:
         base = pattern[2:]
         if not base:
             return False
-        return host == base or host.endswith("." + base)
+        # ADV-DOM-006: wildcard requires a label before the base; apex excluded.
+        return host.endswith("." + base) and host != base
     return host == pattern or host.endswith("." + pattern)
 
 
