@@ -229,6 +229,8 @@ Watch JPEG/HTML (`need_human`) — that is **not** the Claude `/watch` skill.
 
 **Dual timeline / thin session scrubber:** Watch shows a live viewport clock beside an event-clock driven by activity-feed timestamps, plus a thin scrubber over `GET …/watch/timeline?token=…` markers (`[{seq,ts,kind,summary}]`). Seeking highlights the matching feed row; the JPEG stays the live frame (no ffmpeg / video recording). Same token TTL/revoke → 410.
 
+**Evidence panel (annotated / timed stills):** Watch shows an Evidence aside beside the activity feed. Selected feed events auto-capture a JPEG still keyed by feed `seq` (default kinds: navigate / confirm / alert; `SLIPSTREAM_EVIDENCE_AUTO=0` disables; `SLIPSTREAM_EVIDENCE_MAX` bounds retention). Poll `GET …/watch/evidence?token=…` for markers; `…&seq=N` returns the JPEG (same token TTL/revoke → 410). Click a feed row to load matching evidence + scrubbed refs — never secrets. No ffmpeg / video / Monid / Electron / MCP.
+
 
 ### Install upstream `/watch`
 

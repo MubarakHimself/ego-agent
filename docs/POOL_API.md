@@ -168,6 +168,7 @@ On `need_human` the pool mints an unguessable token and returns:
 | `GET` | `/v1/leases/{id}/watch?token=…` | HTML shell embedding JPEG frame; observe-only until confirm |
 | `GET` | `/v1/leases/{id}/watch/frame?token=…` | `image/jpeg` viewport via CDP `Page.captureScreenshot` (mock JPEG under `SLIPSTREAM_MOCK`) |
 | `GET` | `/v1/leases/{id}/watch/timeline?token=…` | Dual-timeline markers JSON for feed scrubber (same TTL/revoke) |
+| `GET` | `/v1/leases/{id}/watch/evidence?token=…` | Evidence markers JSON (seq-keyed stills); `&seq=N` → JPEG |
 | `POST` | `/v1/leases/{id}/watch/confirm?token=…` | Confirm Take-over → `{action: pause, agent_paused: true, input_enabled: true, lease_kept: true}` |
 | `POST` | `/v1/leases/{id}/watch/input?token=…` | Bridge click/type/key/scroll into leased CDP (requires confirm; exclusive pause) |
 | `POST` | `/v1/leases/{id}/watch/cede?token=…` | Disable input, clear pause → `{action: continue, agent_paused: false, input_enabled: false}`; lease stays until `task_done`. Requires prior Confirm (`takeover_confirmed` / `input_enabled`); otherwise `400` nothing to cede |
@@ -189,6 +190,19 @@ On `need_human` the pool mints an unguessable token and returns:
 **Defer:** simultaneous human+agent drive, session replay, cloud overflow, MCP wrapper, full WS dashboard polish, token→HttpOnly cookie, `--remote-allow-origins` tighten.
 
 **In-memory alert state:** `_alert_log`, `_task_done_envelopes`, and `_watches` are **process-lifetime** maps (survive lease release for idempotent `task_done` / revoked-watch `410`; cleared on pool shutdown / process exit). Bounded LRU eviction is deferred.
+
+
+### Evidence panel (annotated / timed stills)
+
+Thin evidence-first Watch side panel (no video):
+
+- Auto-capture JPEG stills on selected feed kinds (`navigate` / `confirm` / `alert` by default) keyed by feed `seq`
+- Stored under `{artifacts_root}/leases/{lease_id}/evidence/` with the same O_NOFOLLOW openat discipline as downloads (bounded retention)
+- `GET /v1/leases/{id}/watch/evidence?token=…` → `{lease_id, markers:[{seq,ts,kind,summary,refs,id}], count}`
+- `GET /v1/leases/{id}/watch/evidence?token=…&seq=N` → `image/jpeg` (token / TTL / revoke → 410 like Watch frame)
+- Watch HTML: Evidence aside; click a feed row (or scrub to a marker) to show the matching still + scrubbed refs
+- Annotations are scrubbed (never cookies / passwords / tokens / vault / CDP). Env: `SLIPSTREAM_EVIDENCE_AUTO` (kinds or `0`), `SLIPSTREAM_EVIDENCE_MAX` (default 32)
+
 
 ### Permission ladder (confirm-actions v1)
 

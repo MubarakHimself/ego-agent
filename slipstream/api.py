@@ -29,6 +29,7 @@ Endpoints:
   GET    /v1/leases/{id}/watch/frame
   GET    /v1/leases/{id}/watch/events
   GET    /v1/leases/{id}/watch/timeline
+  GET    /v1/leases/{id}/watch/evidence
   GET    /v1/leases/{id}/downloads
   GET    /v1/leases/{id}/downloads/{artifact_id}
   GET    /v1/leases/{id}/uploads
@@ -443,6 +444,56 @@ def make_handler(pool: BrowserPool):
                         return
                     raise
                 return
+
+            lease_id = _v1_lease_tail(parts, _PART_WATCH, "evidence")
+            if lease_id is not None:
+                seq_raw = (qs.get("seq") or [None])[0]
+                seq = None
+                if seq_raw not in (None, ""):
+                    try:
+                        seq = int(seq_raw)
+                    except ValueError:
+                        _json_response(
+                            self,
+                            400,
+                            {"error": "bad_seq"},
+                            extra_headers=WATCH_CLICKJACK_HEADERS,
+                        )
+                        return
+                try:
+                    result = pool.get_watch_evidence(lease_id, token, seq=seq)
+                    if seq is None:
+                        _json_response(
+                            self,
+                            200,
+                            result,
+                            extra_headers=WATCH_CLICKJACK_HEADERS,
+                        )
+                    else:
+                        _bytes_response(
+                            self,
+                            200,
+                            result,
+                            "image/jpeg",
+                            extra_headers=WATCH_CLICKJACK_HEADERS,
+                        )
+                except Exception as e:
+                    # Artifact missing → 404; auth/gone via watch helper.
+                    from slipstream.downloads import ArtifactNotFoundError
+
+                    if isinstance(e, ArtifactNotFoundError):
+                        _json_response(
+                            self,
+                            404,
+                            {"error": "evidence_not_found"},
+                            extra_headers=WATCH_CLICKJACK_HEADERS,
+                        )
+                        return
+                    if _watch_error(self, e):
+                        return
+                    raise
+                return
+
 
             if _handle_lease_artifacts_get(self, pool, parts):
                 return

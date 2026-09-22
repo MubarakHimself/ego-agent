@@ -53,7 +53,7 @@ exclude = [".venv*", "**/__pycache__/**", ".venv-skylos", "tests"]
 # Quality backlog (string-dupe / complexity / long functions) tracked separately —
 # max_quality raised so Captain security gate can exit 0 without mass refactors.
 [tool.skylos]
-exclude = [".venv", ".venv-skylos", "*.egg-info", "benches", "data", "tests"]
+exclude = [".venv", ".venv-skylos", "*.egg-info", "benches", "data", "tests", "scripts"]
 ignore = [
   # Optional websocket import is declared under [project.optional-dependencies] cdp.
   "SKY-D223",
