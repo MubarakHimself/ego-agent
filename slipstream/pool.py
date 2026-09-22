@@ -42,6 +42,8 @@ from slipstream.captcha import (
 )
 _ERR_BODY_MUST_JSON = "body must be a JSON object"
 
+_CAT_NAV_IRREVERSIBLE = "nav_irreversible"  # ADV-PL-001 enforced CDP category
+
 from slipstream.download_cdp import (
     MockDownloadRecorder,
     configure_chrome_download_behavior,
@@ -242,7 +244,9 @@ class BrowserPool:
             )
             warm = sum(1 for s in self._slots if s.status == SlotStatus.FREE_WARM)
             leased = sum(1 for s in self._slots if s.status == SlotStatus.LEASED)
-            return {
+            from slipstream.actions import expose_raw_cdp
+
+            out = {
                 "K": self.config.K,
                 "W": self.config.W,
                 "idle_ttl_seconds": self.config.idle_ttl_seconds,
@@ -254,10 +258,13 @@ class BrowserPool:
                 "vault_root": str(self.config.vault_root),
                 # ADV-DL-003: never expose absolute artifacts_root on status.
                 "artifacts_configured": True,
-                "cdp_base_port": self.config.cdp_base_port,
                 "chrome_binary": self.launcher.binary,
                 "slots": [s.to_dict() for s in self._slots],
             }
+            # ADV-PL-001-BYPASS-RAW-CDP-PORT: base+slot_id reconstructs CDP URL.
+            if expose_raw_cdp():
+                out["cdp_base_port"] = self.config.cdp_base_port
+            return out
 
     def _refresh_rss(self) -> None:
         for slot in self._slots:
@@ -2102,7 +2109,7 @@ class BrowserPool:
         navigates). Empty effective allowlist = unrestricted domain-wise.
         iframe/subresource not gated (v1). Soft browse (click/scroll/wait) free.
         Domain allowlist + cdp presence checked before consume; CDP/mock failure
-        after consume refunds the grant.
+        after consume refunds the grant. Soft-fail matched=False also refunds.
         """
         if not isinstance(body, dict):
             raise DomainAllowlistError(_ERR_BODY_MUST_JSON)
@@ -2130,7 +2137,7 @@ class BrowserPool:
                 raise LeaseNotFoundError(lease_id)
             if not mock and not cdp_http:
                 raise CdpInjectError("lease has no cdp_http_url")
-            self._confirmations.consume_once(lease_id, "nav_irreversible")
+            self._confirmations.consume_once(lease_id, _CAT_NAV_IRREVERSIBLE)
 
         try:
             if mock:
@@ -2156,26 +2163,31 @@ class BrowserPool:
             from slipstream.cdp_http import navigate_via_json_new
 
             result = navigate_via_json_new(cdp_http, url, allowed_domains=patterns)
-            ok = bool(result.get("matched"))
-            self._record_activity(
-                lease_id,
-                "navigate",
-                safe_url_summary(url),
-                outcome="ok" if ok else "error",
-                detail={"matched": ok},
-            )
-            return {
-                "ok": ok,
-                "url": url,
-                "matched": ok,
-                "title": (result.get("title") or "")[:200],
-                "observed_url": result.get("url") or "",
-                "allowed_domains": patterns,
-            }
         except Exception:
             with self._lock:
-                self._confirmations.refund_once(lease_id, "nav_irreversible")
+                self._confirmations.refund_once(lease_id, _CAT_NAV_IRREVERSIBLE)
             raise
+
+        ok = bool(result.get("matched"))
+        # ADV-PL-001-NAV-SOFTFAIL-BURNS: matched=False soft-fail — refund grant.
+        if not ok:
+            with self._lock:
+                self._confirmations.refund_once(lease_id, _CAT_NAV_IRREVERSIBLE)
+        self._record_activity(
+            lease_id,
+            "navigate",
+            safe_url_summary(url),
+            outcome="ok" if ok else "error",
+            detail={"matched": ok},
+        )
+        return {
+            "ok": ok,
+            "url": url,
+            "matched": ok,
+            "title": (result.get("title") or "")[:200],
+            "observed_url": result.get("url") or "",
+            "allowed_domains": patterns,
+        }
 
 
     def _sync_lease_signed_in(self, lease: Lease) -> None:

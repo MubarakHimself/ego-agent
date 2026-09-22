@@ -125,7 +125,7 @@ curl -s -X DELETE http://127.0.0.1:8755/v1/leases/<lease_id>
 
 Spaces are exclusive while leased (second agent gets HTTP 409). Warm slots (from explicit DELETE only) with a matching live `space_id` are reused without relaunch. Idle / hard-TTL always stop Chromium.
 
-Drive a leased browser via **pool HTTP** (`navigate` / `eval` / `cred fill` + act/confirm — ladder server-enforced). Raw CDP URLs are omitted from lease JSON by default; set `SLIPSTREAM_EXPOSE_RAW_CDP=1` for Playwright `connectOverCDP` / agent-browser (honor-system for nav/eval; vault fill stays pool-only). Smoke/bench may use `slipstream.cdp_http` when raw CDP is exposed.
+Drive a leased browser via **pool HTTP** (`navigate` / `eval` / `cred fill` + act/confirm — ladder server-enforced). Raw CDP tip (urls + ports) is omitted from lease/status JSON by default; set `SLIPSTREAM_EXPOSE_RAW_CDP=1` for Playwright `connectOverCDP` / agent-browser (honor-system for nav/eval; vault fill stays pool-only). Smoke/bench may use `slipstream.cdp_http` when raw CDP is exposed.
 
 ## Tests & quality gates
 

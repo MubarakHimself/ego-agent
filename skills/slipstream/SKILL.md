@@ -469,7 +469,7 @@ cred fill + act/confirm) so the permission ladder is server-enforced.
 | Path | When |
 |------|------|
 | Pool HTTP | Default — ladder consume_once is real |
-| Raw CDP peers | Only with `SLIPSTREAM_EXPOSE_RAW_CDP=1` (lease returns cdp_*); nav/eval honor-system; vault fill still pool-only |
+| Raw CDP peers | Only with `SLIPSTREAM_EXPOSE_RAW_CDP=1` (lease/status return cdp_* urls + ports); nav/eval honor-system; vault fill still pool-only |
 
 Raw CDP peers (escape hatch): Playwright `connect_over_cdp`, Vercel
 `agent-browser --cdp`, Browser Use `BU_CDP_URL`. Thin `slipstream.cdp_http`

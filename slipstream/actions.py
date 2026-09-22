@@ -84,11 +84,14 @@ def confirm_ttl_seconds() -> int:
 
 
 def expose_raw_cdp() -> bool:
-    """When True, lease/status wire JSON includes cdp_http_url / cdp_ws_url.
+    """When True, lease/status wire JSON includes raw CDP tip (urls + ports).
 
-    Default False (Firstmate B): agents drive via pool HTTP so consume_once is
-    real. Escape hatch ``SLIPSTREAM_EXPOSE_RAW_CDP=1`` restores raw CDP URLs;
-    ladder is honor-system for nav/eval on that path (vault fill stays pool-only).
+    Default False (Firstmate B / ADV-PL-001-BYPASS-RAW-CDP-PORT): agents drive
+    via pool HTTP so consume_once is real. Public status/lease omit
+    ``cdp_http_url`` / ``cdp_ws_url`` / ``cdp_port`` / ``cdp_base_port`` so
+    agents cannot reconstruct ``http://127.0.0.1:{port}``. Escape hatch
+    ``SLIPSTREAM_EXPOSE_RAW_CDP=1`` restores them; ladder is honor-system for
+    nav/eval on that path (vault fill stays pool-only).
     """
     return os.environ.get("SLIPSTREAM_EXPOSE_RAW_CDP", "").strip() == "1"
 

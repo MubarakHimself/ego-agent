@@ -215,6 +215,7 @@ def test_lease_omits_raw_cdp_by_default(api_server: PoolServer, monkeypatch):
     assert code == 200
     assert "cdp_http_url" not in lease
     assert "cdp_ws_url" not in lease
+    assert "cdp_port" not in lease
     # Internal slot still has CDP for pool-side inject
     lid = lease["lease_id"]
     assert api_server.pool._leases[lid].cdp_http_url
@@ -362,3 +363,95 @@ def test_eval_missing_cdp_does_not_burn(api_server: PoolServer):
     assert code >= 400
     # Grant preserved
     assert api_server.pool._confirmations.has_allowance(lid, "eval")
+
+
+
+def test_status_omits_cdp_ports_by_default(api_server: PoolServer, monkeypatch):
+    """ADV-PL-001-BYPASS-RAW-CDP-PORT: status/lease cannot reconstruct CDP without env."""
+    monkeypatch.delenv("SLIPSTREAM_EXPOSE_RAW_CDP", raising=False)
+    base = api_server.base_url
+    lid = _lease(base, "port-leak")
+
+    code, st = ladder_http("GET", f"{base}/v1/pool/status")
+    assert code == 200
+    assert "cdp_base_port" not in st
+    for slot in st["slots"]:
+        assert "cdp_port" not in slot
+        assert "cdp_http_url" not in slot
+        assert "cdp_ws_url" not in slot
+
+    # Lease wire JSON from create already checked in test_lease_omits_raw_cdp_by_default;
+    # list leases must also omit reconstructable tip fields.
+    code, listed = ladder_http("GET", f"{base}/v1/leases")
+    assert code == 200
+    rows = listed if isinstance(listed, list) else listed.get("leases") or listed.get("items") or []
+    mine = [r for r in rows if r.get("lease_id") == lid]
+    assert mine, listed
+    for row in mine:
+        assert "cdp_port" not in row
+        assert "cdp_http_url" not in row
+        assert "cdp_ws_url" not in row
+        assert "cdp_base_port" not in row
+
+    with api_server.pool._lock:
+        internal = api_server.pool._leases[lid]
+        slot = api_server.pool._find_slot_by_lease(lid)
+        assert internal.cdp_http_url
+        assert slot is not None and slot.cdp_port is not None
+        internal_url = internal.cdp_http_url
+        internal_port = slot.cdp_port
+
+    public_ports = [
+        s.get("cdp_port") for s in st["slots"] if s.get("cdp_port") is not None
+    ]
+    assert internal_port not in public_ports
+
+    monkeypatch.setenv("SLIPSTREAM_EXPOSE_RAW_CDP", "1")
+    code, st2 = ladder_http("GET", f"{base}/v1/pool/status")
+    assert code == 200
+    assert st2["cdp_base_port"] == api_server.pool.config.cdp_base_port
+    leased_slots = [s for s in st2["slots"] if s.get("lease_id") == lid]
+    assert leased_slots
+    assert leased_slots[0]["cdp_port"] == internal_port
+    assert leased_slots[0]["cdp_http_url"] == internal_url
+
+
+def test_nav_matched_false_refunds_grant(api_server: PoolServer, monkeypatch):
+    """ADV-PL-001-NAV-SOFTFAIL-BURNS: matched=False refunds nav_irreversible grant."""
+    monkeypatch.delenv("SLIPSTREAM_EXPOSE_RAW_CDP", raising=False)
+    base = api_server.base_url
+    lid = _lease(base, "nav-softfail")
+
+    # Force non-mock navigate path with a stub that returns matched=False
+    api_server.pool.config.mock = False
+    with api_server.pool._lock:
+        slot = api_server.pool._find_slot_by_lease(lid)
+        assert slot is not None
+        slot.cdp_http_url = "http://127.0.0.1:9"
+        api_server.pool._leases[lid].cdp_http_url = slot.cdp_http_url
+
+    import slipstream.cdp_http as cdp_http_mod
+
+    def fake_nav(cdp_http, url, allowed_domains=None):
+        return {"matched": False, "title": "", "url": url}
+
+    monkeypatch.setattr(cdp_http_mod, "navigate_via_json_new", fake_nav)
+
+    grant_ladder(base, lid, "nav_irreversible", "will softfail")
+    code, body = ladder_http(
+        "POST",
+        f"{base}/v1/leases/{lid}/navigate",
+        {"url": "https://example.com/softfail"},
+    )
+    assert code == 200
+    assert body.get("ok") is False
+    assert body.get("matched") is False
+    assert api_server.pool._confirmations.has_allowance(lid, "nav_irreversible")
+
+    code, body2 = ladder_http(
+        "POST",
+        f"{base}/v1/leases/{lid}/navigate",
+        {"url": "https://example.com/softfail2"},
+    )
+    assert code == 200
+    assert body2.get("matched") is False
