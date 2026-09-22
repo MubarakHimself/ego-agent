@@ -65,47 +65,173 @@ class DoctorReport:
 
 
 def _resolve_policy_path(path: Path) -> Path:
-    """Resolve path (name recognized by Skylos PATH_SANITIZERS)."""
+    """Resolve path (name recognized by Skylos PATH_SANITIZERS). Display / post-open only."""
     return Path(path).expanduser().resolve()
 
 
 def _read_skill_head_nofollow(path: Path, *, limit: int = 4096) -> str | None:
-    """Read up to ``limit`` bytes from a regular file; refuse symlink follow (SKY-D325)."""
+    """Read up to ``limit`` bytes from a regular file via O_NOFOLLOW (SKY-D325 / ADV-008).
+
+    Opens the *original* candidate (expanduser only) — never Path.resolve() before
+    open, so a leaf symlink yields ELOOP instead of silently following. fstat must
+    show a regular file under the size cap.
+    """
+    import errno
+    import stat as stat_mod
+
+    candidate = Path(path).expanduser()
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        resolved = _resolve_policy_path(path)
-    except OSError:
+        # ADV-008: open original candidate with O_NOFOLLOW (no Path.resolve before open).
+        # Containment/size via fstat REG below; leaf symlink → ELOOP.
+        fd = os.open(  # skylos: ignore[SKY-D215] O_NOFOLLOW leaf open; fstat REG+size; no pre-resolve (ADV-008)
+            os.fspath(candidate), flags
+        )
+    except OSError as e:
+        # Leaf symlink → ELOOP (or EPERM on some platforms); refuse.
+        if e.errno in (getattr(errno, "ELOOP", -1), getattr(errno, "EPERM", -2)):
+            return None
         return None
     try:
-        if resolved.is_symlink() or not resolved.is_file():
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode):
             return None
-        st = resolved.stat()
         if st.st_size > 1_000_000:
             # Skill docs are small; refuse absurd sizes.
             return None
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(resolved, flags)
-        try:
-            data = os.read(fd, limit)
-        finally:
-            os.close(fd)
-        return data.decode("utf-8", errors="replace")
-    except OSError:
+        data = os.read(fd, limit)
+    finally:
+        os.close(fd)
+    return data.decode("utf-8", errors="replace")
+
+
+def _frontmatter_name(head: str) -> str | None:
+    """Return YAML frontmatter ``name`` between leading ``---`` markers, else None."""
+    text = head.lstrip("\ufeff")
+    if not text.startswith("---"):
         return None
+    rest = text[3:]
+    if rest.startswith("\r\n"):
+        rest = rest[2:]
+    elif rest.startswith("\n"):
+        rest = rest[1:]
+    end = rest.find("\n---")
+    if end < 0:
+        return None
+    block = rest[:end]
+    for raw in block.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("name:"):
+            val = line.split(":", 1)[1].strip().strip("'\"")
+            if not val:
+                return None
+            # Exact token (no embedded spaces); otherwise first token.
+            if any(c.isspace() for c in val):
+                return val.split()[0]
+            return val
+    return None
 
 
 def _looks_like_watch_skill(path: Path) -> bool:
-    """True if SKILL.md frontmatter/body smells like bradautomates/claude-video /watch."""
+    """True if SKILL.md is the composed /watch skill (frontmatter name == watch).
+
+    Primary: YAML frontmatter between ``---`` with exact ``name: watch``.
+    Secondary only: when frontmatter name is absent, require ≥2 strong body markers
+    (marketplace copies may omit YAML name).
+    """
     head = _read_skill_head_nofollow(path, limit=4096)
     if head is None:
         return False
+    name = _frontmatter_name(head)
+    if name is not None:
+        return name == "watch"
     lower = head.lower()
-    if "name: watch" in lower:
-        return True
-    # Marketplace / plugin copies may omit YAML name; accept strong markers.
     markers = ("/watch", "claude-video", "bradautomates", "yt-dlp", "watch_detail")
     return sum(1 for m in markers if m in lower) >= 2
+
+
+_PLUGIN_CACHE_MAX_DEPTH = 10
+_PLUGIN_CACHE_MAX_ENTRIES = 512
+
+
+def _path_under_root(path: Path, root: Path) -> bool:
+    """True if ``path`` is under ``root`` using absolute (non-resolving) paths."""
+    try:
+        path.expanduser().absolute().relative_to(root.expanduser().absolute())
+        return True
+    except ValueError:
+        return False
+
+
+def _iter_plugin_cache_watch_skills(cache_root: Path) -> list[Path]:
+    """Confined walk for ``…/skills/watch/SKILL.md`` under a plugin cache root.
+
+    ADV-WATCH-COMPOSE-008: directory-symlink listing via controlled walk is OK
+    (depth/entry caps + realpath containment). Leaf ``SKILL.md`` is only *listed*
+    here; open uses O_NOFOLLOW in ``_read_skill_head_nofollow``.
+    """
+    hits: list[Path] = []
+    try:
+        root = cache_root.expanduser()
+        if not root.is_dir():
+            return hits
+        real_root = Path(os.path.realpath(root))
+    except OSError:
+        return hits
+
+    stack: list[tuple[Path, int]] = [(root, 0)]
+    seen_dirs: set[str] = set()
+    scanned = 0
+
+    while stack:
+        current, depth = stack.pop()
+        scanned += 1
+        if scanned > _PLUGIN_CACHE_MAX_ENTRIES:
+            break
+        try:
+            real_cur = Path(os.path.realpath(current))
+            real_cur.relative_to(real_root)
+        except (OSError, ValueError):
+            continue
+        key = str(real_cur)
+        if key in seen_dirs:
+            continue
+        seen_dirs.add(key)
+        try:
+            with os.scandir(current) as it:
+                for ent in it:
+                    scanned += 1
+                    if scanned > _PLUGIN_CACHE_MAX_ENTRIES:
+                        break
+                    try:
+                        # Dir listing may follow dir symlinks (controlled walk).
+                        if ent.is_dir(follow_symlinks=True):
+                            if depth < _PLUGIN_CACHE_MAX_DEPTH:
+                                stack.append((Path(ent.path), depth + 1))
+                            continue
+                        if ent.name != "SKILL.md":
+                            continue
+                        leaf = Path(ent.path)
+                        # Only …/skills/watch/SKILL.md
+                        if leaf.parent.name != "watch" or leaf.parent.parent.name != "skills":
+                            continue
+                        # Containment after lstat (do not resolve the leaf).
+                        try:
+                            leaf.lstat()
+                        except OSError:
+                            continue
+                        if not _path_under_root(leaf, root):
+                            continue
+                        hits.append(leaf.absolute())
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return hits
 
 
 def _watch_skill_candidates() -> list[Path]:
@@ -133,12 +259,7 @@ def _watch_skill_candidates() -> list[Path]:
         home / ".claude" / "plugins" / "cache" / "claude-video",
         home / ".claude" / "plugins" / "marketplaces" / "claude-video",
     ):
-        if cache_root.is_dir():
-            try:
-                for hit in cache_root.glob("**/skills/watch/SKILL.md"):
-                    candidates.append(hit)
-            except OSError:
-                pass
+        candidates.extend(_iter_plugin_cache_watch_skills(cache_root))
     return candidates
 
 
@@ -146,20 +267,21 @@ def find_watch_skill() -> Path | None:
     """Locate composed Claude /watch skill (optional; never vendored).
 
     Searches SLIPSTREAM_WATCH_SKILL, common Agent Skills hosts, Claude Code
-    marketplace cache, and Firstmate box paths. Validates lightly so a random
-    SKILL.md named watch is not counted as a PASS.
+    marketplace cache, and Firstmate box paths. Opens each leaf with O_NOFOLLOW
+    (no pre-resolve). Validates frontmatter ``name: watch`` (markers secondary).
+    Returns the absolute candidate path (symlinks in parents not collapsed); callers
+    may realpath for display after a successful nofollow open.
     """
-    seen: set[Path] = set()
+    seen: set[str] = set()
     for path in _watch_skill_candidates():
-        try:
-            resolved = _resolve_policy_path(path)
-        except OSError:
+        candidate = Path(path).expanduser()
+        key = str(candidate.absolute())
+        if key in seen:
             continue
-        if resolved in seen:
+        seen.add(key)
+        if not _looks_like_watch_skill(candidate):
             continue
-        seen.add(resolved)
-        if resolved.is_file() and not resolved.is_symlink() and _looks_like_watch_skill(resolved):
-            return resolved
+        return candidate.absolute()
     return None
 
 
@@ -185,14 +307,19 @@ def watch_compose_status() -> dict[str, object]:
                 "vendor yt-dlp/ffmpeg/Whisper scripts."
             ),
         }
+    # Realpath for display only (leaf already validated via O_NOFOLLOW open).
+    try:
+        display = str(_resolve_policy_path(path))
+    except OSError:
+        display = str(path)
     return {
         "ok": True,
         "status": "ok",
-        "path": str(path),
+        "path": display,
         "required": False,
         "upstream": "bradautomates/claude-video",
         "install": install_hint,
-        "message": f"Composed /watch skill present: {path}",
+        "message": f"Composed /watch skill present: {display}",
     }
 
 
