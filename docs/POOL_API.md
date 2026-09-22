@@ -293,7 +293,8 @@ POST /v1/leases/{lease_id}/act
 → 403 {"status":"confirmation_required","category":"nav_irreversible",…}
 ```
 
-Env: `SLIPSTREAM_ACT_SOFT_RETRY` (default 1), `SLIPSTREAM_ACT_FALLBACK_MAX_STEPS` (default 5).
+Env: `SLIPSTREAM_ACT_SOFT_RETRY` (default 1), `SLIPSTREAM_ACT_FALLBACK_MAX_STEPS` (default 5; client `max_steps` may only lower this).
+`steps_run` / feed summaries use `safe_url_summary` for navigate (no query/fragment). Live click uses real CDP (selector miss → fail → soft_retry/fallback); mock failures via `_mock_act_fail_remaining`.
 CLI: `slipstream try-act --lease-id … --body '{"kind":"click","selector":"#x"}'`.
 
 ### Domain allowlist (top-frame navigate)

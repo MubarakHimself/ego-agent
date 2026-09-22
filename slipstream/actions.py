@@ -372,11 +372,15 @@ def parse_act_step(raw: Any, *, label: str = "step") -> dict[str, Any]:
 
 
 def _plan_cap(body: dict[str, Any]) -> int:
+    """Client max_steps may only lower the env/server cap (never raise)."""
     cap = max_fallback_steps()
     ms = body.get("max_steps")
-    if isinstance(ms, int) and ms >= 1:
-        return min(ms, 20)
-    return cap
+    if ms is None:
+        return cap
+    # bool is a subclass of int — reject True/False explicitly (ADV-ACT-002).
+    if isinstance(ms, bool) or not isinstance(ms, int) or ms < 1:
+        raise ActFallbackValidationError("max_steps must be a positive integer")
+    return min(ms, cap)
 
 
 def _soft_n(kind: str, soft: Any) -> int:
@@ -410,8 +414,11 @@ def parse_act_request(body: Any) -> dict[str, Any]:
 
 
 def act_step_summary(step: dict[str, Any]) -> str:
+    """Feed/summary line — never echo navigate query/fragment (ADV-ACT-001)."""
     if step["kind"] == _KIND_NAV:
-        return f"act nav {step.get('url', '')[:80]}"
+        from slipstream.activity_feed import safe_url_summary
+
+        return f"act nav {safe_url_summary(step.get('url'))}"
     return f"act clk {step.get('selector', '')[:80]}"
 
 

@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import pytest
 
+import json
+
 from slipstream.actions import (
     STATUS_ACT_OK,
     STATUS_NEED_FALLBACK,
+    ActFallbackValidationError,
+    act_step_summary,
     parse_act_request,
 )
+from slipstream.activity_feed import safe_url_summary
 from slipstream.api import PoolServer
 from slipstream.config import PoolConfig
 from slipstream.pool import BrowserPool
@@ -144,3 +149,95 @@ def test_soft_browse_free(api_server: PoolServer):
     assert body["status"] == STATUS_ACT_OK
     code, hb = ladder_http("POST", f"{base}/v1/leases/{lid}/heartbeat", {})
     assert code == 200, hb
+
+
+def test_plan_cap_respects_env_and_rejects_bool(monkeypatch):
+    monkeypatch.setenv("SLIPSTREAM_ACT_FALLBACK_MAX_STEPS", "3")
+    # Client cannot raise above env cap.
+    with pytest.raises(ActFallbackValidationError, match="max_steps"):
+        parse_act_request(
+            {
+                "kind": "click",
+                "selector": "#a",
+                "max_steps": 10,
+                "fallback_plan": [
+                    {"kind": "click", "selector": f"#f{i}"} for i in range(4)
+                ],
+            }
+        )
+    parsed = parse_act_request(
+        {
+            "kind": "click",
+            "selector": "#a",
+            "max_steps": 2,
+            "fallback_plan": [
+                {"kind": "click", "selector": "#f0"},
+                {"kind": "click", "selector": "#f1"},
+            ],
+        }
+    )
+    assert parsed["max_steps"] == 2
+    # bool True must not be treated as int 1 (ADV-ACT-002).
+    with pytest.raises(ActFallbackValidationError, match="max_steps"):
+        parse_act_request(
+            {"kind": "click", "selector": "#a", "max_steps": True, "fallback_plan": []}
+        )
+
+
+def test_act_step_summary_scrubs_navigate_query():
+    raw = "https://example.com/path?sig=secret&token=abc#frag"
+    summary = act_step_summary({"kind": "navigate", "url": raw})
+    assert "sig=secret" not in summary
+    assert "token=abc" not in summary
+    assert "frag" not in summary
+    assert safe_url_summary(raw) in summary
+
+
+def test_navigate_secret_not_in_steps_run_or_feed(api_server: PoolServer):
+    base = api_server.base_url
+    lid = _lease(base, "scrub-nav-space")
+    grant_ladder(base, lid, "nav_irreversible", "act navigate scrub")
+    secret = "https://example.com/ok?sig=secret&token=abc#frag"
+    code, body = ladder_http(
+        "POST",
+        f"{base}/v1/leases/{lid}/act",
+        {"kind": "navigate", "url": secret},
+    )
+    assert code == 200, body
+    blob = json.dumps(body)
+    assert "sig=secret" not in blob
+    assert "token=abc" not in blob
+    assert "#frag" not in blob
+    for step in body.get("steps_run") or []:
+        result = step.get("result") or {}
+        for key in ("url", "observed_url"):
+            if key in result:
+                assert "?" not in result[key]
+                assert "#" not in result[key]
+    # Activity feed summaries must also stay scrubbed.
+    feed = api_server.pool._activity_feeds.get(lid)
+    assert feed is not None
+    for ev in feed.list_events(after_seq=0):
+        s = json.dumps(ev)
+        assert "sig=secret" not in s
+        assert "token=abc" not in s
+
+
+def test_fallback_plan_navigate_ladder_gated(api_server: PoolServer):
+    """ADV-ACT-005: navigate inside fallback_plan still needs ladder grant."""
+    base = api_server.base_url
+    lid = _lease(base, "fb-nav-gate-space")
+    api_server.pool._mock_act_fail_remaining[lid] = 1
+    code, body = ladder_http(
+        "POST",
+        f"{base}/v1/leases/{lid}/act",
+        {
+            "kind": "click",
+            "selector": "#primary-miss",
+            "soft_retry": False,
+            "fallback_plan": [{"kind": "navigate", "url": "https://example.com/next"}],
+        },
+    )
+    assert code == 403, body
+    assert body["status"] == "confirmation_required"
+    assert body["category"] == "nav_irreversible"

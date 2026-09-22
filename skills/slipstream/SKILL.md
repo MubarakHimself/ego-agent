@@ -212,6 +212,7 @@ slipstream try-act --lease-id "$LEASE_ID" --body '{"kind":"navigate","url":"http
 HTTP: `POST /v1/leases/{id}/act` with `{kind, …, fallback_plan?, soft_retry?, max_steps?}`.
 Responses: `status=ok|need_fallback|confirmation_required|failed` plus `reason`, `attempts`.
 Ladder `consume_once` still applies to navigate/fill/eval steps inside the plan.
+`max_steps` is server-capped by `SLIPSTREAM_ACT_FALLBACK_MAX_STEPS` (client may only lower). Navigate URLs in `steps_run`/feed are query/fragment-scrubbed. Click uses real CDP success (mock fail via test budget).
 Pattern-steal from Stagehand agent-fallbacks docs — no Stagehand/Browserbase code.
 
 ## Domain allowlist (top-frame)

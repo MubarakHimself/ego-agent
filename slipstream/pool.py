@@ -144,6 +144,8 @@ from slipstream.vault import (
     parse_fill_body,
 )
 from slipstream.cdp_inject import CdpInjectError, CdpInjector, default_injector
+
+_KIND_CLICK_ACT = "click"
 from slipstream.actions import (
     act_feed_kind,
     act_step_summary,
@@ -2293,6 +2295,7 @@ class BrowserPool:
                 raise LeaseNotFoundError(lease_id)
             mock = self.config.mock
             fail_left = self._mock_act_fail_remaining.get(lease_id, 0)
+            cdp_http = slot.cdp_http_url
 
         kind = step["kind"]
         summary = act_step_summary(step)
@@ -2310,12 +2313,9 @@ class BrowserPool:
             return {"ok": False, "kind": kind, "reason": "mock_primary_fail", "mock": True}
 
         if kind == "click":
-            with self._lock:
-                self._act_log.append({"lease_id": lease_id, "kind": kind, "ok": True, "step": step})
-            self._record_activity(
-                lease_id, feed, summary, outcome="ok", detail={"kind": kind}
+            return self._act_click_step(
+                lease_id, step, summary, feed, cdp_http=cdp_http, mock=mock
             )
-            return {"ok": True, "kind": kind, "mock": mock}
 
         result = self.navigate(lease_id, {"url": step["url"]})
         ok = bool(result.get("ok", result.get("matched", True)))
@@ -2323,8 +2323,61 @@ class BrowserPool:
             "ok": ok,
             "kind": kind,
             "reason": None if ok else "navigate_unmatched",
-            "result": result,
+            # ADV-ACT-001: never echo raw navigate URL (query/fragment) in steps_run.
+            "result": self._scrub_act_nav_result(result),
         }
+
+    def _scrub_act_nav_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Copy navigate result with url fields reduced via safe_url_summary."""
+        out = dict(result)
+        for key in ("url", "observed_url"):
+            if key in out and isinstance(out[key], str):
+                out[key] = safe_url_summary(out[key])
+        return out
+
+    def _act_click_step(
+        self,
+        lease_id: str,
+        step: dict[str, Any],
+        summary: str,
+        feed: str,
+        *,
+        cdp_http: str | None,
+        mock: bool,
+    ) -> dict[str, Any]:
+        """Real CDP click (or mock injector); no always-ok forge (ADV-ACT-003)."""
+        selector = step["selector"]
+        reason = "no_cdp"
+        err = ""
+        if cdp_http:
+            try:
+                self._cdp_injector.click_selector(cdp_http, selector)
+                reason = ""
+            except CdpInjectError as e:
+                reason = "click_failed"
+                err = str(e)[:200]
+        ok = reason == ""
+        with self._lock:
+            self._act_log.append(
+                {
+                    "lease_id": lease_id,
+                    "kind": _KIND_CLICK_ACT,
+                    "ok": ok,
+                    "selector": selector,
+                    **({"error": err} if err else {}),
+                }
+            )
+        self._record_activity(
+            lease_id,
+            feed,
+            summary,
+            outcome="ok" if ok else "error",
+            detail={"kind": _KIND_CLICK_ACT, **({"reason": reason} if reason else {})},
+        )
+        out: dict[str, Any] = {"ok": ok, "kind": _KIND_CLICK_ACT, "mock": mock}
+        if reason:
+            out["reason"] = reason
+        return out
 
     def _sync_lease_signed_in(self, lease: Lease) -> None:
         """Copy Space signed-in badge onto lease (metadata only)."""
