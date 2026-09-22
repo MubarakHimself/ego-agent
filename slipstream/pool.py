@@ -75,6 +75,14 @@ from slipstream.metadata import (
     metadata_matches,
     validate_user_metadata,
 )
+from slipstream.signed_in import (
+    SignedInValidationError,
+    badge_from_registry,
+    metadata_signed_in_patch,
+    normalize_signed_in_host,
+    strip_signed_in_metadata,
+    validate_signed_in_body,
+)
 from slipstream.rss import sample_tree_rss
 from slipstream.vault import (
     CredNotFoundError,
@@ -141,6 +149,8 @@ class BrowserPool:
         self._space_metadata: dict[str, dict[str, Any]] = {}
         # Space-level allowed_domains (None key absent = inherit config/env).
         self._space_allowed_domains: dict[str, list[str]] = {}
+        # Space signed-in badge (persist cookies via profile dir; badge is metadata).
+        self._space_signed_in: dict[str, dict[str, Any]] = {}
         # Mock navigate recorder (tests); never returned with secrets.
         self._nav_log: list[dict[str, Any]] = []
         # Alerts: per-lease history + task_done idempotency (survives release).
@@ -289,6 +299,7 @@ class BrowserPool:
         domains_override = (
             parse_allowed_domains(allowed_domains) if allowed_domains is not None else None
         )
+        badge = badge_from_registry(self._space_signed_in.get(space_id))
         lease = Lease(
             lease_id=lease_id,
             slot_id=slot.slot_id,
@@ -303,6 +314,8 @@ class BrowserPool:
             user_metadata=effective_metadata(space_meta, override),
             allowed_domains_override=domains_override,
             allowed_domains=self._effective_domains_for(space_id, domains_override),
+            signed_in=bool(badge.get("signed_in")),
+            signed_in_host=badge.get("signed_in_host"),
         )
         self._leases[lease_id] = lease
         slot.status = SlotStatus.LEASED
@@ -481,6 +494,7 @@ class BrowserPool:
                         existing.allowed_domains = self._effective_domains_for(
                             space_id, existing.allowed_domains_override
                         )
+                        self._sync_lease_signed_in(existing)
                         early_result = existing.to_dict()
                         break
 
@@ -1266,11 +1280,21 @@ class BrowserPool:
             confirmed = sess.takeover_confirmed
             enabled = sess.input_enabled
             tok = sess.token
+            lease_obj = self._leases.get(lease_id)
+            space_id = lease_obj.space_id if lease_obj else None
+            badge = badge_from_registry(
+                self._space_signed_in.get(space_id) if space_id else None
+            )
         frame = frame_path(lease_id, tok)
         confirm = confirm_path(lease_id, tok) if mode == "takeover" else None
         in_url = input_path(lease_id, tok) if enabled else None
         cede = cede_path(lease_id, tok) if (mode == "takeover" and enabled) else None
         events = events_path(lease_id, tok)
+        mark_url = (
+            f"/v1/leases/{lease_id}/watch/mark-signed-in?token={tok}"
+            if mode == "takeover"
+            else None
+        )
         body = render_watch_html(
             lease_id=lease_id,
             reason=reason,
@@ -1284,6 +1308,9 @@ class BrowserPool:
             input_url=in_url,
             cede_url=cede,
             events_url=events,
+            signed_in=bool(badge.get("signed_in")),
+            signed_in_host=badge.get("signed_in_host"),
+            mark_signed_in_url=mark_url,
         )
         return "text/html; charset=utf-8", body
 
@@ -1586,6 +1613,41 @@ class BrowserPool:
             "allowed_domains": patterns,
         }
 
+
+    def _sync_lease_signed_in(self, lease: Lease) -> None:
+        """Copy Space signed-in badge onto lease (metadata only)."""
+        badge = badge_from_registry(self._space_signed_in.get(lease.space_id))
+        lease.signed_in = bool(badge.get("signed_in"))
+        lease.signed_in_host = badge.get("signed_in_host")
+
+    def _apply_space_signed_in_locked(
+        self, space_id: str, *, signed: bool, host: str | None
+    ) -> None:
+        """Mutate registries under lock; refresh active leases for space_id."""
+        if signed:
+            self._space_signed_in[space_id] = {
+                "signed_in": True,
+                "host": host,
+                "marked_at": time.time(),
+            }
+            meta = strip_signed_in_metadata(dict(self._space_metadata.get(space_id, {})))
+            meta.update(metadata_signed_in_patch(signed_in=True, host=host))
+            self._space_metadata[space_id] = meta
+        else:
+            self._space_signed_in.pop(space_id, None)
+            meta = strip_signed_in_metadata(dict(self._space_metadata.get(space_id, {})))
+            if meta:
+                self._space_metadata[space_id] = meta
+            else:
+                self._space_metadata.pop(space_id, None)
+        space_meta = dict(self._space_metadata.get(space_id, {}))
+        for lease in self._leases.values():
+            if lease.space_id == space_id:
+                lease.user_metadata = effective_metadata(
+                    space_meta, lease.user_metadata_override
+                )
+                self._sync_lease_signed_in(lease)
+
     # --- user_metadata / list ------------------------------------------
 
     def set_space_metadata(
@@ -1651,20 +1713,111 @@ class BrowserPool:
     def get_space_metadata(self, space_id: str) -> dict[str, Any]:
         space_id = self.config.normalize_space_id(space_id)
         with self._lock:
-            return {
+            out: dict[str, Any] = {
                 "space_id": space_id,
                 "user_metadata": dict(self._space_metadata.get(space_id, {})),
                 "allowed_domains": list(self._space_allowed_domains[space_id])
                 if space_id in self._space_allowed_domains
                 else None,
             }
+            out.update(badge_from_registry(self._space_signed_in.get(space_id)))
+            return out
+
+
+    def set_space_signed_in(
+        self,
+        space_id: str,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Mark/unmark Space signed-in badge (no cookie dump).
+
+        Session cookies persist automatically in the Space profile dir
+        (``spaces_root/{space_id}`` = Chromium ``--user-data-dir``). This only
+        sets a metadata badge + optional host label for list/Watch chips.
+        """
+        space_id = self.config.normalize_space_id(space_id)
+        signed, host = validate_signed_in_body(body or {})
+        with self._lock:
+            self._apply_space_signed_in_locked(space_id, signed=signed, host=host)
+            out: dict[str, Any] = {
+                "space_id": space_id,
+                "signed_in": signed,
+                "user_metadata": dict(self._space_metadata.get(space_id, {})),
+                "persist_note": (
+                    "session cookies persist in Space profile dir "
+                    f"({self.config.spaces_root}/{space_id}); "
+                    "badge is metadata only — never cookie values"
+                ),
+            }
+            if signed and host:
+                out["signed_in_host"] = host
+            return out
+
+
+    def mark_watch_signed_in(
+        self, lease_id: str, token: str | None, body: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Tokenized Watch path: mark lease Space signed-in after human login."""
+        with self._lock:
+            sess = self._get_watch_session_locked(lease_id, token)
+            if lease_id not in self._leases:
+                self._invalidate_pair_browse_locked(sess, revoke=True)
+                raise WatchGoneError(_ERR_LEASE_INACTIVE)
+            space_id = self._leases[lease_id].space_id
+        # set_space_signed_in takes its own lock
+        raw = dict(body or {})
+        if "signed_in" not in raw:
+            raw["signed_in"] = True
+        return self.set_space_signed_in(space_id, raw)
+
+    def login_once(
+        self,
+        space_id: str,
+        *,
+        agent_id: str,
+        detail: str | None = None,
+        ttl_s: int | None = None,
+        host: str | None = None,
+        ttl_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        """Lease Space + raise need_human(reason=login) for Watch/Take-over.
+
+        Optional ``host`` is a badge hint only (applied when marked signed-in).
+        Persist remains automatic via Space profile after human logs in.
+        """
+        if not agent_id or not isinstance(agent_id, str):
+            raise SignedInValidationError("agent_id required")
+        host_label = normalize_signed_in_host(host) if host else None
+        lease = self.lease(agent_id, space_id, ttl_seconds=ttl_seconds)
+        alert_body: dict[str, Any] = {
+            "event": "need_human",
+            "reason": "login",
+            "detail": detail or "login-once: human Watch/Take-over to sign in",
+        }
+        if ttl_s is not None:
+            alert_body["ttl_s"] = ttl_s
+        envelope = self.raise_alert(lease["lease_id"], alert_body)
+        out: dict[str, Any] = {
+            "lease": lease,
+            "alert": envelope.get("alert"),
+            "harness": envelope.get("harness"),
+            "flow": "login_once",
+            "next": (
+                "Captain opens watch_url → Confirm Take-over → human logs in → "
+                "Cede or POST /v1/spaces/{space_id}/signed-in "
+                "(cookies already in profile dir)"
+            ),
+        }
+        if host_label:
+            out["host_hint"] = host_label
+        return out
 
     def list_spaces(self, *, q: str | None = None) -> dict[str, Any]:
         """List known Spaces (tagged and/or currently slotted) filtered by q=."""
         with self._lock:
             known: set[str] = set(self._space_metadata.keys()) | set(
                 self._space_allowed_domains.keys()
-            )
+            ) | set(self._space_signed_in.keys())
             for slot in self._slots:
                 if slot.space_id:
                     known.add(slot.space_id)
@@ -1681,17 +1834,17 @@ class BrowserPool:
                     s.space_id == sid and s.status == SlotStatus.FREE_WARM
                     for s in self._slots
                 )
-                items.append(
-                    {
-                        "space_id": sid,
-                        "user_metadata": meta,
-                        "allowed_domains": list(self._space_allowed_domains[sid])
-                        if sid in self._space_allowed_domains
-                        else None,
-                        "leased": leased,
-                        "warm": warm,
-                    }
-                )
+                item: dict[str, Any] = {
+                    "space_id": sid,
+                    "user_metadata": meta,
+                    "allowed_domains": list(self._space_allowed_domains[sid])
+                    if sid in self._space_allowed_domains
+                    else None,
+                    "leased": leased,
+                    "warm": warm,
+                }
+                item.update(badge_from_registry(self._space_signed_in.get(sid)))
+                items.append(item)
             return {"spaces": items, "q": q}
 
     def list_leases(self, *, q: str | None = None) -> dict[str, Any]:
@@ -1703,6 +1856,7 @@ class BrowserPool:
                     self._space_metadata.get(lease.space_id, {}),
                     lease.user_metadata_override,
                 )
+                self._sync_lease_signed_in(lease)
                 if not metadata_matches(lease.user_metadata, q):
                     continue
                 items.append(lease.to_dict())
@@ -1722,6 +1876,7 @@ class BrowserPool:
                 slot.status = SlotStatus.FREE_COLD
             self._leases.clear()
             self._space_metadata.clear()
+            self._space_signed_in.clear()
             self._watches.clear()
             self._watch_input_log.clear()
             self._activity_feeds.clear()

@@ -45,7 +45,9 @@ from slipstream.cli import (
     cmd_leases_list,
     cmd_navigate,
     cmd_spaces_list,
+    cmd_spaces_login_once,
     cmd_spaces_set,
+    cmd_spaces_signed_in,
     cmd_release,
     cmd_status,
     resolve_secret,
@@ -371,6 +373,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated Space top-frame allowlist (omit to leave unchanged)",
     )
     p_sp_set.set_defaults(_handler="spaces_set")
+    p_sp_si = spaces_sub.add_parser(
+        "signed-in",
+        help="Mark/unmark Space signed-in badge (profile cookies persist; no dump)",
+    )
+    _add_url(p_sp_si)
+    p_sp_si.add_argument(_OPT_SPACE_ID, required=True, help="Space id")
+    p_sp_si.add_argument(
+        "--host",
+        default=None,
+        help="Optional host label for badge (e.g. github.com)",
+    )
+    p_sp_si.add_argument(
+        "--clear",
+        action=_STORE_TRUE,
+        help="Unmark signed-in (clear badge)",
+    )
+    p_sp_si.set_defaults(_handler="spaces_signed_in")
+    p_sp_lo = spaces_sub.add_parser(
+        "login-once",
+        help="Lease Space + need_human(reason=login) for Watch/Take-over",
+    )
+    _add_url(p_sp_lo)
+    p_sp_lo.add_argument(_OPT_SPACE_ID, required=True, help="Space id")
+    p_sp_lo.add_argument("--agent-id", required=True, help="Agent id for the lease")
+    p_sp_lo.add_argument("--detail", default=None, help="Human-safe detail string")
+    p_sp_lo.add_argument("--host", default=None, help="Optional host hint for later badge")
+    p_sp_lo.add_argument("--ttl-s", type=int, default=None, help="Watch TTL seconds")
+    p_sp_lo.set_defaults(_handler="spaces_login_once")
 
     # --- leases list ---
     p_leases = sub.add_parser("leases", help="List/filter active leases by user_metadata")
@@ -466,6 +496,22 @@ def main(argv: list[str] | None = None) -> int:
                 metadata_json=args.metadata,
                 tags=args.tag,
                 allowed_domains=sp_domains,
+                url=args.url,
+            )
+        if args._handler == "spaces_signed_in":
+            return cmd_spaces_signed_in(
+                space_id=args.space_id,
+                signed_in=not args.clear,
+                host=args.host,
+                url=args.url,
+            )
+        if args._handler == "spaces_login_once":
+            return cmd_spaces_login_once(
+                space_id=args.space_id,
+                agent_id=args.agent_id,
+                detail=args.detail,
+                host=args.host,
+                ttl_s=args.ttl_s,
                 url=args.url,
             )
         if args._handler == "leases_list":

@@ -618,3 +618,47 @@ def cmd_leases_list(
         _fail_http(status, payload)
     _print_json(payload)
     return 0
+
+
+def cmd_spaces_signed_in(
+    *,
+    space_id: str,
+    signed_in: bool = True,
+    host: str | None = None,
+    url: str | None = None,
+) -> int:
+    """POST /v1/spaces/{id}/signed-in — mark/unmark badge (never cookies)."""
+    base = resolve_base_url(url)
+    body: dict[str, Any] = {"signed_in": signed_in}
+    if host:
+        body["host"] = host
+    status, payload = _request("POST", f"{base}{_PATH_SPACES}{space_id}/signed-in", body)
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0
+
+
+def cmd_spaces_login_once(
+    *,
+    space_id: str,
+    agent_id: str,
+    detail: str | None = None,
+    host: str | None = None,
+    ttl_s: int | None = None,
+    url: str | None = None,
+) -> int:
+    """POST /v1/spaces/{id}/login-once — lease + need_human(reason=login)."""
+    base = resolve_base_url(url)
+    body: dict[str, Any] = {"agent_id": agent_id}
+    if detail:
+        body["detail"] = detail
+    if host:
+        body["host"] = host
+    if ttl_s is not None:
+        body["ttl_s"] = ttl_s
+    status, payload = _request("POST", f"{base}{_PATH_SPACES}{space_id}/login-once", body)
+    if status != 200:
+        _fail_http(status, payload)
+    _print_json(payload)
+    return 0

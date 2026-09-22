@@ -347,6 +347,31 @@ slipstream cred fill --lease-id "$LEASE_ID" --cred-id "$CRED_ID" \
 # → 400 if page origin ≠ cred.origin
 ```
 
+
+## Login-once + signed-in badge
+
+Human logs in **once** into a Space via Watch/Take-over; session cookies persist in the Space Chromium profile (`--user-data-dir`). Mark a **signed-in** badge afterward (metadata / host label only — **never** dump cookies to the agent). Vault fill stays separate.
+
+```bash
+# Option A — existing path
+slipstream alert --lease-id "$LEASE_ID" need_human --reason login --detail "please sign in"
+
+# Option B — convenience: lease + need_human(login)
+slipstream spaces login-once --space-id "$SPACE" --agent-id agent-1 --host github.com
+
+# After captain Take-over login (or Watch "Mark Space signed-in"):
+slipstream spaces signed-in --space-id "$SPACE" --host github.com
+# Clear badge:
+slipstream spaces signed-in --space-id "$SPACE" --clear
+
+# Badge visible on:
+#   GET /v1/spaces  → signed_in / signed_in_host
+#   GET /v1/leases  → same
+#   Watch header chip
+```
+
+Filter: `slipstream spaces list --q signed_in=true`.
+
 **Login / 2FA / CAPTCHA:** if fill is not enough (or no bind exists), raise
 `need_human` with `reason=login` (or `other`). Lease stays warm; pause CDP;
 captain uses Watch / Take-over. Prefer session reuse on later leases of the
