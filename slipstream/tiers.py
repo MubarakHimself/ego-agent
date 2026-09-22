@@ -6,7 +6,9 @@ spawning pool Chromium. Attach is default-off (``SLIPSTREAM_ALLOW_ATTACH=1``).
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import socket
 import urllib.parse
 from typing import Any
 
@@ -22,9 +24,12 @@ ATTACH_RISK_LABEL = (
     "does not quit user Chrome"
 )
 
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+# Align with CLI `_host_is_loopback`: no 0.0.0.0 (unspecified, not loopback).
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _ALLOWED_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 _REFUSED_SCHEMES = frozenset({"file", "javascript", "data", "blob", "about", "ftp"})
+
+_ERR_HOST = "cdp_url host "
 
 
 class TierError(ValueError):
@@ -67,6 +72,68 @@ def _attach_allow_hosts() -> set[str]:
     return hosts
 
 
+
+def _is_forbidden_attach_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Refuse unspecified / link-local / multicast / classic metadata."""
+    return bool(
+        addr.is_unspecified
+        or addr.is_multicast
+        or addr.is_link_local
+        or addr == ipaddress.ip_address("169.254.169.254")
+    )
+
+
+def _check_resolved_attach_ip(
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    *,
+    host_l: str,
+    explicit: bool,
+) -> None:
+    if _is_forbidden_attach_ip(addr):
+        raise TierError(
+            f"cdp_url peer {host_l!r} refused (link-local/metadata/unspecified)"
+        )
+    if addr.is_loopback or explicit:
+        return
+    raise TierError(f"cdp_url peer {host_l!r} is not loopback")
+
+
+def assert_attach_peer_allowed(host: str) -> None:
+    """Hostname allowlist + resolve; loopback unless ATTACH_ALLOW_HOSTS.
+
+    Explicit allowlist hosts may be non-loopback; link-local/metadata/unspecified
+    are always refused.
+    """
+    host_l = (host or "").lower().strip("[]")
+    if not host_l:
+        raise TierError("cdp_url must include a host")
+    allow = _attach_allow_hosts()
+    if host_l not in allow:
+        raise TierError(
+            f"{_ERR_HOST}{host_l!r} not allowlisted (loopback or "
+            "SLIPSTREAM_ATTACH_ALLOW_HOSTS)"
+        )
+    explicit = host_l not in _LOOPBACK_HOSTS
+    try:
+        literal = ipaddress.ip_address(host_l)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        _check_resolved_attach_ip(literal, host_l=host_l, explicit=explicit)
+        return
+    try:
+        infos = socket.getaddrinfo(host_l, None, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise TierError(f"{_ERR_HOST}{host_l!r} could not be resolved") from exc
+    ips = {info[4][0] for info in infos}
+    if not ips:
+        raise TierError(f"{_ERR_HOST}{host_l!r} resolved to no addresses")
+    for ip_s in ips:
+        _check_resolved_attach_ip(
+            ipaddress.ip_address(ip_s), host_l=host_l, explicit=explicit
+        )
+
+
 def cdp_http_from_ws(url: str) -> str:
     """Map ws(s) CDP URL to http(s) base for /json/version probes."""
     p = urllib.parse.urlparse(url)
@@ -84,6 +151,7 @@ def resolve_attach_cdp(
 
     Accepts ``cdp_url`` (http/https/ws/wss) or ``cdp_port`` (→ http://127.0.0.1:PORT).
     Refuses file: / javascript: / data: and non-allowlisted hosts.
+    Resolves hostnames and refuses link-local / metadata / unspecified peers.
     """
     if cdp_url is not None and cdp_port is not None:
         raise TierError("provide cdp_url or cdp_port, not both")
@@ -109,11 +177,7 @@ def resolve_attach_cdp(
     host = (parsed.hostname or "").lower().strip("[]")
     if not host:
         raise TierError("cdp_url must include a host")
-    if host not in _attach_allow_hosts():
-        raise TierError(
-            f"cdp_url host {host!r} not allowlisted (loopback or "
-            "SLIPSTREAM_ATTACH_ALLOW_HOSTS)"
-        )
+    assert_attach_peer_allowed(host)
     if scheme in ("ws", "wss"):
         http_url = cdp_http_from_ws(raw)
     else:

@@ -480,8 +480,12 @@ class BrowserPool:
         self._captcha.pop(lease_id, None)
         self._confirmations.clear_lease(lease_id)
 
-        # Attach leases never go warm — we do not own the Chromium tree.
-        external = bool(getattr(lease, "external_attach", False))
+        # Attach / external handles never go warm — we do not own that Chrome,
+        # and must not hand a user CDP to the next agent without ALLOW_ATTACH.
+        handle_peek = self._handles.get(slot.slot_id)
+        external = bool(getattr(lease, "external_attach", False)) or (
+            handle_peek is not None and bool(getattr(handle_peek, "external", False))
+        )
         keep_warm = (
             allow_warm
             and not external
@@ -580,9 +584,9 @@ class BrowserPool:
         """Ensure attach CDP answers /json/version (skipped under mock)."""
         if self.config.mock:
             return
-        from slipstream.cdp_http import wait_cdp_ready
+        from slipstream.cdp_http import wait_attach_cdp_ready
 
-        wait_cdp_ready(cdp_http_url, timeout=5.0)
+        wait_attach_cdp_ready(cdp_http_url, timeout=5.0)
 
     def _lease_attach(
         self,
@@ -639,6 +643,16 @@ class BrowserPool:
                         self._sync_lease_signed_in(existing)
                         if ka_explicit:
                             existing.keep_alive = ka
+                        # ADV-AC-002: never mark external while still owning a pool tree.
+                        handle = self._handles.get(slot.slot_id)
+                        if handle is not None and not bool(
+                            getattr(handle, "external", False)
+                        ):
+                            owned = self._handles.pop(slot.slot_id, None)
+                            if owned is not None:
+                                pending_stops.append(owned)
+                            self._clear_process_fields(slot)
+                            handle = None
                         existing.tier = TIER_ATTACH
                         existing.risk_label = ATTACH_RISK_LABEL
                         existing.external_attach = True
@@ -648,11 +662,23 @@ class BrowserPool:
                         slot.cdp_port = cdp_port
                         slot.cdp_ws_url = None
                         slot.chromium_pid = None
-                        handle = self._handles.get(slot.slot_id)
-                        if handle is not None:
+                        if handle is None:
+                            self._handles[slot.slot_id] = LaunchHandle(
+                                pid=0,
+                                cdp_port=int(cdp_port or 0),
+                                cdp_http_url=cdp_http,
+                                cdp_ws_url=None,
+                                user_data_dir=self.config.space_path(space_id),
+                                process=None,
+                                mocked=bool(self.config.mock),
+                                external=True,
+                            )
+                        else:
                             handle.external = True
                             handle.mocked = handle.mocked or self.config.mock
                             handle.cdp_http_url = cdp_http
+                            handle.process = None
+                            handle.pid = 0
                             if cdp_port is not None:
                                 handle.cdp_port = cdp_port
                         early_result = existing.to_dict()
@@ -863,6 +889,20 @@ class BrowserPool:
                             space_id, existing.allowed_domains_override
                         )
                         self._sync_lease_signed_in(existing)
+                        # ADV-AC-001: leaving attach must fully detach user CDP
+                        # (never stamp ephemeral/named onto an external handle).
+                        handle_now = self._handles.get(slot.slot_id)
+                        leaving_attach = bool(
+                            getattr(existing, "external_attach", False)
+                        ) or (
+                            handle_now is not None
+                            and bool(getattr(handle_now, "external", False))
+                        )
+                        if leaving_attach:
+                            h = self._detach_lease_locked(lid, allow_warm=False)
+                            if h is not None:
+                                pending_stops.append(h)
+                            break
                         # Idempotent re-lease: only flip keep_alive when body/arg
                         # set it explicitly (omit preserves prior flag).
                         if ka_explicit:
@@ -894,7 +934,18 @@ class BrowserPool:
                         None,
                     )
                     if matching_warm is not None:
-                        if self._handle_alive(matching_warm):
+                        warm_handle = self._handles.get(matching_warm.slot_id)
+                        # ADV-AC-001: never warm-reuse a previously-attached user Chrome.
+                        if warm_handle is not None and bool(
+                            getattr(warm_handle, "external", False)
+                        ):
+                            port, h = self._reserve_starting_locked(
+                                matching_warm, agent_id, space_id
+                            )
+                            if h is not None:
+                                pending_stops.append(h)
+                            launch_job = (matching_warm.slot_id, port)
+                        elif self._handle_alive(matching_warm):
                             early_result = self._attach_lease(
                                 matching_warm,
                                 agent_id,
@@ -2908,7 +2959,7 @@ class BrowserPool:
         with self._lock:
             known: set[str] = set(self._space_metadata.keys()) | set(
                 self._space_allowed_domains.keys()
-            ) | set(self._space_signed_in.keys())
+            ) | set(self._space_signed_in.keys()) | set(self._space_tiers.keys())
             for slot in self._slots:
                 if slot.space_id:
                     known.add(slot.space_id)

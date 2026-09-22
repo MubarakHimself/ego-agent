@@ -172,3 +172,149 @@ def test_cli_tier_flags():
     )
     assert a.tier == "attach"
     assert a.cdp_port == 9222
+
+
+def test_adv_ac001_release_after_attach_to_ephemeral_never_warms_user_chrome(
+    pool: BrowserPool, monkeypatch: pytest.MonkeyPatch
+):
+    """Re-lease attach→ephemeral fully detaches; release must not FREE_WARM user CDP."""
+    monkeypatch.setenv("SLIPSTREAM_ALLOW_ATTACH", "1")
+    # W>=1 so warm would be possible if the bug returned.
+    pool.config.W = 2
+
+    first = pool.lease(
+        "agent-a",
+        "space-flip",
+        tier="attach",
+        cdp_url="http://127.0.0.1:9555",
+    )
+    assert first["tier"] == TIER_ATTACH
+    assert pool._handles[first["slot_id"]].external is True
+
+    # Same agent re-leases without attach → must spawn pool Chrome, not keep user CDP.
+    second = pool.lease("agent-a", "space-flip", tier="ephemeral")
+    assert second["tier"] == TIER_EPHEMERAL
+    assert "risk_label" not in second
+    handle = pool._handles[second["slot_id"]]
+    assert handle.external is False
+    assert handle.mocked is True
+    lease_obj = pool._leases[second["lease_id"]]
+    assert lease_obj.external_attach is False
+
+    rel = pool.release(second["lease_id"])
+    assert rel["released"] is True
+    # Even with W room, must not warm a slot that previously held attach origin
+    # after the flip path (fresh mock handle is owned — warm OK for owned).
+    # Critical: agent-b without ALLOW_ATTACH must not inherit user CDP.
+    monkeypatch.delenv("SLIPSTREAM_ALLOW_ATTACH", raising=False)
+    third = pool.lease("agent-b", "space-flip")
+    assert third["tier"] == TIER_EPHEMERAL
+    h3 = pool._handles[third["slot_id"]]
+    assert h3.external is False
+    assert "9555" not in (h3.cdp_http_url or "")
+
+
+def test_adv_ac001_never_warm_external_handle_on_release(
+    pool: BrowserPool, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("SLIPSTREAM_ALLOW_ATTACH", "1")
+    pool.config.W = 5
+    lease = pool.lease(
+        "agent-a",
+        "space-nowarm",
+        tier="attach",
+        cdp_port=9666,
+    )
+    # Corrupt lease flag but leave handle.external — defense in depth.
+    pool._leases[lease["lease_id"]].external_attach = False
+    pool._leases[lease["lease_id"]].tier = TIER_EPHEMERAL
+    rel = pool.release(lease["lease_id"])
+    assert rel.get("kept_warm") is False
+    slot = pool._slots[lease["slot_id"]]
+    assert slot.status == SlotStatus.FREE_COLD
+    assert pool._handles.get(lease["slot_id"]) is None
+
+
+def test_adv_ac002_ephemeral_to_attach_stops_owned_chromium(
+    pool: BrowserPool, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("SLIPSTREAM_ALLOW_ATTACH", "1")
+    first = pool.lease("agent-a", "space-orphan", tier="ephemeral")
+    slot_id = first["slot_id"]
+    owned = pool._handles[slot_id]
+    assert owned.external is False
+    assert owned.mocked is True
+
+    stops: list = []
+    real_stop = pool.launcher.stop
+
+    def tracking_stop(h, *a, **k):
+        stops.append(h)
+        return real_stop(h, *a, **k)
+
+    monkeypatch.setattr(pool.launcher, "stop", tracking_stop)
+
+    second = pool.lease(
+        "agent-a",
+        "space-orphan",
+        tier="attach",
+        cdp_url="http://127.0.0.1:9777",
+    )
+    assert second["tier"] == TIER_ATTACH
+    new_handle = pool._handles[second["slot_id"]]
+    assert new_handle.external is True
+    assert new_handle.cdp_http_url == "http://127.0.0.1:9777"
+    # Owned tree must have been stopped (not orphaned via external no-op).
+    assert any(h is owned or (not getattr(h, "external", False)) for h in stops)
+    assert owned in stops
+    assert pool._slots[second["slot_id"]].chromium_pid is None
+
+
+def test_adv_ac003_refuse_unspecified_and_link_local(monkeypatch: pytest.MonkeyPatch):
+    with pytest.raises(TierError):
+        resolve_attach_cdp(cdp_url="http://0.0.0.0:9222")
+    with pytest.raises(TierError):
+        resolve_attach_cdp(cdp_url="http://169.254.169.254:80")
+    monkeypatch.setenv("SLIPSTREAM_ATTACH_ALLOW_HOSTS", "169.254.169.254")
+    with pytest.raises(TierError):
+        resolve_attach_cdp(cdp_url="http://169.254.169.254:80")
+
+
+def test_adv_ac003_probe_refuses_redirect(monkeypatch: pytest.MonkeyPatch):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+
+    from slipstream.cdp_http import wait_attach_cdp_ready
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(302)
+            self.send_header("Location", "http://169.254.169.254/latest/meta-data/")
+            self.end_headers()
+
+        def log_message(self, *args):  # noqa: ARG002
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises((TimeoutError, Exception)):
+            wait_attach_cdp_ready(f"http://127.0.0.1:{port}", timeout=1.5)
+    finally:
+        server.shutdown()
+
+
+def test_adv_ac004_zero_zero_not_loopback():
+    with pytest.raises(TierError):
+        resolve_attach_cdp(cdp_url="http://0.0.0.0:9222")
+
+
+def test_adv_ac005_list_spaces_includes_tier_only(pool: BrowserPool):
+    pool.set_space_metadata("tier-only-space", tier="named")
+    listed = pool.list_spaces()
+    ids = {s["space_id"] for s in listed["spaces"]}
+    assert "tier-only-space" in ids
+    row = next(s for s in listed["spaces"] if s["space_id"] == "tier-only-space")
+    assert row["tier"] == TIER_NAMED
