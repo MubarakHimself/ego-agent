@@ -8,6 +8,33 @@ Personal multi-agent **CDP browser pool** (research → build).
 
 **Not** a fork of CitroLabs ego lite. Inspired by public MIT harness patterns and peer CDP stacks. Original code only.
 
+## Out-of-box (one path)
+
+Clean venv → install → doctor (live) **or** chrome-less demo. **No MCP.**
+
+```bash
+git clone https://github.com/MubarakHimself/slipstream.git && cd slipstream
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+
+# Live preflight — needs Chrome (or SLIPSTREAM_CHROME).
+# Bare `slipstream doctor` (mock unset): missing Chrome → FAIL exit 1.
+# WARN/SKIP (e.g. pool not up yet) still allow exit 0 when Chrome is present.
+slipstream doctor
+
+# Chrome-less path (do not use bare doctor):
+make demo
+# or: SLIPSTREAM_MOCK=1 slipstream doctor   # chrome missing → WARN, exit 0
+#     SLIPSTREAM_MOCK=1 slipstream serve --port 8755
+# equivalent: SLIPSTREAM_MOCK=1 python scripts/oob_smoke.py
+
+# Live serve (after Chrome + doctor PASS):
+# unset SLIPSTREAM_MOCK
+# slipstream serve --port 8755
+```
+
+Live Chrome: unset `SLIPSTREAM_MOCK`, install `google-chrome` / `chromium` (or set `SLIPSTREAM_CHROME`), then `slipstream serve --port 8755`. Fuller notes: [`docs/install.md`](docs/install.md).
+
 ## Status
 
 Architecture locked — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and Firstmate report `ego-arch-pool-001`.
@@ -42,6 +69,7 @@ slipstream/          # Pool service package
 skills/
   slipstream/SKILL.md  # Agent skill (alias: slipstream-browser); lifecycle + doctor
 scripts/
+  oob_smoke.py       # Thin mock OOB smoke (doctor + serve + lease cycle)
   bench_pool.py      # LIVE + MOCK pool speed benchmark
   skylos_local.sh    # Skylos quality gate (also: run_skylos.sh)
   run_vulture.sh     # Vulture dead-code gate
@@ -50,30 +78,19 @@ benches/             # Sample benchmark outputs (committed samples)
 docs/
   ARCHITECTURE.md    # Captain lock
   POOL_API.md        # HTTP endpoints (+ CLI as another client)
-  install.md         # Agent-pasteable install + compose /watch
+  install.md         # OOB install: Chrome, SLIPSTREAM_*, mock vs live, /watch
 data/spaces/         # Runtime Space profiles (gitignored)
 ```
 
 **Space path convention:** `{spaces_root}/{space_id}/` → Chromium `--user-data-dir`.
 
-## Quick start
+## Quick start (detail)
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"   # installs console script `slipstream`; pytest for tests
-
-# Start pool — mock mode (no Chrome required)
-SLIPSTREAM_MOCK=1 slipstream serve --port 8755
-# equivalent: SLIPSTREAM_MOCK=1 python -m slipstream serve --port 8755
-
-# Real Chrome (system google-chrome / chromium; or SLIPSTREAM_CHROME=/usr/bin/google-chrome)
-slipstream serve --port 8755
-```
+Same path as **Out-of-box** above. `pip install -e ".[dev]"` installs the `slipstream` console script (also: `python -m slipstream …`).
 
 Base URL: `http://127.0.0.1:8755` — see [`docs/POOL_API.md`](docs/POOL_API.md).
 Agent skill: [`skills/slipstream/SKILL.md`](skills/slipstream/SKILL.md).
-Pasteable install (incl. compose `/watch`): [`docs/install.md`](docs/install.md).
+Full install (Chrome / `SLIPSTREAM_*` / mock vs live / compose `/watch`): [`docs/install.md`](docs/install.md).
 
 ### Agent CLI (against a running pool)
 

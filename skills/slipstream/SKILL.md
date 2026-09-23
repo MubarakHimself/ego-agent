@@ -61,9 +61,11 @@ slipstream doctor --json
 `doctor` checks: Chrome binary, ephemeral CDP probe (`/json/version`), pool
 `GET /healthz`, Spaces root writable, this skill file present, and optional
 composed `/watch` (`watch_compose` — **PASS** if found at a known path,
-**WARN** if missing; never fails; never vendored). Also:
+**WARN** if missing; never fails; never vendored). Under `SLIPSTREAM_MOCK=1`,
+missing Chrome is **WARN** (not FAIL) so mock OOB still exits 0. Also:
 `slipstream watch-status` (thin compose-only status). Exit 0 if no failures
-(warnings/skips allowed). Pasteable agent install: [`docs/install.md`](../../docs/install.md).
+(warnings/skips allowed). One-shot mock smoke: `make demo` /
+`scripts/oob_smoke.py`. Pasteable install: [`docs/install.md`](../../docs/install.md).
 
 **Versions:** package `slipstream.__version__` is `0.1.0`. Skill
 `metadata.version` (`0.2.0`) is the skill-doc revision and may differ —
