@@ -10,27 +10,27 @@ Personal multi-agent **CDP browser pool** (research → build).
 
 ## Out-of-box (one path)
 
-Clean venv → install → doctor → mock serve (or live Chrome). **No MCP.**
+Clean venv → install → doctor (live) **or** chrome-less demo. **No MCP.**
 
 ```bash
 git clone https://github.com/MubarakHimself/slipstream.git && cd slipstream
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
-# Preflight (exit 0 = PASS; WARN/SKIP ok — e.g. pool not up yet)
+# Live preflight — needs Chrome (or SLIPSTREAM_CHROME).
+# Bare `slipstream doctor` (mock unset): missing Chrome → FAIL exit 1.
+# WARN/SKIP (e.g. pool not up yet) still allow exit 0 when Chrome is present.
 slipstream doctor
 
-# Mock demo — no Chrome required
-SLIPSTREAM_MOCK=1 slipstream serve --port 8755
-# other shell:
-export SLIPSTREAM_URL=http://127.0.0.1:8755
-slipstream doctor
-slipstream lease --agent-id a1 --space-id demo
-# … heartbeat / release …
-
-# Or one-shot mock smoke (doctor + serve + lease/heartbeat/release):
+# Chrome-less path (do not use bare doctor):
 make demo
+# or: SLIPSTREAM_MOCK=1 slipstream doctor   # chrome missing → WARN, exit 0
+#     SLIPSTREAM_MOCK=1 slipstream serve --port 8755
 # equivalent: SLIPSTREAM_MOCK=1 python scripts/oob_smoke.py
+
+# Live serve (after Chrome + doctor PASS):
+# unset SLIPSTREAM_MOCK
+# slipstream serve --port 8755
 ```
 
 Live Chrome: unset `SLIPSTREAM_MOCK`, install `google-chrome` / `chromium` (or set `SLIPSTREAM_CHROME`), then `slipstream serve --port 8755`. Fuller notes: [`docs/install.md`](docs/install.md).

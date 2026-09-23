@@ -24,14 +24,18 @@ cd slipstream
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"          # console script: slipstream
 
-slipstream doctor                # exit 0 = PASS (WARN/SKIP ok)
-# Mock demo (no Chrome):
-SLIPSTREAM_MOCK=1 slipstream serve --port 8755
-# Live Chrome:
-# unset SLIPSTREAM_MOCK; slipstream serve --port 8755
+# Live preflight — needs Chrome (or SLIPSTREAM_CHROME).
+# Bare `slipstream doctor` (mock unset): missing Chrome → FAIL exit 1.
+# WARN/SKIP (e.g. pool not up) still allow exit 0 when Chrome is present.
+slipstream doctor
 
-# One-shot mock smoke (doctor + brief lease/heartbeat/release):
+# Chrome-less path (do not use bare doctor):
 make demo                        # or: SLIPSTREAM_MOCK=1 python scripts/oob_smoke.py
+# or: SLIPSTREAM_MOCK=1 slipstream doctor   # chrome missing → WARN, exit 0
+#     SLIPSTREAM_MOCK=1 slipstream serve --port 8755
+
+# Live Chrome serve (after doctor PASS):
+# unset SLIPSTREAM_MOCK; slipstream serve --port 8755
 ```
 
 **No MCP server** — HTTP JSON API + `slipstream` CLI + skill doc only.
