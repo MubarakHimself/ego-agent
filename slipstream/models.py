@@ -88,6 +88,10 @@ class Lease:
     risk_label: str | None = None
     # True when lease bound to external Chrome (release must not kill it).
     external_attach: bool = False
+    # Cloud overflow (remote CDP via provider); same lease API surface.
+    overflow: bool = False
+    provider: str | None = None
+    remote_session_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         from slipstream.actions import expose_raw_cdp
@@ -106,6 +110,10 @@ class Lease:
             "keep_alive": bool(self.keep_alive),
             "tier": self.tier,
         }
+        if self.overflow:
+            out["overflow"] = True
+            if self.provider:
+                out["provider"] = self.provider
         if self.risk_label:
             out["risk_label"] = self.risk_label
         if expose_raw_cdp():

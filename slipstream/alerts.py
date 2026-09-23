@@ -6,6 +6,10 @@ Captain chat gets a one-liner + Watch/Take-over link fields; harness gets JSON.
 
 from __future__ import annotations
 
+_K_DETAIL = "detail"
+
+_K_REASON = "reason"
+
 _DEFAULT_POOL_BASE = "http://127.0.0.1:8755"
 
 import re
@@ -345,7 +349,7 @@ def parse_alert_request(body: dict[str, Any]) -> dict[str, Any]:
             f"event must be one of {sorted(SHIP_EVENTS)}; got {event!r}"
         )
 
-    reason = body.get("reason")
+    reason = body.get(_K_REASON)
     if event == EVENT_NEED_HUMAN:
         if reason is None:
             reason = "other"
@@ -360,7 +364,7 @@ def parse_alert_request(body: dict[str, Any]) -> dict[str, Any]:
                 f"reason must be one of {sorted(REASONS)}; got {reason!r}"
             )
 
-    detail = body.get("detail")
+    detail = body.get(_K_DETAIL)
     if detail is None:
         detail = ""
     if not isinstance(detail, str):
@@ -391,8 +395,8 @@ def parse_alert_request(body: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "event": event,
-        "reason": reason,
-        "detail": detail,
+        _K_REASON: reason,
+        _K_DETAIL: detail,
         "task_id": task_id,
         "ttl_s": ttl_s,
         "outcome": outcome,
@@ -438,8 +442,8 @@ def build_alert_payload(
         "lease_id": lease_id,
         "space_id": space_id,
         "task_id": parsed.get("task_id"),
-        "reason": parsed.get("reason"),
-        "detail": parsed.get("detail") or "",
+        _K_REASON: parsed.get(_K_REASON),
+        _K_DETAIL: parsed.get(_K_DETAIL) or "",
         "status": status,
         "watch_url": watch,
         "ttl_s": parsed["ttl_s"],
@@ -467,8 +471,8 @@ def build_harness_envelope(
     """Harness-facing JSON so the caller pauses / awaits / continues."""
     captain = format_captain_one_liner(
         event=payload["event"],
-        reason=payload.get("reason"),
-        detail=payload.get("detail"),
+        reason=payload.get(_K_REASON),
+        detail=payload.get(_K_DETAIL),
         outcome=payload.get("outcome"),
         watch_url=payload["watch_url"],
         takeover_url=takeover_url,

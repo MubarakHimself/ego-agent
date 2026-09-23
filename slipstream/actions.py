@@ -34,6 +34,8 @@ from typing import Any
 
 from slipstream.alerts import AlertValidationError, reject_secret_fields, scrub_text
 
+_ERR_BODY_MUST_JSON = "body must be a JSON object"
+
 # Nairobi EAT timestamps for expires_at (box-local convention).
 _EAT = timezone(timedelta(hours=3), name="EAT")
 
@@ -108,7 +110,7 @@ def _iso_eat(ts: float) -> str:
 def parse_action_request(body: dict[str, Any]) -> dict[str, Any]:
     """Validate gated-act body; return {category, summary}. Never keeps secrets."""
     if not isinstance(body, dict):
-        raise ActionValidationError("body must be a JSON object")
+        raise ActionValidationError(_ERR_BODY_MUST_JSON)
     try:
         reject_secret_fields(body)
     except AlertValidationError as e:
@@ -153,7 +155,7 @@ def parse_action_request(body: dict[str, Any]) -> dict[str, Any]:
 def parse_confirmation_action(body: dict[str, Any]) -> str:
     """Validate confirm|deny body; return normalized action string."""
     if not isinstance(body, dict):
-        raise ActionValidationError("body must be a JSON object")
+        raise ActionValidationError(_ERR_BODY_MUST_JSON)
     try:
         reject_secret_fields(body)
     except AlertValidationError as e:
@@ -288,7 +290,7 @@ class ConfirmationStore:
 def parse_eval_request(body: dict[str, Any]) -> dict[str, Any]:
     """Validate Runtime.evaluate body; return {expression}. Never keeps secrets."""
     if not isinstance(body, dict):
-        raise ActionValidationError("body must be a JSON object")
+        raise ActionValidationError(_ERR_BODY_MUST_JSON)
     try:
         reject_secret_fields(body)
     except AlertValidationError as e:

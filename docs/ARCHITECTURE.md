@@ -9,7 +9,7 @@ Shared **Browser Pool Manager**:
 - Agents **lease / heartbeat / release** — never own a permanent browser PID
 - **Space** = dedicated Chromium `user-data-dir`
 - Prefer **one process tree per slot** (not 16 always-on; not one global multi-context browser)
-- Local CDP first; cloud overflow later behind the same lease API
+- Local CDP first; **cloud overflow** behind the same lease API (`SLIPSTREAM_CLOUD_OVERFLOW=1` + mock provider; `SLIPSTREAM_MAX_OVERFLOW` default=K; real providers later)
 - Warm pool **W=1**
 - Soft-evict idle ~**5 min** (lease must heartbeat; LLM-think keeps heartbeat)
 - Attach-to-real-Chrome = **stretch**, not MVP
