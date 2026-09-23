@@ -139,9 +139,11 @@ from slipstream.tiers import (
     cloud_overflow_always,
     cloud_overflow_enabled,
     cloud_provider_name,
+    max_cloud_overflow,
     parse_tier,
     resolve_attach_cdp,
     risk_label_for_tier,
+    validate_cloud_session_cdp,
 )
 from slipstream.signed_in import (
     SignedInValidationError,
@@ -193,6 +195,10 @@ from slipstream.actions import (
 
 class PoolFullError(Exception):
     """Raised when live slots == K and no free slot can be allocated."""
+
+
+class OverflowFullError(PoolFullError):
+    """Raised when overflow slots hit SLIPSTREAM_MAX_OVERFLOW (maps to 503 overflow_full)."""
 
 
 class LeaseNotFoundError(Exception):
@@ -325,6 +331,7 @@ class BrowserPool:
             }
             if cloud_overflow_enabled():
                 out["cloud_provider"] = cloud_provider_name()
+                out["max_overflow"] = max_cloud_overflow(self.config.K)
             # ADV-PL-001-BYPASS-RAW-CDP-PORT: base+slot_id reconstructs CDP URL.
             if expose_raw_cdp():
                 out["cdp_base_port"] = self.config.cdp_base_port
@@ -658,8 +665,22 @@ class BrowserPool:
                     f"(agent_id={s.agent_id!r}, status={s.status.value})"
                 )
 
+    def _count_overflow_slots_locked(self) -> int:
+        """Active overflow slots (slot_id >= K). Caller holds lock."""
+        k = self.config.K
+        return sum(1 for s in self._slots if s.slot_id >= k)
+
     def _alloc_overflow_slot_locked(self, agent_id: str, space_id: str) -> SlotState:
-        """Append a STARTING overflow slot above local K. Caller holds lock."""
+        """Append a STARTING overflow slot above local K. Caller holds lock.
+
+        Enforces SLIPSTREAM_MAX_OVERFLOW (default = K). Raises OverflowFullError.
+        """
+        cap = max_cloud_overflow(self.config.K)
+        if self._count_overflow_slots_locked() >= cap:
+            raise OverflowFullError(
+                f"overflow at max_overflow={cap} "
+                f"(SLIPSTREAM_MAX_OVERFLOW; default=K={self.config.K})"
+            )
         next_id = max((s.slot_id for s in self._slots), default=-1) + 1
         if next_id < self.config.K:
             next_id = self.config.K
@@ -725,6 +746,7 @@ class BrowserPool:
                 if h is not None:
                     pending_stops.append(h)
                 break
+            slot.last_heartbeat = now
             return (
                 self._refresh_existing_lease_locked(
                     existing, space_id, meta_override, domains_override
@@ -736,7 +758,7 @@ class BrowserPool:
             self._assert_space_free_locked(space_id)
             slot = self._alloc_overflow_slot_locked(agent_id, space_id)
             return None, slot.slot_id, None
-        except SpaceInUseError as exc:
+        except (SpaceInUseError, OverflowFullError) as exc:
             return None, None, exc
 
     def _bind_cloud_session_locked(
@@ -749,29 +771,36 @@ class BrowserPool:
         *,
         ctx: dict[str, Any],
     ) -> dict[str, Any]:
-        """Under lock: attach overflow lease to reserved slot. ``ctx`` holds lease opts."""
+        """Under lock: bind overflow lease to reserved slot. ``ctx`` holds lease opts.
+
+        ADV-CO-001: overflow must NOT set external_attach (attach-tier only).
+        Never-warm uses overflow=True + handle.external. ADV-CO-002: validate CDP URLs.
+        """
+        # URLs already validated in _validated_remote_or_rollback (ADV-CO-002).
+        http_url = remote.cdp_http_url
+        ws_url = remote.cdp_ws_url
         self._handles[slot.slot_id] = handle
         result = self._attach_lease(
             slot,
             agent_id,
             space_id,
             ctx.get("ttl_seconds"),
-            cdp_http_url=remote.cdp_http_url,
-            cdp_ws_url=remote.cdp_ws_url,
+            cdp_http_url=http_url,
+            cdp_ws_url=ws_url,
             user_metadata=ctx.get("meta_override"),
             allowed_domains=ctx.get("domains_override"),
             keep_alive=bool(ctx.get("ka")),
             tier=str(ctx.get("resolved_tier") or TIER_EPHEMERAL),
-            external_attach=True,
+            external_attach=False,
             overflow=True,
             provider=remote.provider or ctx.get("provider_name"),
             remote_session_id=remote.session_id,
         )
-        self._prepare_lease_downloads(result["lease_id"], remote.cdp_http_url)
+        self._prepare_lease_downloads(result["lease_id"], http_url)
         slot.chromium_pid = None
         slot.cdp_port = None
-        slot.cdp_http_url = remote.cdp_http_url
-        slot.cdp_ws_url = remote.cdp_ws_url
+        slot.cdp_http_url = http_url
+        slot.cdp_ws_url = ws_url
         return result
 
     def _remote_handle(self, space_id: str, remote: Any) -> LaunchHandle:
@@ -793,6 +822,26 @@ class BrowserPool:
             with self._lock:
                 self._drop_overflow_slot_locked(slot_id)
             raise
+
+    def _validated_remote_or_rollback(self, provider: Any, remote: Any, slot_id: int):
+        """ADV-CO-002: validate provider CDP URLs; rollback slot+session on failure."""
+        try:
+            http_url, ws_url = validate_cloud_session_cdp(
+                remote.cdp_http_url, remote.cdp_ws_url
+            )
+        except Exception:
+            try:
+                provider.release_session(remote.session_id)
+            finally:
+                with self._lock:
+                    self._drop_overflow_slot_locked(slot_id)
+            raise
+        return type(remote)(
+            session_id=remote.session_id,
+            cdp_http_url=http_url,
+            cdp_ws_url=ws_url,
+            provider=remote.provider,
+        )
 
     def _lease_cloud_overflow(
         self,
@@ -824,6 +873,7 @@ class BrowserPool:
             return early
         assert slot_id is not None
         remote = self._create_remote_or_rollback(provider, agent_id, space_id, slot_id)
+        remote = self._validated_remote_or_rollback(provider, remote, slot_id)
         handle = self._remote_handle(space_id, remote)
         ctx = {
             "ttl_seconds": ttl_seconds, "meta_override": meta_override,
@@ -1157,15 +1207,23 @@ class BrowserPool:
                             space_id, existing.allowed_domains_override
                         )
                         self._sync_lease_signed_in(existing)
+                        # ADV-CO-001/004: overflow re-lease refreshes in place
+                        # (same lease_id / remote_session_id). Do not detach+rebind.
+                        if bool(getattr(existing, _S_OVERFLOW, False)):
+                            if ka_explicit:
+                                existing.keep_alive = ka
+                            early_result = self._refresh_existing_lease_locked(
+                                existing, space_id, meta_override, domains_override
+                            )
+                            break
                         # ADV-AC-001: leaving attach must fully detach user CDP
                         # (never stamp ephemeral/named onto an external handle).
-                        handle_now = self._handles.get(slot.slot_id)
+                        # ADV-CO-001: attach tier / external_attach only — not
+                        # handle.external alone (overflow also sets external for
+                        # never-warm / no-stop).
                         leaving_attach = bool(
                             getattr(existing, "external_attach", False)
-                        ) or (
-                            handle_now is not None
-                            and bool(getattr(handle_now, "external", False))
-                        )
+                        ) or getattr(existing, "tier", None) == TIER_ATTACH
                         if leaving_attach:
                             h = self._detach_lease_locked(lid, allow_warm=False)
                             if h is not None:

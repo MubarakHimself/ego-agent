@@ -25,7 +25,7 @@ MVP is always **isolated** mode (one process tree per Space). There is no `mode`
 | `cdp_base_port` | 9222 | Operator-internal Chromium bind; **not** on public status/lease unless `SLIPSTREAM_EXPOSE_RAW_CDP=1`. Do **not** derive CDP from public JSON or `slot_id` (no `9222+slot_id` recipe) |
 | `host` / `port` | `127.0.0.1` / `8755` | API bind |
 
-Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_ARTIFACTS_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm + unused grant seconds, default 60), `SLIPSTREAM_EXPOSE_RAW_CDP=1` (include cdp_* URLs **and** `cdp_port`/`cdp_base_port`/`chromium_pid` on lease/status JSON; raw CDP nav/eval honor-system — do not derive CDP from default public JSON), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted unless Space/lease lockdown applies), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers), `SLIPSTREAM_KEEPALIVE_TTL` (override `keep_alive_ttl_seconds`; clamped ≤ hard TTL), `SLIPSTREAM_CLOUD_OVERFLOW=1|always` (default off; overflow behind same lease API), `SLIPSTREAM_CLOUD_PROVIDER=mock` (only mock this PR). **No** server env defaults `keep_alive` true on omit — only explicit body/`--keep-alive`.
+Env overrides: `SLIPSTREAM_MOCK=1`, `SLIPSTREAM_CHROME`, `SLIPSTREAM_SPACES_ROOT`, `SLIPSTREAM_VAULT_ROOT` / `VAULT_ROOT`, `SLIPSTREAM_ARTIFACTS_ROOT`, `SLIPSTREAM_K`, `SLIPSTREAM_W`, `SLIPSTREAM_PORT`, `SLIPSTREAM_HEADLESS=0`, `SLIPSTREAM_CONFIRM_TTL` (pending confirm + unused grant seconds, default 60), `SLIPSTREAM_EXPOSE_RAW_CDP=1` (include cdp_* URLs **and** `cdp_port`/`cdp_base_port`/`chromium_pid` on lease/status JSON; raw CDP nav/eval honor-system — do not derive CDP from default public JSON), `SLIPSTREAM_ALLOWED_DOMAINS` (comma/space-separated top-frame host patterns; empty/unset = unrestricted unless Space/lease lockdown applies), `SLIPSTREAM_CONTENT_BOUNDARIES=1` (wrap page-derived skill/CLI echoes in nonce markers), `SLIPSTREAM_KEEPALIVE_TTL` (override `keep_alive_ttl_seconds`; clamped ≤ hard TTL), `SLIPSTREAM_CLOUD_OVERFLOW=1|always` (default off; overflow behind same lease API), `SLIPSTREAM_CLOUD_PROVIDER=mock` (only mock this PR), `SLIPSTREAM_MAX_OVERFLOW` (cap concurrent overflow slots; default = pool K). **No** server env defaults `keep_alive` true on omit — only explicit body/`--keep-alive`.
 
 ## Endpoints
 
@@ -64,7 +64,7 @@ Omit `keep_alive` on create/reconnect (defaults **false**). Do **not** send `"ke
 
 Optional `ttl_seconds` may be shorter than `lease_hard_ttl_seconds`; requests above the ceiling are **clamped** to `lease_hard_ttl_seconds` (never reject solely for being too long).
 
-→ `503` when pool at hard K (`{"error":"pool_full"}`) **and** cloud overflow is off, or Chromium launch fails (`{"error":"launch_failed"}`, including `OSError` / other launch exceptions). With `SLIPSTREAM_CLOUD_OVERFLOW=1`, pool-full creates an overflow lease instead of 503.
+→ `503` when pool at hard K (`{"error":"pool_full"}`) **and** cloud overflow is off, or Chromium launch fails (`{"error":"launch_failed"}`, including `OSError` / other launch exceptions). With `SLIPSTREAM_CLOUD_OVERFLOW=1`, pool-full creates an overflow lease instead of 503 (until `SLIPSTREAM_MAX_OVERFLOW` is hit → `overflow_full`).
 
 **Warm reuse:** if a `FREE_WARM` slot already holds the requested `space_id` **and** its process is still alive, the existing process is reused (no stop/relaunch). A dead warm process is stopped and cold-started. A warm slot bound to a different Space is stopped and relaunched.
 
@@ -119,8 +119,9 @@ Thin **remote CDP overflow** when the local pool is at hard K (Browserbase-class
 | `SLIPSTREAM_CLOUD_OVERFLOW=always` | Skip local Chromium; every non-attach lease is overflow |
 | (unset / `0`) | **Default.** Local-only — pool full → HTTP **503** `pool_full` |
 | `SLIPSTREAM_CLOUD_PROVIDER=mock` | Only supported provider in this PR (default). Real providers later |
+| `SLIPSTREAM_MAX_OVERFLOW` | Cap concurrent overflow slots (default = local K). Above cap → HTTP **503** `overflow_full` |
 
-Overflow leases use the **same** `POST/DELETE /v1/leases` + heartbeat surface. Status / list / sessions include `overflow: true` and `provider: "mock"`. Release calls `provider.release_session` (mock records it); local Chromium release path unchanged. Overflow does **not** consume a local K Chromium slot.
+Overflow leases use the **same** `POST/DELETE /v1/leases` + heartbeat surface. Status / list / sessions include `overflow: true` and `provider: "mock"`. Release calls `provider.release_session` (mock records it); local Chromium release path unchanged. Overflow does **not** consume a local K Chromium slot. Idempotent re-lease of an overflow lease refreshes in place (same `lease_id` / remote session) — it does **not** flip to local Chromium. Provider CDP URLs are validated at bind (http/https + allowlisted peers; refuse `file:`/`javascript:`/`data:`).
 
 **Decision B:** raw `cdp_http_url` / `cdp_ws_url` still omitted unless `SLIPSTREAM_EXPOSE_RAW_CDP=1`.
 

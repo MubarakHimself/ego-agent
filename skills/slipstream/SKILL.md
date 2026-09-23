@@ -502,7 +502,9 @@ slipstream sessions --json           # includes watch_url when need_human minted
   (default). Wait/retry or release another lease; do not spawn your own browser.
 - **Cloud overflow (optional):** `SLIPSTREAM_CLOUD_OVERFLOW=1` → on pool full,
   lease a **mock** remote CDP session behind the **same** `/v1/leases` API
-  (`overflow=true`, `provider=mock`). `=always` skips local Chromium. **No paid
+  (`overflow=true`, `provider=mock`). `=always` skips local Chromium.
+  Cap via `SLIPSTREAM_MAX_OVERFLOW` (default = K); above cap → **503**
+  `overflow_full`. Re-lease keeps the same overflow session. **No paid
   keys / no real Browserbase** in this release — real providers later.
 - **Agents never own a permanent browser PID** — only leases.
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import abc
 import ipaddress
 import os
+from collections import deque
 import socket
 import threading
 import urllib.parse
@@ -199,6 +200,55 @@ def resolve_attach_cdp(
     return http_url.rstrip("/"), port
 
 
+
+_HTTP_SCHEMES = frozenset({"http", "https"})
+_WS_SCHEMES = frozenset({"ws", "wss"})
+
+
+def _provider_cdp_parse(url: str, *, what: str, allowed: frozenset[str]) -> urllib.parse.ParseResult:
+    """Parse + scheme/host policy for one provider CDP URL (shared with attach peers)."""
+    if not isinstance(url, str) or not url.strip():
+        raise CloudProviderError(f"{what} must be a non-empty string")
+    parsed = urllib.parse.urlparse(url.strip())
+    scheme = (parsed.scheme or "").lower()
+    if scheme in _REFUSED_SCHEMES or scheme not in allowed:
+        raise CloudProviderError(
+            f"{what} scheme not allowed (got {scheme!r}; use {'/'.join(sorted(allowed))})"
+        )
+    host = (parsed.hostname or "").lower().strip("[]")
+    if not host:
+        raise CloudProviderError(f"{what} must include a host")
+    try:
+        assert_attach_peer_allowed(host)
+    except TierError as exc:
+        raise CloudProviderError(str(exc)) from exc
+    return parsed
+
+
+def validate_cloud_session_cdp(
+    cdp_http_url: str,
+    cdp_ws_url: str | None = None,
+) -> tuple[str, str | None]:
+    """Bind-time validation for provider CloudSession CDP endpoints.
+
+    Same scheme/host/IP policy as attach (loopback or SLIPSTREAM_ATTACH_ALLOW_HOSTS).
+    Refuses file:/javascript:/data:. Providers must not return attacker-controlled URLs.
+    Returns normalized (http_url, ws_url|None).
+    """
+    parsed = _provider_cdp_parse(
+        cdp_http_url, what="CloudSession.cdp_http_url", allowed=_HTTP_SCHEMES
+    )
+    http_url = urllib.parse.urlunparse(
+        (parsed.scheme, parsed.netloc, "", "", "", "")
+    ).rstrip("/")
+    ws_out: str | None = None
+    if cdp_ws_url is not None and str(cdp_ws_url).strip():
+        _provider_cdp_parse(
+            str(cdp_ws_url), what="CloudSession.cdp_ws_url", allowed=_WS_SCHEMES
+        )
+        ws_out = str(cdp_ws_url).strip()
+    return http_url, ws_out
+
 def risk_label_for_tier(tier: str) -> str | None:
     if tier == TIER_ATTACH:
         return ATTACH_RISK_LABEL
@@ -276,6 +326,24 @@ def cloud_overflow_always() -> bool:
     """True when every non-attach lease should use the cloud provider."""
     return cloud_overflow_mode() == _MODE_ALWAYS
 
+def max_cloud_overflow(pool_k: int) -> int:
+    """Cap on concurrent overflow slots (SLIPSTREAM_MAX_OVERFLOW; default = pool K)."""
+    raw = os.environ.get("SLIPSTREAM_MAX_OVERFLOW", "").strip()
+    if not raw:
+        return max(0, int(pool_k))
+    try:
+        n = int(raw)
+    except ValueError as exc:
+        raise CloudProviderError(
+            f"SLIPSTREAM_MAX_OVERFLOW must be an integer (got {raw!r})"
+        ) from exc
+    if n < 0:
+        raise CloudProviderError(
+            f"SLIPSTREAM_MAX_OVERFLOW must be >= 0 (got {n})"
+        )
+    return n
+
+
 
 def cloud_provider_name() -> str:
     """SLIPSTREAM_CLOUD_PROVIDER (default mock). Only mock supported this PR."""
@@ -290,11 +358,14 @@ class MockCloudProvider(RemoteCdpProvider):
 
     name = _PROVIDER_MOCK
 
+    # Bound ring buffers — avoid unbounded memory if overflow is left on.
+    _RING = 64
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._n = 0
-        self.created: list[CloudSession] = []
-        self.released: list[str] = []
+        self.created: deque[CloudSession] = deque(maxlen=self._RING)
+        self.released: deque[str] = deque(maxlen=self._RING)
         self._alive: set[str] = set()
 
     def create_session(

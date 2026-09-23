@@ -6,14 +6,17 @@ import pytest
 
 from slipstream.tiers import (
     CloudProviderError,
+    CloudSession,
     MockCloudProvider,
     build_cloud_provider,
     cloud_overflow_always,
     cloud_overflow_enabled,
     cloud_overflow_mode,
+    max_cloud_overflow,
+    validate_cloud_session_cdp,
 )
 from slipstream.config import PoolConfig
-from slipstream.pool import BrowserPool, PoolFullError
+from slipstream.pool import BrowserPool, OverflowFullError, PoolFullError
 
 
 @pytest.fixture
@@ -201,3 +204,137 @@ def test_always_overflow_skips_local(tmp_path, monkeypatch: pytest.MonkeyPatch):
         assert local_leased == []
     finally:
         pool.shutdown()
+
+
+def test_overflow_re_lease_keeps_remote_session(overflow_pool):
+    """ADV-CO-001/004: re-lease under =1 refreshes in place; no detach+rebind."""
+    pool, provider = overflow_pool
+    pool.lease("a0", "s0")
+    pool.lease("a1", "s1")
+    first = pool.lease("a2", "s2")
+    assert first["overflow"] is True
+    lid = first["lease_id"]
+    lease_obj = pool._leases[lid]
+    assert lease_obj.external_attach is False
+    assert lease_obj.overflow is True
+    remote_sid = lease_obj.remote_session_id
+    assert remote_sid
+    assert pool._handles[first["slot_id"]].external is True
+    assert len(provider.created) == 1
+    assert list(provider.released) == []
+
+    second = pool.lease("a2", "s2")
+    assert second["lease_id"] == lid
+    assert second["overflow"] is True
+    assert second["provider"] == "mock"
+    again = pool._leases[lid]
+    assert again.remote_session_id == remote_sid
+    assert again.external_attach is False
+    assert len(provider.created) == 1
+    assert list(provider.released) == []
+    assert pool.status()["leased"] == 3
+
+
+def test_validate_cloud_session_cdp_policy():
+    """ADV-CO-002: refuse file/javascript/data; allow mock loopback."""
+    http, ws = validate_cloud_session_cdp(
+        "http://127.0.0.1:19001", "ws://127.0.0.1:19001/devtools/browser/x"
+    )
+    assert http == "http://127.0.0.1:19001"
+    assert ws.startswith("ws://127.0.0.1:19001")
+    for bad in (
+        "file:///tmp/x",
+        "javascript:alert(1)",
+        "data:text/html,hi",
+        "http://evil.example:9222",
+        "http://169.254.169.254/",
+    ):
+        with pytest.raises(CloudProviderError):
+            validate_cloud_session_cdp(bad)
+    with pytest.raises(CloudProviderError):
+        validate_cloud_session_cdp(
+            "http://127.0.0.1:9", "javascript:alert(1)"
+        )
+
+
+def test_bind_rejects_evil_provider_urls(overflow_pool):
+    """ADV-CO-002: bind-time validation refuses bad provider CDP URLs."""
+    pool, provider = overflow_pool
+    pool.lease("a0", "s0")
+    pool.lease("a1", "s1")
+
+    def evil_create(*, agent_id, space_id, **kwargs):
+        return CloudSession(
+            session_id="evil-1",
+            cdp_http_url="file:///etc/passwd",
+            cdp_ws_url="ws://127.0.0.1:1/x",
+            provider="mock",
+        )
+
+    provider.create_session = evil_create  # type: ignore[method-assign]
+    with pytest.raises(CloudProviderError):
+        pool.lease("a2", "s2")
+    # Slot rolled back — still at local K.
+    assert all(s.slot_id < pool.config.K for s in pool._slots)
+
+
+def test_max_overflow_default_k_and_cap(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """ADV-CO-003: default max_overflow=K; above cap → OverflowFullError."""
+    monkeypatch.setenv("SLIPSTREAM_CLOUD_OVERFLOW", "1")
+    monkeypatch.delenv("SLIPSTREAM_MAX_OVERFLOW", raising=False)
+    assert max_cloud_overflow(2) == 2
+    provider = MockCloudProvider()
+    cfg = PoolConfig(
+        K=2,
+        W=0,
+        spaces_root=tmp_path / "spaces",
+        vault_root=tmp_path / "vault",
+        artifacts_root=tmp_path / "artifacts",
+        cdp_base_port=19522,
+        mock=True,
+    )
+    pool = BrowserPool(cfg, cloud_provider=provider)
+    try:
+        pool.lease("a0", "s0")
+        pool.lease("a1", "s1")
+        pool.lease("a2", "s2")  # overflow 1
+        pool.lease("a3", "s3")  # overflow 2 (=K)
+        st = pool.status()
+        assert st["max_overflow"] == 2
+        with pytest.raises(OverflowFullError):
+            pool.lease("a4", "s4")
+        assert len(provider.created) == 2
+    finally:
+        pool.shutdown()
+
+
+def test_max_overflow_env_override(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SLIPSTREAM_CLOUD_OVERFLOW", "always")
+    monkeypatch.setenv("SLIPSTREAM_MAX_OVERFLOW", "1")
+    provider = MockCloudProvider()
+    cfg = PoolConfig(
+        K=5,
+        W=0,
+        spaces_root=tmp_path / "spaces",
+        vault_root=tmp_path / "vault",
+        artifacts_root=tmp_path / "artifacts",
+        cdp_base_port=19622,
+        mock=True,
+    )
+    pool = BrowserPool(cfg, cloud_provider=provider)
+    try:
+        pool.lease("a0", "s0")
+        with pytest.raises(OverflowFullError):
+            pool.lease("a1", "s1")
+    finally:
+        pool.shutdown()
+
+
+def test_mock_created_released_rings_bounded():
+    """ADV-CO-003: mock created/released rings are bounded."""
+    p = MockCloudProvider()
+    for i in range(MockCloudProvider._RING + 20):
+        sess = p.create_session(agent_id="a", space_id=f"s{i}")
+        p.release_session(sess.session_id)
+    assert len(p.created) == MockCloudProvider._RING
+    assert len(p.released) == MockCloudProvider._RING
