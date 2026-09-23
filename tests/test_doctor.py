@@ -425,3 +425,38 @@ def test_plugin_cache_confined_walk_finds_skill(tmp_path, monkeypatch):
         lambda: [skill_symlink],
     )
     assert find_watch_skill() is None
+
+
+def test_doctor_mock_without_chrome_warns_not_fails(tmp_path, monkeypatch):
+    """OOB mock path: missing Chrome is WARN under SLIPSTREAM_MOCK=1 (exit 0)."""
+    monkeypatch.setenv("SLIPSTREAM_MOCK", "1")
+    monkeypatch.setenv("SLIPSTREAM_SPACES_ROOT", str(tmp_path / "spaces-mock-nochrome"))
+    monkeypatch.setenv("SLIPSTREAM_CHROME", str(tmp_path / "definitely-missing-chrome"))
+
+    report = run_doctor(url="http://127.0.0.1:1")
+    names = {c.name: c for c in report.checks}
+    assert names["mock"].status == "warn"
+    assert names["chrome"].status == "warn"
+    assert names["cdp_probe"].status == "skip"
+    assert names["pool_healthz"].status == "warn"
+    assert names["spaces_root"].status == "ok"
+    assert names["skill_path"].status == "ok"
+    assert report.ok is True
+
+    out = io.StringIO()
+    with redirect_stdout(out):
+        code = cmd_doctor(url="http://127.0.0.1:1", as_json=False)
+    assert code == 0
+    assert "Result: PASS" in out.getvalue()
+
+
+def test_doctor_live_without_chrome_still_fails(tmp_path, monkeypatch):
+    monkeypatch.delenv("SLIPSTREAM_MOCK", raising=False)
+    monkeypatch.setenv("SLIPSTREAM_SPACES_ROOT", str(tmp_path / "spaces-live-nochrome"))
+    monkeypatch.setenv("SLIPSTREAM_CHROME", str(tmp_path / "definitely-missing-chrome"))
+
+    report = run_doctor(url="http://127.0.0.1:1")
+    names = {c.name: c for c in report.checks}
+    assert names["chrome"].status == "fail"
+    assert report.ok is False
+    assert cmd_doctor(url="http://127.0.0.1:1", as_json=True) == 1

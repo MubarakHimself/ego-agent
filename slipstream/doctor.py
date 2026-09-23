@@ -1,15 +1,15 @@
 """slipstream doctor — preflight checks for out-of-box agent use.
 
 Checks (real path assumes SLIPSTREAM_MOCK off):
-  - Chrome/Chromium binary present
-  - CDP probe (ephemeral headless Chrome → GET /json/version)
-  - Pool GET /healthz
+  - Chrome/Chromium binary present (WARN under SLIPSTREAM_MOCK=1 if missing)
+  - CDP probe (ephemeral headless Chrome → GET /json/version; skip under mock)
+  - Pool GET /healthz (WARN if pool not running yet)
   - Spaces root writable
   - Skill file skills/slipstream/SKILL.md
   - Optional composed /watch skill (warn only; never vendored)
 
 Human output by default; --json for machines. Exit 0 if no failures
-(warnings allowed); exit 1 if any check failed.
+(warnings/skips allowed); exit 1 if any check failed.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ _LABEL_SKILLS = "skills"
 _LABEL_WATCH = "watch"
 _LABEL_CDP_PROBE = "cdp_probe"
 _LABEL_POOL_HEALTHZ = "pool_healthz"
+_LABEL_CHROME = "chrome"
 _ENV_MOCK = "SLIPSTREAM_MOCK"
 _UTF8 = "utf-8"
 
@@ -382,9 +383,21 @@ def _check_mock() -> CheckResult:
 def _check_chrome() -> CheckResult:
     explicit = os.environ.get("SLIPSTREAM_CHROME")
     binary = find_chrome_binary(explicit)
+    mock = os.environ.get(_ENV_MOCK, "") == "1"
     if not binary:
+        if mock:
+            # Mock pool needs no Chrome — WARN so doctor still exits 0 for OOB demo.
+            return CheckResult(
+                name=_LABEL_CHROME,
+                status="warn",
+                message=(
+                    "No Chrome/Chromium binary (ok under SLIPSTREAM_MOCK=1; "
+                    "real path needs google-chrome / chromium or SLIPSTREAM_CHROME)"
+                ),
+                detail={"SLIPSTREAM_CHROME": explicit, "mock": True},
+            )
         return CheckResult(
-            name="chrome",
+            name=_LABEL_CHROME,
             status="fail",
             message=(
                 "No Chrome/Chromium binary found. Install google-chrome or "
@@ -393,7 +406,7 @@ def _check_chrome() -> CheckResult:
             detail={"SLIPSTREAM_CHROME": explicit},
         )
     return CheckResult(
-        name="chrome",
+        name=_LABEL_CHROME,
         status="ok",
         message=f"Chrome found: {binary}",
         detail={"binary": binary, "SLIPSTREAM_CHROME": explicit},
